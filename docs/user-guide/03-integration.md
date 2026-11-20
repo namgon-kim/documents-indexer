@@ -10,6 +10,8 @@
 <iframe src="/embed" title="문서 마트" width="100%" height="720"></iframe>
 ```
 
+`PUBLIC_BASE_PATH`를 쓰는 배포라면 `src`에 접두사를 붙입니다(예: `/ai/labs/project/app/embed`).
+
 다른 origin에 삽입할 때는 HTTPS로 배포하고 `PUBLIC_ORIGIN`, `INDEXER_ACCESS_KEY`, `ALLOWED_FRAME_ANCESTORS`와 `EMBED_SIGNING_SECRET`을 설정합니다. 단일 테넌트의 공유 문서 접근을 허용할 호스트만 등록합니다. 호스트의 백엔드는 로그인한 사용자에게 iframe 사용 권한이 있는지 확인한 뒤 `scripts/issue_embed_code.py`의 `issue_code()`와 같은 방식으로 짧은 수명의 코드를 발급합니다. 서명 비밀은 브라우저에 전달하지 않습니다.
 
 호스트의 화면은 아래 방식으로 nonce를 받아 발급 코드를 전달합니다. 예시에서 `/api/indexer/embed-code`는 호스트가 구현하는 인증된 발급 경로입니다.

@@ -74,7 +74,7 @@ export function DocumentChat(props: Props) {
         </div></div>
       <button type="button" className="icon-button" title="대화 지우기" aria-label="대화 지우기" disabled={searching || !messages.length} onClick={() => { setOpen([]); onClear(); }}>
         <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13M10 11v5M14 11v5"/></svg></button>
-      <a className="icon-button" href="/settings" title="설정" aria-label="설정">
+      <a className="icon-button" href="settings" title="설정" aria-label="설정">
         <svg viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg></a>
     </div>
 

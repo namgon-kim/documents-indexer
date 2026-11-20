@@ -35,7 +35,7 @@ cp -n /path/to/deployment-settings/pipeline/*.json ./data/production/pipeline/
 chmod 600 ./data/production/pipeline/*.json
 ```
 
-`.env.production`의 `PUBLIC_ORIGIN`은 브라우저가 접속하는 HTTPS 출처(경로 제외), `INDEXER_ACCESS_KEY`는 로그인에 사용할 값으로 설정한다. 앱은 HTTPS 종료 지점 뒤에서 사용한다. `INDEXER_UID`, `INDEXER_GID`를 호스트 데이터 디렉터리 소유자에 맞춘다. 기본 앱 바인딩은 `0.0.0.0:8000`이며 필요하면 `APP_BIND_ADDRESS`와 `APP_PORT`를 바꾼다. iframe을 쓰는 경우에만 출처와 서명 키를 설정한다.
+`.env.production`의 `PUBLIC_ORIGIN`은 브라우저가 접속하는 HTTPS 출처(경로 제외), `INDEXER_ACCESS_KEY`는 로그인에 사용할 값으로 설정한다. 프록시가 하위 경로로 연결하면 브라우저 기준 경로를 `PUBLIC_BASE_PATH`에 넣는다(예: `https://host/ai/labs/project/app/` → `PUBLIC_ORIGIN=https://host`, `PUBLIC_BASE_PATH=/ai/labs/project/app`). 앱은 이 경로 또는 프록시가 앞부분을 떼어 낸 경로(`/project/app/...`)와 접두사 없는 경로를 모두 받는다. 웹은 상대 경로로 빌드되며 서버가 화면에 `<base>`를 넣는다. 앱은 HTTPS 종료 지점 뒤에서 사용한다. `INDEXER_UID`, `INDEXER_GID`를 호스트 데이터 디렉터리 소유자에 맞춘다. 기본 앱 바인딩은 `0.0.0.0:8000`이며 필요하면 `APP_BIND_ADDRESS`와 `APP_PORT`를 바꾼다. iframe을 쓰는 경우에만 출처와 서명 키를 설정한다.
 
 기본 `QDRANT_URL=http://host.docker.internal:6333`은 **같은 서버**에서 기존 Qdrant가 호스트의 6333 포트로 공개된 경우에 사용한다. 포트가 다르거나 다른 서버라면 실제 주소를 입력한다. `QDRANT_API_KEY`는 기존 Qdrant에 설정된 값과 일치해야 하며 인증이 없다면 비운다. 컨테이너의 `localhost`는 호스트가 아니다. `host.docker.internal`은 Compose가 `host-gateway`로 연결한다. [Docker 네트워크 설명](https://docs.docker.com/compose/how-tos/networking/)
 

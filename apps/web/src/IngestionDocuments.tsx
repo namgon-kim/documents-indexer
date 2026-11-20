@@ -209,7 +209,7 @@ function DocumentCard({item, busy, modelEnabled, embeddingProfile, supportsDpi, 
     </details>}
     {job.error && job.status !== "failed" && <p>{job.error.message}</p>}
     {item.deletion_pending && <p className="alert">삭제가 완료되지 않았습니다. 삭제를 다시 시도해 주세요.</p>}
-    {item.indexed && <p><a href={`/search?document=${encodeURIComponent(item.document_id)}`}>이 문서에서 검색</a></p>}
+    {item.indexed && <p><a href={`search?document=${encodeURIComponent(item.document_id)}`}>이 문서에서 검색</a></p>}
     {!item.deletion_pending && <details><summary>다시 처리</summary>
       <p className="hint">선택한 임베딩 모델로 검색을 준비합니다. 이미 읽은 내용을 사용하거나 문서를 다시 읽을 수 있습니다. 다시 읽으면 외부 서비스 비용이 발생할 수 있습니다.</p>
       <label>청크 크기 (자)<input type="number" min={400} max={4000} value={target} onChange={event => {const value = Number(event.target.value); setTarget(value); setOverlap(current => Math.min(current, Math.floor(value / 4)));}}/></label>
@@ -357,7 +357,7 @@ export function IngestionDocuments({session, options, embeddingProfiles, embeddi
         <label>검색에 사용할 임베딩 모델<select value={embeddingProfile} disabled={!embeddingProfiles.length || busy} onChange={event => onEmbeddingProfileChange(event.target.value)}>
           {embeddingProfiles.map(item => <option key={item.profile_id} value={item.profile_id}>{item.name}{item.enabled ? "" : " · 새 문서 사용 중지"}</option>)}
         </select></label>
-        <p className="hint">현재 문서 파서 · {parserName(options.current_parser?.name || options.current_parser?.provider)} · <a href="/settings">파서 설정</a></p>
+        <p className="hint">현재 문서 파서 · {parserName(options.current_parser?.name || options.current_parser?.provider)} · <a href="settings">파서 설정</a></p>
         {embeddingProfiles.find(item => item.profile_id === embeddingProfile)?.enabled === false && <p className="hint">사용 중지된 모델의 문서는 검색할 수 있지만 새로 처리할 수 없습니다.</p>}
         <label>문서 처리 유형<select value={profile} onChange={event => { const next = event.target.value; setProfile(next); setSettings(current => ({...current, ...chunkDefaults(next, file?.name)})); }}>
           <option value="">자동 선택</option><option value="general">일반</option><option value="report">보고서·계획서</option>

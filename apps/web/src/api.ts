@@ -109,6 +109,15 @@ export class ApiError extends Error {
   }
 }
 
+// The app root as the browser sees it; a proxy may mount the app under a path prefix (server sets <base>).
+export const appBase = new URL(".", document.baseURI).pathname;
+export function appUrl(path: string) {
+  return path.startsWith("/") ? appBase + path.slice(1) : path;
+}
+// Page name relative to the app root: "", "chat", "search", "settings" or "embed".
+export const route = (location.pathname.startsWith(appBase) ? location.pathname.slice(appBase.length)
+  : location.pathname.replace(/^\/+/, "")).replace(/\/+$/, "");
+
 function headers(session?: Session) {
   if (!session) return {};
   return "token" in session
@@ -118,14 +127,14 @@ function headers(session?: Session) {
 
 export async function imageBlob(path: string, session: Session): Promise<Blob> {
   if (!path.startsWith('/v1/ingest/')) throw new Error('이미지 주소를 확인할 수 없습니다.');
-  const response = await fetch(path + (path.includes('?') ? '&' : '?') + 'preview=true',
+  const response = await fetch(appUrl(path) + (path.includes('?') ? '&' : '?') + 'preview=true',
     {credentials: 'token' in session ? 'omit' : 'same-origin', headers: headers(session) as HeadersInit});
   if (!response.ok) throw new Error('이미지를 불러오지 못했습니다.');
   return response.blob();
 }
 
 export async function api<T>(path: string, session?: Session, body?: unknown, key?: string): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(appUrl(path), {
     method: body === undefined ? "GET" : "POST",
     credentials: session && "token" in session ? "omit" : "same-origin",
     headers: { ...headers(session), ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
@@ -140,7 +149,7 @@ export async function api<T>(path: string, session?: Session, body?: unknown, ke
 }
 
 export async function remove(path: string, session: Session): Promise<void> {
-  const response = await fetch(path, { method: "DELETE", credentials: "token" in session ? "omit" : "same-origin", headers: headers(session) as HeadersInit });
+  const response = await fetch(appUrl(path), { method: "DELETE", credentials: "token" in session ? "omit" : "same-origin", headers: headers(session) as HeadersInit });
   const payload = await response.json();
   if (!response.ok) throw new ApiError(payload.error?.message || "삭제하지 못했습니다.", response.status);
 }
@@ -149,7 +158,7 @@ export async function put<T>(path: string, session: Session, body: unknown): Pro
   const requestHeaders = new Headers();
   for (const [key, value] of Object.entries(headers(session))) if (value) requestHeaders.set(key, value);
   requestHeaders.set("Content-Type", "application/json");
-  const response = await fetch(path, { method: "PUT", credentials: "token" in session ? "omit" : "same-origin",
+  const response = await fetch(appUrl(path), { method: "PUT", credentials: "token" in session ? "omit" : "same-origin",
     headers: requestHeaders, body: JSON.stringify(body) });
   const payload = await response.json();
   if (!response.ok) throw new ApiError(payload.error?.message || "설정을 저장하지 못했습니다.", response.status);
@@ -161,7 +170,7 @@ export function uploadIngestion(file: File, settings: Settings, profile: string,
                                 progress: (value: number | null) => void, allowDuplicate = false): Promise<{document_id: string; job_id: string}> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
-    request.open("POST", "/v1/ingest");
+    request.open("POST", appUrl("/v1/ingest"));
     request.responseType = "json";
     for (const [name, value] of Object.entries(headers(session))) if (value) request.setRequestHeader(name, value);
     request.upload.onprogress = event => progress(event.lengthComputable ? event.loaded / event.total : null);
@@ -178,7 +187,7 @@ export function uploadIngestion(file: File, settings: Settings, profile: string,
 }
 
 export async function download(path: string, session: Session, filename: string) {
-  const response = await fetch(path, { headers: headers(session) as HeadersInit });
+  const response = await fetch(appUrl(path), { headers: headers(session) as HeadersInit });
   if (!response.ok) throw new ApiError("원본 파일을 내려받을 수 없습니다.", response.status);
   const url = URL.createObjectURL(await response.blob());
   const link = document.createElement("a");

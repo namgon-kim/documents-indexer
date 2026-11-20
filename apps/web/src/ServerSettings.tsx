@@ -139,7 +139,7 @@ export function ServerSettings({session, chatOptions, chatModel, reasoningEffort
   }
   function fieldDisabled(key: string) { return rerankOff && ["reranker_base_url", "reranker_api_key", "reranker_model"].includes(key); }
   return <section className="server-settings"><div className="settings-heading"><div><span className="eyebrow">WORKSPACE SETTINGS</span><h2>설정</h2>
-    <p className="hint">대화와 문서 처리에 사용하는 연결 및 기본값을 관리합니다.</p></div><a className="secondary settings-return" href="/chat">대화로 돌아가기</a></div>
+    <p className="hint">대화와 문서 처리에 사용하는 연결 및 기본값을 관리합니다.</p></div><a className="secondary settings-return" href="chat">대화로 돌아가기</a></div>
     <div className="settings-notice"><strong>서버 설정 적용 안내</strong><p>설정을 저장하면 실행 중인 문서 처리가 끝난 뒤 적용됩니다.</p></div>
     <p className="hint settings-subnote">환경 변수는 기본값입니다. API 키는 다시 표시되지 않습니다. 데이터 및 웹 경로는 서버 시작 설정에서 변경합니다.</p>
     {saved.restart_required && <p className="alert">저장된 설정이 아직 실행 중인 서버에 적용되지 않았습니다.</p>}

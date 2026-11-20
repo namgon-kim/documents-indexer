@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 import httpx
 from fastapi import Depends, FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from indexer.artifact_store import ArtifactStore
 from indexer.auth_store import AuthStore
@@ -45,6 +45,7 @@ from qdrant_client import QdrantClient
 from starlette.concurrency import run_in_threadpool
 
 from apps.api.auth import Auth, EmbedExchange, Login
+from apps.api.base_path import StripBasePath, with_base_tag
 
 SUFFIXES = {"pdf", "hwp", "hwpx"}
 
@@ -963,12 +964,15 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         @app.get("/settings", include_in_schema=False)
         def web():
             ancestors = " ".join(["'self'", *config.frame_origins])
-            return FileResponse(
-                config.web_dir / "index.html",
+            document = (config.web_dir / "index.html").read_text(encoding="utf-8")
+            return HTMLResponse(
+                with_base_tag(document, base_config.public_base_path),
                 headers={
                     "Content-Security-Policy": f"frame-ancestors {ancestors}",
                     "Cache-Control": "no-cache",
                 },
             )
 
+    if base_config.public_base_path:
+        app.add_middleware(StripBasePath, base_path=base_config.public_base_path)
     return app

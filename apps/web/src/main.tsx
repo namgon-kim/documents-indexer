@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { createRoot } from "react-dom/client";
-import { api, ApiError } from "./api";
+import { api, ApiError, route } from "./api";
 import type { DocumentItem, EmbeddingProfile, Hit, Job, Options, Session } from "./api";
 import { ServerSettings } from "./ServerSettings";
 import { IngestionDocuments } from "./IngestionDocuments";
@@ -11,10 +11,10 @@ import type { ChatMessage } from "./DocumentChat";
 import indukLogo from "./assets/induk-logo.svg";
 import "./style.css";
 
-const embed = location.pathname === "/embed";
-const chatPage = location.pathname === "/chat";
-const searchPage = location.pathname === "/search";
-const settingsPage = location.pathname === "/settings";
+const embed = route === "embed";
+const chatPage = route === "chat";
+const searchPage = route === "search";
+const settingsPage = route === "settings";
 const framed = window.parent !== window;
 function locationLabel(hit: Hit) {
   function label(role: "evidence" | "context") {
@@ -237,16 +237,16 @@ function App() {
 
   return <main className={embed ? "shell embedded" : "shell"}>
     <header className="brand">
-      <a className="brand-home" href="/" aria-label="문서 마트 홈">
+      <a className="brand-home" href="./" aria-label="문서 마트 홈">
         <img className="university-logo" src={indukLogo} alt="인덕대학교"/>
         <span className="brand-divider" aria-hidden="true"/>
         <span className="brand-title"><strong>문서 마트</strong><small>DOCUMENT MART</small></span>
       </a>
       <nav className="navigation" aria-label="주 메뉴">
-        <a href="/" aria-current={!chatPage && !searchPage && !settingsPage ? "page" : undefined}>문서 관리</a>
-        <a href="/search" aria-current={searchPage ? "page" : undefined}>문서 검색</a>
-        <a href="/chat" aria-current={chatPage ? "page" : undefined}>문서 대화</a>
-        <a href="/settings" aria-current={settingsPage ? "page" : undefined}>설정</a>
+        <a href="./" aria-current={!chatPage && !searchPage && !settingsPage ? "page" : undefined}>문서 관리</a>
+        <a href="search" aria-current={searchPage ? "page" : undefined}>문서 검색</a>
+        <a href="chat" aria-current={chatPage ? "page" : undefined}>문서 대화</a>
+        <a href="settings" aria-current={settingsPage ? "page" : undefined}>설정</a>
       </nav>
     </header>
     {session && !settingsPage && <div className="page-intro">
@@ -265,7 +265,7 @@ function App() {
       </form>}
     </section> : <>
       {!chatPage && !searchPage && !settingsPage && options?.ingestion_enabled && <IngestionDocuments session={session} options={options} embeddingProfiles={embeddingProfiles} embeddingProfile={embeddingProfile} onEmbeddingProfileChange={changeEmbeddingProfile} onChange={() => void list(session, undefined, true).catch(showError)}/>}
-      {!chatPage && !searchPage && !settingsPage && options && !options.ingestion_enabled && <section className="card"><p>문서 파서와 임베딩 연결을 설정해 주세요.</p><a href="/settings">설정 열기</a></section>}
+      {!chatPage && !searchPage && !settingsPage && options && !options.ingestion_enabled && <section className="card"><p>문서 파서와 임베딩 연결을 설정해 주세요.</p><a href="settings">설정 열기</a></section>}
       {settingsPage && <ServerSettings session={session} chatOptions={chatOptions} chatModel={chatModel}
         reasoningEffort={reasoningEffort} onModelChange={value => {setChatModel(value); localStorage.setItem("indexer.model", value);}}
         onReasoningChange={value => {setReasoningEffort(value); localStorage.setItem("indexer.reasoning", value);}}

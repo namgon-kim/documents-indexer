@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,14 @@ def qdrant_http_url(value: str) -> str:
     value = value.strip()
     if value and "://" not in value:
         return "http://" + value
+    return value
+
+
+def base_path(value: str) -> str:
+    """Public path prefix such as /ai/labs/app; empty when the app is served at the root."""
+    value = value.strip().rstrip("/")
+    if value and not re.fullmatch(r"(/[A-Za-z0-9._~-]+)+", value):
+        raise ValueError("PUBLIC_BASE_PATH must look like /path/to/app")
     return value
 
 
@@ -48,6 +57,7 @@ class Config:
     dev_auth: bool = False
     frame_origins: tuple[str, ...] = ()
     public_origin: str = ""
+    public_base_path: str = ""
     embed_secret: str = ""
     llm_api_key: str = ""
     llm_base_url: str = "https://api.openai.com/v1"
@@ -94,6 +104,7 @@ class Config:
             dev_auth=flag("INDEXER_DEV_AUTH"),
             frame_origins=tuple(filter(None, os.getenv("ALLOWED_FRAME_ANCESTORS", "").split())),
             public_origin=os.getenv("PUBLIC_ORIGIN", ""),
+            public_base_path=base_path(os.getenv("PUBLIC_BASE_PATH", "")),
             embed_secret=os.getenv("EMBED_SIGNING_SECRET", ""),
             llm_api_key=os.getenv("LLM_API_KEY", ""),
             llm_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
