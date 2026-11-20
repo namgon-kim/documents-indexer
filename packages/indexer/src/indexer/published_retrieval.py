@@ -1,0 +1,203 @@
+"""게시된 청크를 검색과 대화가 공유하는 근거 계약으로 변환한다."""
+
+import json
+from contextlib import nullcontext
+
+import httpx
+from qdrant_client.http.exceptions import ApiException
+
+from indexer.contracts import IndexerError
+
+
+class PublishedRetrieval:
+    def __init__(self, publisher, storage):
+        self.publisher, self.storage = publisher, storage
+
+    @staticmethod
+    def _expand_table(results, indexed):
+        """Add bounded evidence from the same exact table, never an inferred continuation."""
+        output = [dict(item) for item in results]
+        seen = {item['chunk_id'] for item in output}
+        anchor = next((item for item in output if item.get('kind') == 'table'
+                       and len(item.get('element_ids', [])) == 1 and item.get('job_id')), None)
+        origin_id = anchor['chunk_id'] if anchor else None
+        if not anchor and output:
+            hit = output[0]
+            if hit.get('document_id') and hit.get('job_id') and hit.get('heading_element_ids') and hit.get('page') is not None:
+                matches = [item for item in indexed.values() if item.get('kind') == 'table'
+                           and item.get('document_id') == hit.get('document_id')
+                           and item.get('job_id') == hit.get('job_id') and item.get('page') == hit.get('page')
+                           and item.get('heading_path') == hit.get('heading_path')
+                           and item.get('heading_element_ids') == hit.get('heading_element_ids')
+                           and len(item.get('element_ids', [])) == 1]
+                if len({tuple(item['element_ids']) for item in matches}) == 1:
+                    matches.sort(key=lambda item: (item.get('part_number', 0), item['chunk_id']))
+                    anchor = matches[0] if matches else None
+                    origin_id = hit['chunk_id']
+        if not anchor:
+            return output
+        candidates = [item for item in indexed.values()
+                      if item.get('kind') == 'table' and item.get('document_id') == anchor.get('document_id')
+                      and item.get('job_id') == anchor.get('job_id')
+                      and item.get('element_ids') == anchor.get('element_ids')
+                      and item.get('chunk_id') not in seen]
+        candidates.sort(key=lambda item: (abs(item.get('part_number', 0) - anchor.get('part_number', 0)),
+                                          item.get('part_number', 0), item['chunk_id']))
+        budget = 9000
+        added = 0
+        for item in candidates:
+            length = len(item.get('text', ''))
+            if not length or length > budget:
+                continue
+            output.append({**item, 'expanded_from': origin_id, 'expansion_reason': 'same_source_table'})
+            budget -= length
+            added += 1
+            if added >= 3:
+                break
+        complete = added == len(candidates)
+        for item in output:
+            if (item.get('kind') == 'table' and item.get('document_id') == anchor.get('document_id')
+                and item.get('job_id') == anchor.get('job_id') and item.get('element_ids') == anchor.get('element_ids')):
+                item['table_expansion_complete'] = complete
+        return output
+
+    def search(self, request):
+        guard = getattr(self.publisher, "search_lock", None)
+        with guard if guard is not None else nullcontext():
+            return self._search(request)
+
+    def _search(self, request):
+        try:
+            result = self.publisher.search(request.query, request.method, request.top_k,
+                                           str(request.document_id) if request.document_id else None,
+                                           request.rerank, str(request.index_version) if request.index_version else None)
+            documents = {}
+            elements_by_job = {}
+            hits = []
+            chunk_path = self.publisher.root / result["index_version"] / "chunks.json"
+            indexed = {item["chunk_id"]: item for item in json.loads(chunk_path.read_text(encoding="utf-8"))}
+            pending = self._expand_table(result["results"], indexed)
+            seen_chunks = {item['chunk_id'] for item in pending}
+            expanded_visual_count, expanded_visual_chars = 0, 0
+            for chunk in pending:
+                document_id = chunk["document_id"]
+                if document_id not in documents:
+                    path = self.storage.document_dir(document_id) / "document.json"
+                    documents[document_id] = json.loads(path.read_text(encoding="utf-8"))
+                job_id = chunk.get("job_id")
+                page = chunk.get("page")
+                before, after = None, None
+                for key, direction in (("previous_chunk_id", "before"), ("next_chunk_id", "after")):
+                    adjacent = indexed.get(chunk.get(key))
+                    if (adjacent and adjacent.get("document_id") == document_id and adjacent.get("job_id") == job_id
+                        and ((page is not None and adjacent.get("page") == page) or (page is None and chunk.get("source_scope") is not None and adjacent.get("source_scope") == chunk.get("source_scope")))
+                        and adjacent.get("heading_path") == chunk.get("heading_path")
+                        and adjacent.get("kind") == chunk.get("kind") == "text"):
+                        if direction == "before":
+                            before = adjacent
+                        else:
+                            after = adjacent
+                evidence_ids = list(dict.fromkeys(chunk.get("element_ids", [])))
+                related = [item for item in (before, chunk, after) if item]
+                context_ids = list(dict.fromkeys(eid for item in related for eid in
+                    [*item.get("heading_element_ids", []), *item.get("context_element_ids", []),
+                     *(item.get("element_ids", []) if item is not chunk else [])] if eid not in evidence_ids))
+                refs = []
+                related_images = []
+                if job_id and (evidence_ids or context_ids):
+                    key = (document_id, job_id)
+                    if key not in elements_by_job:
+                        elements_by_job[key] = {item["element_id"]: item for item in
+                            self.storage.load_job(document_id, job_id, "elements")}
+                    source_elements = elements_by_job[key]
+                    image_ids = set()
+                    for eid in evidence_ids:
+                        for link in source_elements.get(eid, {}).get('related_images', []):
+                            image = source_elements.get(link.get('element_id'), {})
+                            if (not image.get('asset_id') or image.get('element_id') in image_ids
+                                or image.get('image_policy') == 'exclude'
+                                or (image.get('image_policy') == 'analyze' and link.get('type') != 'image_analysis')):
+                                continue
+                            if link.get('type') == 'cell_anchor':
+                                anchor = image.get('layout') or {}
+                                cells = chunk.get('table_cells', [])
+                                if not cells or not any(abs(cell['row'] - anchor.get('start_row', -100)) <= 1
+                                                        and abs(cell['column'] - anchor.get('start_column', -100)) <= 1
+                                                        for cell in cells):
+                                    continue
+                            image_ids.add(image['element_id'])
+                            related_images.append({**link, 'url': f'/v1/ingest/{document_id}/jobs/{job_id}/elements/{image["element_id"]}/image',
+                                                   'is_preview': bool(image.get('image_is_preview')),
+                                                   'location': image.get('office_location'), 'layout': image.get('layout')})
+                            if link.get('type') != 'image_analysis' and expanded_visual_count < 2:
+                                visual_ids = {item['element_id'] for item in source_elements.values()
+                                              if item.get('source_origin') == 'visual_analysis'
+                                              and item.get('visual_id') == image.get('visual_id') and item.get('visual_id')}
+                                for candidate in indexed.values():
+                                    if (candidate.get('document_id') != document_id or candidate.get('job_id') != job_id
+                                        or candidate['chunk_id'] in seen_chunks or not visual_ids.intersection(candidate.get('element_ids', []))):
+                                        continue
+                                    length = len(candidate.get('text', ''))
+                                    if not length or expanded_visual_chars + length > 4000:
+                                        continue
+                                    pending.append({**candidate, 'expanded_from': chunk['chunk_id'],
+                                                    'expansion_reason': 'related_image_analysis',
+                                                    'visual_relation': {key: link[key] for key in ('type', 'origin', 'status') if key in link}})
+                                    seen_chunks.add(candidate['chunk_id'])
+                                    expanded_visual_count += 1
+                                    expanded_visual_chars += length
+                                    if expanded_visual_count >= 2:
+                                        break
+                            if len(related_images) >= 4:
+                                break
+                        if len(related_images) >= 4:
+                            break
+                    for role, ids in (("evidence", evidence_ids), ("context", context_ids)):
+                        for eid in ids:
+                            source = elements_by_job[key].get(eid)
+                            if source is None:
+                                raise IndexerError("SEARCH_UNAVAILABLE", "검색 결과의 원문 근거를 확인할 수 없습니다.", 409)
+                            location = source.get("office_location")
+                            if location:
+                                ref = {**location, "role": role}
+                                if ref not in refs:
+                                    refs.append(ref)
+                            source_page = source.get("page")
+                            if source_page:
+                                ref = {"page": source_page, "role": role,
+                                       "kind": "pdf_page" if documents[document_id]["format"] == "pdf" else "parser_page"}
+                                if ref not in refs:
+                                    refs.append(ref)
+                if not refs and page:
+                    refs.append({"page": page, "role": "evidence", "kind": "pdf_page" if documents[document_id]["format"] == "pdf" else "parser_page"})
+                urls = [f"/v1/ingest/{document_id}/jobs/{job_id}/elements/{element_id}"
+                        for element_id in evidence_ids] if job_id else []
+                context_urls = [f"/v1/ingest/{document_id}/jobs/{job_id}/elements/{element_id}"
+                                for element_id in context_ids] if job_id else []
+                before_text = (before.get("body_text") or before["text"])[-600:] if before else ""
+                after_text = (after.get("body_text") or after["text"])[:600] if after else ""
+                context_text = "\n".join(filter(None, [chunk.get("heading_text"), before_text,
+                    chunk.get("body_text") or chunk["text"], after_text])) if before or after else chunk["text"]
+                hits.append({**chunk, "unit_id": chunk["chunk_id"], "filename": documents[document_id]["filename"],
+                             "search_text": chunk["text"], "context_text": context_text,
+                             "context_before": before_text, "context_after": after_text,
+                             "context_element_ids": context_ids,
+                             "related_images": related_images,
+                             "source_refs": refs, "evidence_urls": urls, "context_urls": context_urls})
+            return {**result, "results": hits}
+        except ApiException as error:
+            raise IndexerError("VECTOR_DB_UNAVAILABLE", "벡터 데이터베이스 연결 또는 설정을 확인해 주세요.", 503) from error
+        except httpx.HTTPStatusError as error:
+            code = error.response.status_code
+            message = ("검색 서비스 인증 정보를 확인해 주세요." if code in {401, 403} else
+                       "검색 서비스 요청 한도를 확인한 뒤 다시 시도해 주세요." if code == 429 else
+                       "검색 서비스가 요청을 처리하지 못했습니다. 연결과 모델 설정을 확인해 주세요.")
+            raise IndexerError("SEARCH_PROVIDER_ERROR", message, 503) from error
+        except httpx.RequestError as error:
+            raise IndexerError("SEARCH_PROVIDER_UNAVAILABLE", "검색 서비스에 연결하지 못했습니다. 연결 설정을 확인해 주세요.", 503) from error
+        except (TypeError, AttributeError) as error:
+            raise IndexerError("SEARCH_PROVIDER_ERROR", "검색 서비스 응답을 확인할 수 없습니다. 연결과 모델 설정을 확인해 주세요.", 503) from error
+        except ValueError as error:
+            raise IndexerError("SEARCH_UNAVAILABLE", str(error), 409) from error
+        except (FileNotFoundError, KeyError) as error:
+            raise IndexerError("SEARCH_UNAVAILABLE", "검색 색인 또는 근거를 확인할 수 없습니다.", 409) from error

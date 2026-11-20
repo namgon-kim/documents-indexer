@@ -1,0 +1,35 @@
+name: document-indexer
+
+services:
+  pipeline:
+    build:
+      context: .
+      target: pipeline
+    user: "${INDEXER_UID:-1000}:${INDEXER_GID:-1000}"
+    restart: unless-stopped
+    stop_grace_period: "${PIPELINE_STOP_GRACE_PERIOD:-16m}"
+    ports:
+      - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8000}:8000"
+    env_file:
+      - "${INDEXER_ENV_FILE:-.env.production}"
+    environment:
+      DATA_DIR: /data
+      WEB_DIR: /app/apps/web/dist
+      INDEXER_DEV_AUTH: "0"
+      PUBLIC_ORIGIN: "${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to the public HTTPS origin}"
+      INDEXER_ACCESS_KEY: "${INDEXER_ACCESS_KEY:?Set INDEXER_ACCESS_KEY}"
+      QDRANT_URL: "${QDRANT_URL:?Set QDRANT_URL to the existing Qdrant server}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - type: bind
+        source: "${INDEXER_STATE_DIR:-./data/production}/pipeline"
+        target: /data
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
