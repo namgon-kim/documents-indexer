@@ -406,7 +406,8 @@ def test_continued_table_search_returns_all_context_evidence(tmp_path):
         IngestionService(storage, Parser(), publisher).ingest(source)
         hit = PublishedRetrieval(publisher, storage).search(SearchRequest(query="연구비", method="bm25"))["results"][0]
         assert "2026년 / 27" in hit["search_text"]
-        assert {url.rsplit("/", 1)[-1] for url in hit["evidence_urls"]} == {"e4"}
+        assert {url.split("?", 1)[0].rsplit("/", 1)[-1] for url in hit["evidence_urls"]} == {"e4"}
+        assert [part["text"] for part in hit["source_segments"]] == ["연구비", "27"]
         assert {url.rsplit("/", 1)[-1] for url in hit["context_urls"]} == {"e1", "e2", "e3"}
         assert {ref["page"] for ref in hit["source_refs"] if ref["role"] == "evidence"} == {2}
         assert {ref["page"] for ref in hit["source_refs"] if ref["role"] == "context"} == {1, 2}
@@ -586,3 +587,49 @@ def test_credit_exhaustion_is_reported_and_resumes_without_reparsing(tmp_path):
         available = True
         assert service.resume_index(doc, job)["status"] == "completed"
         assert parser.calls == 1
+
+
+def test_html_table_search_evidence_is_scoped_after_provider_splits(tmp_path):
+    cell = '행일치\n  ' + '세부내용 ' * 95
+    html = (f'<table><tr><td style="white-space:pre-wrap">{cell}</td></tr>'
+            '<tr><td>다른행식별자</td></tr></table>')
+
+    class Parser:
+        def parse(self, request):
+            element = {"page": 1, "category": "table", "content": {"html": html}}
+            return ParseResult("fake", [element], {})
+
+    def provider(request):
+        body = json.loads(request.content)
+        if any(len(text.encode()) > 180 for text in body["input"]):
+            return httpx.Response(413)
+        return httpx.Response(200, json={"model": body["model"], "data": [
+            {"index": i, "embedding": [1.0, 0.5]} for i in range(len(body["input"]))]})
+
+    with httpx.Client(transport=httpx.MockTransport(provider)) as http:
+        qdrant = QdrantClient(":memory:")
+        embedder = EmbeddingClient(http, "https://example.test/v1", "key", EmbeddingProfile("p", "doc", "query", 2))
+        service = IngestionService(ArtifactStore(tmp_path), Parser(), IndexPublisher(tmp_path, qdrant, embedder))
+        config = Config(tmp_path, access_key="example", external_processing=True)
+        with TestClient(create_app(config, ingestion_service=service), base_url="https://testserver") as client:
+            login = client.post("/v1/auth/login", json={"access_key": "example"}, headers={"Origin": "https://testserver"})
+            client.headers.update({"Origin": "https://testserver", "X-CSRF-Token": login.json()["csrf_token"]})
+            uploaded = client.post("/v1/ingest", files={"file": ("report.pdf", pdf_bytes())})
+            assert uploaded.status_code == 200 and uploaded.json()['status'] == 'completed'
+            response = client.post("/v1/retrieve", json={"query": "행일치", "method": "bm25", "limit": 1})
+            assert response.status_code == 200, response.text
+            hit = response.json()["results"][0]
+            assert "embedding_split_from" in hit
+            [url] = hit["evidence_urls"]
+            assert '?table_cells=' in url
+            evidence = client.get(url)
+            assert evidence.status_code == 200, evidence.text
+            [source] = evidence.json()['cells']
+            assert source['row'] == 1 and source['column'] == 1
+            assert source['text'].startswith('행일치\n  ')
+            assert 0 < source['end'] < len(cell)
+            assert source['text'] == hit['source_segments'][0]['text'] == cell[:source['end']]
+            base = url.split('?')[0]
+            assert '다른행식별자' in client.get(base).json()['content']['text']
+            assert client.get(base + '?table_cells=99:1:0:4').status_code == 404
+        qdrant.close()

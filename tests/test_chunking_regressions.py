@@ -3,11 +3,14 @@ import httpx
 import pytest
 from indexer.chunking import make_chunks, normalize_elements
 from indexer.contracts import IndexerError
+from indexer.embedding_adaptation import split_chunk
+from indexer.embedding_input import embedding_text
 from indexer.parsing.contracts import ParserConfig, ParseRequest
-from indexer.parsing.normalization import cells_from, parse_table_html
+from indexer.parsing.normalization import cells_from, clean, parse_table_html
 from indexer.parsing.paddle_vl_adapter import PaddleVLParser
 from indexer.parsing.upstage_adapter import UpstageParser
 from indexer.structure_relations import figure_relationships
+from indexer.table_evidence import split_cell_source
 
 
 def row(kind, text, page=None, **extra):
@@ -99,7 +102,7 @@ def test_common_html_keeps_line_breaks_and_indentation_in_evidence():
     chunk = make_chunks('d', 'j', elements, 400, 0)[0]
     assert 'Unit price / 1.25' in chunk['text']
     assert cells[3].search_text in chunk['text'] and cells[3].text not in chunk['text']
-    assert cells[3].text in chunk['source_segments'][0]['text']
+    assert any(item['text'] == cells[3].text for item in chunk['source_segments'])
     assert 'discard' not in chunk['text']
 
 
@@ -111,6 +114,52 @@ def test_table_whitespace_style_applies_across_inline_elements():
     elements = normalize_elements([{'category': 'table', 'page': 1, 'content': {'html': html}}])
     assert elements[0]['text'] == source
     assert make_chunks('d', 'j', elements, 400, 0)[0]['table_segments'][0]['value'] == 'start end'
+
+
+
+def test_rowspan_infers_search_header_without_source_indentation():
+    html = ('<table><tr><td rowspan="2">Group</td><td>First<br>  Line</td><td>Second</td></tr>'
+            '<tr><td>12</td><td>15</td></tr></table>')
+    elements = normalize_elements([{'category': 'table', 'page': 1, 'content': {'html': html}}])
+    chunks = make_chunks('d', 'j', elements, 400, 0)
+    segment = next(part for chunk in chunks for part in chunk['table_segments'] if part['value'] == '12')
+    assert segment['label'] == 'Group / First Line' and segment['label_origin'] == 'inferred'
+    assert any(source['text'] == 'First\n  Line' for chunk in chunks for source in chunk['source_segments'])
+
+
+def test_common_table_source_ranges_follow_initial_and_embedding_splits():
+    formatted = '  ' + 'e\u0301 한글 alpha\n    beta ' * 90 + '\n  '
+    html = f'<table><tr><td style="white-space: pre-wrap">{formatted}</td><td>other cell</td></tr></table>'
+    elements = normalize_elements([{'category': 'table', 'page': 1, 'content': {'html': html}}])
+    initial = make_chunks('d', 'j', elements, 400, 0)
+    assert len(initial) > 1
+    adapted = [part for chunk in initial for part in (
+        split_chunk(chunk, 120) if len(chunk['text'].encode()) > 120 else [chunk])]
+    assert len(adapted) > len(initial)
+    for chunks in (initial, adapted):
+        sources = []
+        for chunk in chunks:
+            assert chunk['source_range_quality'] == 'table_cell'
+            for origin, value in zip(chunk['source_segments'], chunk['table_segments'], strict=True):
+                assert (origin['row'], origin['column']) == (value['row'], value['column'])
+                assert embedding_text(clean(origin['text'])) == value['value']
+                if origin['column'] == 1:
+                    assert formatted[origin['start']:origin['end']] == origin['text']
+                    sources.append(origin['text'])
+                else:
+                    assert origin['text'] == 'other cell'
+        assert ''.join(sources) == formatted
+
+
+
+def test_table_fragment_offsets_use_source_characters_through_unicode_normalization():
+    raw = '  ' + '\u0344' * 37 + ' e\u0301\n  '
+    parts = list(split_cell_source(raw, chars=13, max_bytes=17))
+    assert len(parts) > 1 and ''.join(part['source_text'] for part in parts) == raw
+    for part in parts:
+        assert part['source_text'] == raw[part['source_start']:part['source_end']]
+        assert embedding_text(clean(part['source_text'])) == part['text']
+        assert len(part['text'].encode()) <= 17
 
 
 def test_plain_html_cells_keep_inline_text_and_ordinary_search_labels():

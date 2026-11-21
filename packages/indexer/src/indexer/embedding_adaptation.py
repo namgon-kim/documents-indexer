@@ -9,6 +9,7 @@ from indexer.contracts import IndexerError
 from indexer.embedding_input import byte_size, context_prefix, embedding_text, split_text
 from indexer.office_locations import set_xlsx_chunk_evidence
 from indexer.representation import table_groups
+from indexer.table_evidence import HTML_CELL_RANGE, set_html_table_evidence
 
 
 def input_limit_error(error):
@@ -44,6 +45,9 @@ def split_chunk(chunk, max_bytes):
                          "label": segment.get("label", ""), "text": segment.get("value", segment["text"]),
                          "label_origin": segment.get("label_origin", "parser")}
                         for segment in segments]
+        if chunk.get("source_range_quality") == HTML_CELL_RANGE:
+            for part, source in zip(source_parts, chunk["source_segments"], strict=True):
+                part.update(source_text=source["text"], source_start=source["start"])
         parts = []
         for group in table_groups(prefix, source_parts, max_bytes, max_bytes):
             converted = [{**item, "row": item["row"], "column": item["column"], "label": item["label"],
@@ -68,11 +72,15 @@ def split_chunk(chunk, max_bytes):
         item.pop("previous_chunk_id", None)
         item.pop("next_chunk_id", None)
         if part_segments is not None:
-            item["table_segments"] = part_segments
+            item["table_segments"] = [{key: val for key, val in part.items()
+                                       if key not in {"source_text", "source_start", "source_end"}}
+                                      for part in part_segments]
             item["table_cells"] = [{"row": part["row"], "column": part["column"]} for part in part_segments]
             item['body_text'] = "\n".join(part['text'] for part in part_segments)
             if chunk.get('xlsx_region_start'):
                 set_xlsx_chunk_evidence(item, part_segments)
+            elif chunk.get('source_range_quality') == HTML_CELL_RANGE:
+                set_html_table_evidence(item, part_segments)
             elif chunk.get('source_range_quality') == 'unverified':
                 item['source_segments'] = [{**chunk['source_segments'][0],
                                             'text': "\n".join(part['value'] for part in part_segments)}]

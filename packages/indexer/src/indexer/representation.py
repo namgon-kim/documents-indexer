@@ -2,6 +2,7 @@ from itertools import groupby
 
 from indexer.embedding_input import MAX_INPUT_BYTES, byte_size, context_prefix, render_embedding, split_text
 from indexer.table_continuity import column_headers
+from indexer.table_evidence import split_cell_source
 
 
 def inferred_column_headers(cells, infer_first_row=False):
@@ -32,7 +33,7 @@ def inferred_column_headers(cells, infer_first_row=False):
                 continue
             matching = [h for h in candidates if h.column == cell.column and h.columns == cell.columns]
             if len(matching) == 1:
-                result[(cell.row, cell.column)] = matching[0].text
+                result[(cell.row, cell.column)] = matching[0].search_text
     return result
 
 
@@ -116,10 +117,13 @@ def table_groups(context, parts, target, max_bytes=MAX_INPUT_BYTES):
             item = {**part, "label": context_prefix(part.get("label", ""), min(800, max_bytes // 3))}
             prefix = len(context) + len(item["label"]) + 5
             budget = max_bytes - byte_size(context) - byte_size(item["label"]) - 5
-            fragments.extend(
-                {**item, "text": piece}
-                for piece in split_text(item["text"], chars=max(96, target - prefix), max_bytes=budget)
-            )
+            chars = max(96, target - prefix)
+            if "source_text" in item:
+                pieces = split_cell_source(item["source_text"], chars=chars, max_bytes=budget,
+                                           offset=item.get("source_start", 0))
+            else:
+                pieces = ({"text": piece} for piece in split_text(item["text"], chars=chars, max_bytes=budget))
+            fragments.extend({**item, **piece} for piece in pieces)
         if pending and not fits([*pending, *fragments]):
             yield pending
             pending = []

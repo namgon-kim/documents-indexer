@@ -23,9 +23,10 @@ from indexer.parsing.normalization import (
 )
 from indexer.representation import table_groups, table_parts
 from indexer.structure_relations import figure_relationships, table_relationships
+from indexer.table_evidence import set_html_table_evidence
 from indexer.xlsx_structure import confirmed
 
-TABLE_REPRESENTATION = "table-structure-v12"
+TABLE_REPRESENTATION = "table-structure-v13"
 
 def normalize_elements(raw_elements: list[dict]) -> list[dict]:
     elements = []
@@ -160,10 +161,11 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                    "office_location": item.get("office_location")} for item in refs],
                  "kind": kind, "heading_path": heading_path, "heading_path_origin": first.get("heading_path_origin", "parser"),
                  "quality": "unverified" if kind in {"table", "figure", "chart"} else "extracted",
-                 "source_segments": [{"element_id": item["element_id"],
-                                      "text": (item["text"] if kind == "table" else
-                                               body_text if len(refs) == 1 and kind == "text" else embedding_text(item["text"])),
-                                      "order": item["order"]} for item in refs]}
+                 "source_segments": [] if table_extra and table_extra.get("table_segments") else [
+                     {"element_id": item["element_id"],
+                      "text": (item["text"] if kind == "table" else
+                               body_text if len(refs) == 1 and kind == "text" else embedding_text(item["text"])),
+                      "order": item["order"]} for item in refs]}
         if table_extra:
             chunk.update(table_extra)
         chunks.append(chunk)
@@ -264,12 +266,13 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                                or element.get('source_origin') == 'native_extraction')
                 caption = relation.get("caption", "")
                 inherited_caption = relation.get("previous_caption", "")
-                if not parts and caption:
+                if not any(cell.search_text for cell in cells) and caption:
                     for part_number, part in enumerate(split_text(caption, chars=budget,
                             max_bytes=max_bytes - byte_size(heading) - 1, overlap=overlap_chars)):
                         append_chunk("\n".join(filter(None, (heading, part))), [element], part_number,
                                      "table", element["heading_path"], {"table_cells": [], "table_segments": [], "quality": "unverified",
                                                                        "representation_version": TABLE_REPRESENTATION})
+                        chunks[-1]["source_segments"][0]["text"] = part
                     continue
                 table_heading = context_prefix(" > ".join(filter(None, [heading, inherited_caption, caption])), min(800, target_chars // 2, max_bytes // 3))
                 context_ids = list(dict.fromkeys(value for value in (relation.get("caption_id"), relation.get("previous_table_id"), relation.get("previous_caption_id")) if value))
@@ -279,7 +282,12 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                         parts.append({"text": cell.search_text, "label": "", "row": cell.row + 1, "column": cell.column + 1})
                         uncertain = True
                 layout = element.get('layout') or {}
-                if layout.get('space') == 'xlsx_region':
+                legacy_xlsx = layout.get('space') == 'xlsx_region'
+                if not legacy_xlsx:
+                    source_cells = {(cell.row + 1, cell.column + 1): cell.text for cell in cells}
+                    for part in parts:
+                        part["source_text"] = source_cells[part["row"], part["column"]]
+                if legacy_xlsx:
                     for part in parts:
                         part['row'] += layout.get('row_offset', 0)
                         part['column'] += layout.get('column_offset', 0)
@@ -299,11 +307,14 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                                       "label_origin": part.get("label_origin", "parser")}
                                                      for part, line in zip(group, lines, strict=True)],
                                   "quality": "unverified" if uncertain or context_ids else "extracted"}, body_prefix=table_heading)
-                    if layout.get('space') == 'xlsx_region':
+                    if legacy_xlsx:
                         # Retain only this chunk's cells instead of copying the
                         # entire region into every source segment.
-                        chunks[-1]['source_segments'][0]['text'] = '\n'.join(part['text'] for part in group)
+                        chunks[-1]['source_segments'] = [{"element_id": element["element_id"], "order": element["order"],
+                                                          "text": "\n".join(part["text"] for part in group)}]
                         chunks[-1]['source_range_quality'] = 'unverified'
+                    else:
+                        set_html_table_evidence(chunks[-1], group)
                 continue
             text = embedding_text(clean(text))
         if kind in {"figure", "chart", "image"} and element["element_id"] in figures:

@@ -324,7 +324,7 @@ function App() {
           <button className="secondary" onClick={() => void viewEvidence(hit)}>근거 원문 보기</button>
           {!!hit.context_urls?.length && <button className="secondary" onClick={() => void viewEvidence(hit, true)}>문맥 원문 보기</button>}
           {expanded?.id === hit.unit_id + ":context" && <div className="evidence"><p className="hint">제목·캡션·인접 본문 등 문맥입니다. 표 연결은 추정일 수 있습니다.</p><p className="result-text">{expanded.text}</p></div>}
-          {expanded?.id === hit.unit_id && <div className="evidence"><p className="hint">파서가 추출한 원문 요소입니다. 표의 경우 검색된 셀이 포함된 전체 표가 표시됩니다.</p><p className="result-text">{expanded.text}</p></div>}
+          {expanded?.id === hit.unit_id && <div className="evidence"><p className="hint">검색 결과에 연결된 원문 근거입니다.</p><p className="result-text">{expanded.text}</p></div>}
         </article>)}
       </section>}
       {chatPage && <DocumentChat messages={messages} session={session!} searching={searching} query={query} onQueryChange={setQuery} onSubmit={search}
