@@ -43,8 +43,12 @@ def apply_image_actions(base, actions, parser, image_path, checkpoint, persist, 
         if hashlib.sha256(data).hexdigest() != asset_id:
             raise IndexerError('IMAGE_ASSET_INVALID', '원본 이미지의 무결성을 확인할 수 없습니다.', 409)
         saved = completed.get(index)
-        if saved and (saved.get('sha256') != asset_id or saved.get('status') != 'completed'):
-            raise IndexerError('VISUAL_OUTCOME_UNKNOWN', '이미지 요청의 완료 여부를 확인할 수 없습니다.', 409)
+        if saved and saved.get('sha256') != asset_id:
+            raise IndexerError('VISUAL_CHECKPOINT_CHANGED', '저장된 이미지 처리 대상이 변경되었습니다.', 409)
+        if saved and saved.get('status') != 'completed':
+            # An explicit analyze/both choice is the user's approval to retry an
+            # unresolved request. Do not reuse its partial checkpoint as a result.
+            saved = None
         if saved:
             raw_elements = saved.get('elements', [])
         else:

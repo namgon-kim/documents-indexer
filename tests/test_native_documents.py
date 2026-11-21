@@ -399,7 +399,7 @@ def test_image_actions_publish_new_version_and_keep_old_evidence(tmp_path):
         vector.close()
 
 
-def test_image_actions_reject_unresolved_remote_request_without_new_call(tmp_path):
+def test_image_actions_require_explicit_retry_choice_for_unresolved_remote_request(tmp_path):
     from indexer.artifact_store import ArtifactStore
     from indexer.ingestion_service import IngestionService
 
@@ -415,8 +415,11 @@ def test_image_actions_reject_unresolved_remote_request_without_new_call(tmp_pat
     anchor = next(item for item in storage.load_job(doc, job, 'elements') if item.get('source_origin') == 'native_image')
     checkpoint = storage.provider_checkpoint(doc, job, 'initial')['visuals'][0]
     storage.save_provider_event(doc, job, 'initial', 'visual', {**checkpoint, 'status': 'started'})
-    with pytest.raises(ValueError, match='완료 여부'):
-        service.enqueue_image_actions(doc, job, {anchor['element_id']: 'both'})
+    queued = service.enqueue_image_actions(doc, job, {anchor['element_id']: 'both'})
+    assert queued['status'] == 'queued'
+    # The ambiguous initial request remains recorded for audit; the approved
+    # retry is an independent job with its own checkpoint namespace.
+    assert storage.provider_checkpoint(doc, job, 'initial')['visuals'][0]['status'] == 'started'
     assert parser.calls == 1
 
 
@@ -571,8 +574,8 @@ def test_failed_image_edit_restores_unpublished_draft(tmp_path):
     assert all(store.load_job(doc, job, name) == value for name, value in before.items())
     status = store.load_job(doc, job, 'processing')
     assert status['pending_review'] and status['last_image_failure']
-    with pytest.raises(ValueError, match='완료 여부'):
-        service.enqueue_image_actions(doc, job, {anchor['element_id']: 'analyze'})
+    retry = service.enqueue_image_actions(doc, job, {anchor['element_id']: 'analyze'})
+    assert retry['job_id'] == job and retry['image_attempt'] != queued['image_attempt']
 
 
 def test_docx_heading_styles_and_table_headers_are_retained(tmp_path):

@@ -351,9 +351,10 @@ class IngestionService:
         for attempt_folder in provider_folder.glob('image-*'):
             if re.fullmatch(r'image-[0-9a-f]{32}', attempt_folder.name):
                 prior_events.extend(self.storage.provider_checkpoint(document_id, base_job_id, attempt_folder.name).get('visuals', []))
-        for item in prior_events:
-            if f"image-{item.get('index')}" in analyzing and item.get('status') != 'completed':
-                raise ValueError('이전 이미지 요청의 완료 여부를 확인할 수 없어 다시 요청할 수 없습니다')
+        # Selecting analyze/both here is the user's explicit authorization to
+        # issue a new OCR request, including when an earlier request is unresolved.
+        # Keep the old provider checkpoints intact; each image action gets a new
+        # attempt namespace so the uncertain request remains auditable.
         for image in images.values():
             if not self.storage.image_path(document_id, base_job_id, image['asset_id']).is_file():
                 raise ValueError('기준 작업의 원본 이미지를 찾을 수 없습니다')
