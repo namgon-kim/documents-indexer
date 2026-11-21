@@ -9,12 +9,12 @@ def column_headers(cells):
         cell
         for cell in cells
         if cell.header
-        and cell.text
+        and cell.search_text
         and (cell.scope in {"col", "colgroup"} or (not cell.scope and cell.row < first_data_row))
     ]
 
 
 def header_signature(headers):
-    return [(cell.column, cell.columns, " ".join(cell.text.casefold().split())) for cell in headers]
+    return [(cell.column, cell.columns, cell.search_text.casefold()) for cell in headers]
 
 

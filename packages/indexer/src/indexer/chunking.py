@@ -6,7 +6,6 @@ from html import unescape
 from itertools import groupby, pairwise
 from uuid import NAMESPACE_URL, uuid5
 
-from bs4 import BeautifulSoup
 from openpyxl.utils.cell import coordinate_to_tuple
 
 from indexer.element_scope import same_scope, source_scope
@@ -14,11 +13,20 @@ from indexer.embedding_input import MAX_INPUT_BYTES, byte_size, context_prefix, 
 from indexer.heading_hierarchy import apply_flat_hierarchy
 from indexer.inspection import is_page_label
 from indexer.office_locations import set_xlsx_chunk_evidence
-from indexer.parsing.normalization import PAGE_FURNITURE, cells_from, list_items_from
+from indexer.parsing.normalization import (
+    PAGE_FURNITURE,
+    cells_from,
+    clean,
+    list_items_from,
+    parse_table_html,
+    readable,
+)
 from indexer.representation import table_groups, table_parts
 from indexer.structure_relations import figure_relationships, table_relationships
+from indexer.table_evidence import set_html_table_evidence
 from indexer.xlsx_structure import confirmed
 
+TABLE_REPRESENTATION = "table-structure-v13"
 
 def normalize_elements(raw_elements: list[dict]) -> list[dict]:
     elements = []
@@ -28,11 +36,14 @@ def normalize_elements(raw_elements: list[dict]) -> list[dict]:
             raise TypeError("파싱 요소 형식이 잘못되었습니다")
         content = raw["content"]
         html = content.get("html") or ""
-        soup = BeautifulSoup(html, "html.parser")
+        soup = parse_table_html(html)
         for node in soup.find_all(["script", "style", "iframe", "object"]):
             node.decompose()
-        text = " ".join(soup.stripped_strings) or unescape(content.get("text") or "").strip()
-        items = list_items_from(soup)
+        has_table = soup.find("table") is not None
+        text = readable(soup) if has_table else " ".join(soup.stripped_strings)
+        if not text.strip():
+            text = unescape(content.get("text") or "").strip()
+        items = [] if has_table else list_items_from(soup)
         if items:
             outside = " ".join(str(word).strip() for word in soup.strings if not word.find_parent("li") and str(word).strip())
             text = (soup.get_text("\n", strip=True) if outside else
@@ -123,6 +134,11 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
         if len(matches) == 1 and matches[0][1]:
             title_context.add(current['element_id'])
     relationships = table_relationships(elements)
+    caption_tables = defaultdict(list)
+    for element in elements:
+        relation = relationships.get(element["element_id"], {})
+        if relation.get("empty_table") and relation.get("caption_id") and not element.get("xlsx_region"):
+            caption_tables[relation["caption_id"]].append(element["element_id"])
     figures = figure_relationships(elements)
     furniture_pages = defaultdict(set)
     for element in elements:
@@ -150,9 +166,11 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                    "office_location": item.get("office_location")} for item in refs],
                  "kind": kind, "heading_path": heading_path, "heading_path_origin": first.get("heading_path_origin", "parser"),
                  "quality": "unverified" if kind in {"table", "figure", "chart"} else "extracted",
-                 "source_segments": [{"element_id": item["element_id"],
-                                      "text": body_text if len(refs) == 1 and kind == "text" else embedding_text(item["text"]),
-                                      "order": item["order"]} for item in refs]}
+                 "source_segments": [] if table_extra and table_extra.get("table_segments") else [
+                     {"element_id": item["element_id"],
+                      "text": (item["text"] if kind == "table" else
+                               body_text if len(refs) == 1 and kind == "text" else embedding_text(item["text"])),
+                      "order": item["order"]} for item in refs]}
         if table_extra:
             chunk.update(table_extra)
         chunks.append(chunk)
@@ -182,7 +200,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             continue
         heading = context_prefix(" > ".join(element["heading_path"]), min(600, target_chars // 2, max_bytes // 3))
         budget = max(1, target_chars - len(heading) - 1)
-        table = BeautifulSoup(element["html"], "html.parser").find("table")
+        table = parse_table_html(element["html"]).find("table")
         kind = element["kind"]
         if kind == "heading":
             flush()
@@ -232,7 +250,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 kind = region['kind'] if region['kind'] in {'title', 'code', 'key_value'} else 'table'
                 append_chunk('\n'.join(filter(None, [prefix, *(item['text'] for item in segments)])),
                              [element], number, kind, element['heading_path'], {
-                                 'representation_version': 'xlsx-structure-v2', 'xlsx_region_start': region['start'],
+                                 'representation_version': 'xlsx-structure-v3', 'xlsx_region_start': region['start'],
                                  'xlsx_region_kind': region['kind'], 'xlsx_sheet': region['sheet'],
                                  'xlsx_context_cells': [key for key in [region['title'] if title else None, *header_keys] if key],
                                  'context_element_ids': [linked_title['element_id']] if linked_title else [],
@@ -245,29 +263,43 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             continue
         if table:
             flush()
-            cells = cells_from(table) if not table.find("table") else []
+            relation = relationships.get(element["element_id"], {})
+            external_caption_only = relation.get("empty_table") and relation.get("caption_id")
+            if external_caption_only:
+                # Some parsers also put the adjacent caption in the empty table's text fallback.
+                if clean(text) == clean(embedding_text(relation["caption"])):
+                    continue
+                cells = []
+            else:
+                cells = cells_from(table) if not table.find("table") else []
             if cells:
-                relation = relationships.get(element["element_id"], {})
                 parts, uncertain = table_parts(cells, relation.get("inherited_headers", ()),
                                                infer_first_row=(element.get('coordinate_space') or {}).get('provider') == 'paddle_vl'
                                                or element.get('source_origin') == 'native_extraction')
                 caption = relation.get("caption", "")
                 inherited_caption = relation.get("previous_caption", "")
-                if not parts and caption:
+                if not any(cell.search_text for cell in cells) and caption:
                     for part_number, part in enumerate(split_text(caption, chars=budget,
                             max_bytes=max_bytes - byte_size(heading) - 1, overlap=overlap_chars)):
                         append_chunk("\n".join(filter(None, (heading, part))), [element], part_number,
-                                     "table", element["heading_path"], {"table_cells": [], "table_segments": [], "quality": "unverified"})
+                                     "table", element["heading_path"], {"table_cells": [], "table_segments": [], "quality": "unverified",
+                                                                       "representation_version": TABLE_REPRESENTATION})
+                        chunks[-1]["source_segments"][0]["text"] = part
                     continue
                 table_heading = context_prefix(" > ".join(filter(None, [heading, inherited_caption, caption])), min(800, target_chars // 2, max_bytes // 3))
                 context_ids = list(dict.fromkeys(value for value in (relation.get("caption_id"), relation.get("previous_table_id"), relation.get("previous_caption_id")) if value))
                 represented = {(part["row"], part["column"]) for part in parts}
                 for cell in cells:
-                    if cell.text and (cell.row + 1, cell.column + 1) not in represented:
-                        parts.append({"text": cell.text, "label": "", "row": cell.row + 1, "column": cell.column + 1})
+                    if cell.search_text and (cell.row + 1, cell.column + 1) not in represented:
+                        parts.append({"text": cell.search_text, "label": "", "row": cell.row + 1, "column": cell.column + 1})
                         uncertain = True
                 layout = element.get('layout') or {}
-                if layout.get('space') == 'xlsx_region':
+                legacy_xlsx = layout.get('space') == 'xlsx_region'
+                if not legacy_xlsx:
+                    source_cells = {(cell.row + 1, cell.column + 1): cell.text for cell in cells}
+                    for part in parts:
+                        part["source_text"] = source_cells[part["row"], part["column"]]
+                if legacy_xlsx:
                     for part in parts:
                         part['row'] += layout.get('row_offset', 0)
                         part['column'] += layout.get('column_offset', 0)
@@ -279,7 +311,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                     lines = [" / ".join(filter(None, (part.get("label", ""), part["text"]))) for part in group]
                     append_chunk("\n".join(filter(None, [table_heading, *lines])), [element], part_number,
                                  "table", element["heading_path"],
-                                 {"context_element_ids": context_ids,
+                                 {"representation_version": TABLE_REPRESENTATION, "context_element_ids": context_ids,
                                   "relations": ([{"type": "table_continuation", "origin": "inferred", "status": "unverified", "element_id": relation["previous_table_id"]}] if relation.get("previous_table_id") else []) + ([{"type": "caption", "origin": "inferred", "status": "unverified", "element_id": relation["caption_id"]}] if relation.get("caption_id") else []),
                                   "table_cells": [{"row": part["row"], "column": part["column"]} for part in group],
                                   "table_segments": [{"row": part["row"], "column": part["column"], "text": line,
@@ -287,12 +319,16 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                                       "label_origin": part.get("label_origin", "parser")}
                                                      for part, line in zip(group, lines, strict=True)],
                                   "quality": "unverified" if uncertain or context_ids else "extracted"}, body_prefix=table_heading)
-                    if layout.get('space') == 'xlsx_region':
+                    if legacy_xlsx:
                         # Retain only this chunk's cells instead of copying the
                         # entire region into every source segment.
-                        chunks[-1]['source_segments'][0]['text'] = '\n'.join(part['text'] for part in group)
+                        chunks[-1]['source_segments'] = [{"element_id": element["element_id"], "order": element["order"],
+                                                          "text": "\n".join(part["text"] for part in group)}]
                         chunks[-1]['source_range_quality'] = 'unverified'
+                    else:
+                        set_html_table_evidence(chunks[-1], group)
                 continue
+            text = embedding_text(clean(text))
         if kind in {"figure", "chart", "image"} and element["element_id"] in figures:
             flush()
             relation = figures[element["element_id"]]
@@ -320,15 +356,21 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             continue
         groups = split_text(text, chars=budget, max_bytes=max_bytes - byte_size(heading) - 1,
                             overlap=overlap_chars)
+        extra = {"representation_version": TABLE_REPRESENTATION} if table else None
+        if tables := caption_tables.get(element["element_id"]):
+            extra = {"context_element_ids": tables,
+                     "relations": [{"type": "caption_of", "origin": "inferred", "status": "unverified",
+                                    "element_id": table_id} for table_id in tables]}
         for part_number, part in enumerate(groups):
             append_chunk("\n".join(filter(None, (heading, part))), [element], part_number,
-                         kind if kind in {"figure", "chart", "table"} else "text", element["heading_path"])
+                         kind if kind in {"figure", "chart", "table"} else "text", element["heading_path"], extra)
     flush()
     captions = {element["element_id"]: embedding_text(element["text"]) for element in elements
                 if element["kind"] == "caption" and element["text"]}
     included_captions = {relation["element_id"] for chunk in chunks for relation in chunk.get("relations", [])
                          if relation.get("type") == "caption" and captions.get(relation["element_id"])
                          and captions[relation["element_id"]] in chunk["text"]}
+    included_captions.difference_update(caption_tables)
     chunks = [chunk for chunk in chunks if not (chunk["kind"] == "text" and len(chunk["element_ids"]) == 1
               and chunk["element_ids"][0] in included_captions)]
     for element in elements:

@@ -108,6 +108,9 @@ def _spreadsheet(archive, native_cells):
             inline = cell.find(f'{MAIN}is')
             formula = cell.find(f'{MAIN}f')
             raw = value.text if value is not None else None
+            # A present string cache can legitimately contain an empty string.
+            if formula is not None and value is not None and raw is None and cell.get('t') == 'str':
+                raw = ''
             if native_cells:
                 summary['native_cells'][address.upper()] = {'raw_value': raw, 'xml_type': cell.get('t') or 'n',
                     'source_style_id': int(cell.get('s', '0')),
@@ -127,10 +130,9 @@ def _spreadsheet(archive, native_cells):
                     'formula_attributes': dict(formula.attrib) if formula is not None else None})
             if formula is None:
                 continue
-            value = cell.find(f"{MAIN}v")
             summary["formulas"].append({"cell": address, "formula": formula.text,
                                         "formula_attributes": dict(formula.attrib),
-                                        "cached_value": value.text if value is not None and value.text else None,
+                                        "cached_value": raw,
                                         "cell_type": cell.get("t")})
         sheets.append(summary)
     return {"format": "xlsx", "sheets": sheets, "parser_page_mapping": "unknown",

@@ -8,6 +8,7 @@ from openpyxl.utils import get_column_letter
 from qdrant_client.http.exceptions import ApiException
 
 from indexer.contracts import IndexerError
+from indexer.table_evidence import HTML_CELL_RANGE, html_table_evidence_urls
 from indexer.visual_relations import xlsx_anchor_matches
 from indexer.xlsx_access import CANDIDATE_LIMIT, open_workbook
 from indexer.xlsx_query import execute, preview_mapping, unavailable
@@ -265,6 +266,8 @@ class PublishedRetrieval:
                     xlsx_context = [address for address in chunk.get('xlsx_context_cells', []) if address not in cells]
                     context_urls.extend(base_url + '?cells=' + ','.join(xlsx_context[start:start + 100])
                                         for start in range(0, len(xlsx_context), 100))
+                if chunk.get("source_range_quality") == HTML_CELL_RANGE and len(urls) == 1:
+                    urls = html_table_evidence_urls(urls[0], chunk["source_segments"])
                 before_text = (before.get("body_text") or before["text"])[-600:] if before else ""
                 after_text = (after.get("body_text") or after["text"])[:600] if after else ""
                 context_text = "\n".join(filter(None, [chunk.get("heading_text"), before_text,

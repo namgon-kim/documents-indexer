@@ -1,10 +1,8 @@
 """검색 표현에서 원본 요소와 표 셀이 연결되었는지 보수적으로 점검한다."""
 import re
 
-from bs4 import BeautifulSoup
-
 from indexer.embedding_input import embedding_text
-from indexer.parsing.normalization import cells_from
+from indexer.parsing.normalization import cells_from, parse_table_html
 
 
 def audit_representation(elements, chunks):
@@ -35,7 +33,7 @@ def audit_representation(elements, chunks):
             missing = [term for term in original if term not in represented_text]
             if missing:
                 missing_text_terms.append({"element_id": element["element_id"], "missing_term_count": len(missing)})
-        table = BeautifulSoup(element.get("html") or "", "html.parser").find("table")
+        table = parse_table_html(element.get("html") or "").find("table")
         if not table or table.find("table"):
             continue
         present = {(cell["row"], cell["column"]) for chunk in chunks
@@ -52,7 +50,7 @@ def audit_representation(elements, chunks):
             continue
         for cell in cells_from(table):
             row, column = cell.row + 1 + row_offset, cell.column + 1 + column_offset
-            if cell.text and (row, column) not in present:
+            if cell.search_text and (row, column) not in present:
                 missing_cells.append({"element_id": element["element_id"], "row": row, "column": column})
     return {"excluded": excluded, "unrepresented_elements": unrepresented, "missing_table_cells": missing_cells,
             "missing_text_terms": missing_text_terms, "shortened_heading_chunks": shortened_headings,

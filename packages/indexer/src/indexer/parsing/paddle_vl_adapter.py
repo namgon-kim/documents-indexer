@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup, NavigableString
 
 from indexer.contracts import IndexerError
 from indexer.parsing.contracts import ParseResult
+from indexer.parsing.normalization import parse_table_html
 
 
 class PaddleVLParser:
@@ -93,7 +94,7 @@ class PaddleVLParser:
                     content = ''
                 html = content if category == "table" and "<table" in content.lower() else ""
                 if html and "\\n" in html:
-                    soup = BeautifulSoup(html, "html.parser")
+                    soup = parse_table_html(html)
                     for node in list(soup.find_all(string=True)):
                         if "\\n" in node:
                             node.replace_with(NavigableString(str(node).replace("\\n", "\n")))

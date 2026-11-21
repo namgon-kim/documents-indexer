@@ -534,7 +534,7 @@ class NativeExtractor:
     def _xlsx_regions(self, sheet):
         from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
-        from indexer.parsing.xlsx_source import search_value
+        from indexer.parsing.xlsx_source import search_value, source_value
         from indexer.xlsx_structure import address, contains, occupied
 
         cells = occupied(sheet)
@@ -557,13 +557,13 @@ class NativeExtractor:
                         continue
                     key = address(row, col)
                     cell = by_address.get(key)
-                    text = search_value(cell) if cell else ''
+                    text = source_value(cell) if cell else ''
                     span = local_merges.get((row, col))
                     attrs = f' rowspan="{span[1] - row + 1}" colspan="{span[0] - col + 1}"' if span else ''
                     tag = 'th' if key in region['headers'] else 'td'
                     if tag == 'th':
                         attrs += ' scope="col"'
-                    parts.append(f'<{tag}{attrs}>{escape(text)}</{tag}>')
+                    parts.append(f'<{tag}{attrs} style="white-space: pre-wrap">{escape(text)}</{tag}>')
                 rows.append('<tr>' + ''.join(parts) + '</tr>')
             location = {'kind': 'xlsx_range', 'sheet': sheet['name'], 'start': region['start'], 'end': region['end']}
             fragments = [{'row': positions[cell['address']][0], 'column': positions[cell['address']][1],

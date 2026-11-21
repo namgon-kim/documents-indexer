@@ -41,6 +41,7 @@ from indexer.settings import (
     save_overrides,
     values,
 )
+from indexer.table_evidence import read_html_table_evidence
 from indexer.xlsx_access import open_workbook
 from indexer.xlsx_query import JoinPreview, PublishedTableQuery
 from indexer.xlsx_structure import STRUCTURE_VERSION, SheetProposal
@@ -736,7 +737,8 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         return {"profile_id": profile_id, "dimensions": publisher.embedder.profile.dimensions, "validated": True}
 
     @app.get("/v1/ingest/{document_id}/jobs/{job_id}/elements/{element_id}", dependencies=[Depends(auth.require)])
-    def ingestion_evidence(request: Request, document_id: UUID, job_id: UUID, element_id: str, cells: str | None = None):
+    def ingestion_evidence(request: Request, document_id: UUID, job_id: UUID, element_id: str, cells: str | None = None,
+                           table_cells: Annotated[str | None, Query(max_length=3000)] = None):
         if not hasattr(request.app.state, "ingestion"):
             raise IndexerError("PARSER_NOT_CONFIGURED", "파서 연결을 설정해 주세요.", 503)
         if str(document_id) in request.app.state.index_publisher.deleted_documents():
@@ -745,8 +747,16 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             storage = request.app.state.ingestion.storage
             elements = storage.load_job(str(document_id), str(job_id), "elements")
             element = next(item for item in elements if item.get("element_id") == element_id)
+            if table_cells is not None:
+                if cells is not None or element.get('xlsx_region'):
+                    raise KeyError('unavailable table cell ranges')
+                selected = read_html_table_evidence(element.get("html") or "", table_cells)
+                return {"content": {"text": "\n".join(f'{cell["row"]}행 {cell["column"]}열\n{cell["text"]}'
+                                                       for cell in selected)},
+                        "page": element.get("page"), "coordinates": element.get("coordinates"),
+                        "kind": element["kind"], "cells": selected}
             if cells is not None:
-                from indexer.parsing.xlsx_source import search_value
+                from indexer.parsing.xlsx_source import source_value
 
                 keys = cells.split(',')
                 region = element.get('xlsx_region')
@@ -756,11 +766,11 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                     source = [workbook.cell(region['sheet'], key) for key in keys]
                 if any(cell is None for cell in source):
                     raise KeyError('unavailable cells')
-                return {'content': {'text': '\n'.join(f'{cell["address"]} · {search_value(cell)}' for cell in source)},
+                return {'content': {'text': '\n'.join(f'{cell["address"]} · {source_value(cell)}' for cell in source)},
                         'kind': element['kind'], 'cells': source}
             return {"content": {"text": element["text"]}, "page": element.get("page"),
                     "coordinates": element.get("coordinates"), "kind": element.get("kind")}
-        except (FileNotFoundError, StopIteration, KeyError) as error:
+        except (FileNotFoundError, StopIteration, KeyError, ValueError) as error:
             raise IndexerError("EVIDENCE_NOT_FOUND", "근거를 찾을 수 없습니다.", 404) from error
 
     @app.get('/v1/ingest/{document_id}/jobs/{job_id}/images', dependencies=[Depends(auth.require)])
