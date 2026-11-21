@@ -6,6 +6,8 @@ from pathlib import PurePosixPath
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
+from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
+
 from indexer.contracts import IndexerError
 
 MAX_XML_BYTES = 32 * 1024 * 1024
@@ -63,6 +65,10 @@ def inspect_office(path):
 def _spreadsheet(archive):
     workbook = _xml(archive, "xl/workbook.xml")
     relations = _relationships(archive, "xl/_rels/workbook.xml.rels", "xl")
+    shared = []
+    if 'xl/sharedStrings.xml' in archive.namelist():
+        root = _xml(archive, 'xl/sharedStrings.xml')
+        shared = [''.join(node.text or '' for node in item.iter(f'{MAIN}t')) for item in root.findall(f'{MAIN}si')]
     sheets = []
     for node in workbook.findall(f"{MAIN}sheets/{MAIN}sheet"):
         name, rel_id = node.get("name"), node.get(REL)
@@ -82,13 +88,33 @@ def _spreadsheet(archive):
         if sheet.tag not in {f"{MAIN}worksheet", f"{MAIN}chartsheet"}:
             raise ValueError("지원하지 않는 시트 구조입니다")
         summary["sheet_kind"] = "chart" if sheet.tag == f"{MAIN}chartsheet" else "worksheet"
+        merges = []
+        for item in sheet.findall(f'{MAIN}mergeCells/{MAIN}mergeCell'):
+            bounds = range_boundaries(item.get('ref', ''))
+            merges.append((item.get('ref'), bounds))
+        summary['hidden_merged_cells'] = []
         for cell in sheet.iter(f"{MAIN}c"):
-            formula = cell.find(f"{MAIN}f")
-            if formula is None:
-                continue
-            address = cell.get("r", "")
+            address = cell.get('r', '')
             if not re.fullmatch(r"[A-Za-z]{1,3}[1-9][0-9]{0,6}", address):
                 raise ValueError("셀 주소가 올바르지 않습니다")
+            row, col = coordinate_to_tuple(address.upper())
+            owner = next((ref for ref, (left, top, right, bottom) in merges
+                          if left <= col <= right and top <= row <= bottom and (col, row) != (left, top)), None)
+            value = cell.find(f'{MAIN}v')
+            inline = cell.find(f'{MAIN}is')
+            formula = cell.find(f'{MAIN}f')
+            raw = value.text if value is not None else None
+            if owner and (raw is not None or inline is not None or formula is not None):
+                text = ''.join(node.text or '' for node in inline.iter(f'{MAIN}t')) if inline is not None else raw
+                if cell.get('t') == 's' and raw is not None:
+                    index = int(raw)
+                    if not 0 <= index < len(shared):
+                        raise ValueError('공유 문자열을 확인할 수 없습니다')
+                    text = shared[index]
+                summary['hidden_merged_cells'].append({'cell': address.upper(), 'merged_range': owner,
+                    'value': text, 'cell_type': cell.get('t'), 'formula': formula.text if formula is not None else None})
+            if formula is None:
+                continue
             value = cell.find(f"{MAIN}v")
             summary["formulas"].append({"cell": address, "formula": formula.text,
                                         "formula_attributes": dict(formula.attrib),

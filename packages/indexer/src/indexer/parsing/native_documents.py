@@ -67,6 +67,7 @@ class NativeExtractor:
         self.checkpoint, self.persist, self.progress = checkpoint or {}, persist, progress
         self.save_image = save_image
         self.elements, self.warnings, self.limitations, self.visuals = [], [], [], []
+        self.xlsx_sheets = []
 
     def add(self, kind, text='', html='', location=None, layout=None, container=None):
         if text or html:
@@ -252,7 +253,8 @@ class NativeExtractor:
         self.visuals.clear()
         return ParseResult('native_' + kind, self.elements,
                            {'provider': 'native_' + kind, 'mode': self.mode,
-                            'warnings': self.warnings, 'limitations': self.limitations, 'visual_count': visual_count},
+                            'warnings': self.warnings, 'limitations': self.limitations, 'visual_count': visual_count,
+                            **({'xlsx_sheets': self.xlsx_sheets} if kind == 'xlsx' else {})},
                            incomplete=bool(self.warnings))
 
     def _docx(self, path):
@@ -405,6 +407,9 @@ class NativeExtractor:
 
     def _xlsx(self, path):
         try:
+            from indexer.office_inspection import inspect_office
+            source = inspect_office(path)
+            hidden_by_sheet = {item['name']: item.get('hidden_merged_cells', []) for item in source['sheets']}
             with warnings.catch_warnings(record=True) as detected:
                 warnings.simplefilter('always')
                 book = load_workbook(path, data_only=False, read_only=False, keep_links=False)
@@ -413,6 +418,24 @@ class NativeExtractor:
                 self.warning('Excel의 일부 확장 기능 또는 시각 요소를 읽지 못했을 수 있습니다.')
             for sheet in book.worksheets:
                 value_sheet = values[sheet.title]
+                sheet_data = {'name': sheet.title, 'visibility': sheet.sheet_state,
+                              'merged_ranges': [str(value) for value in sheet.merged_cells.ranges],
+                              'tables': [{'name': table.name, 'ref': table.ref} for table in sheet.tables.values()],
+                              'hidden_rows': [index for index, dim in sheet.row_dimensions.items() if dim.hidden],
+                              'hidden_columns': [index for index, dim in sheet.column_dimensions.items() if dim.hidden],
+                              'cells': [], 'hidden_merged_cells': hidden_by_sheet.get(sheet.title, [])}
+                if sheet_data['hidden_merged_cells']:
+                    self.warning(f'{sheet.title} 시트의 병합 영역 안에 숨은 값이 있습니다. 원본을 확인해 주세요.')
+                for cell in sheet._cells.values():
+                    if cell.value is None:
+                        continue
+                    cached = value_sheet[cell.coordinate].value if cell.data_type == 'f' else None
+                    sheet_data['cells'].append({'address': cell.coordinate, 'value': str(cell.value),
+                        'type': cell.data_type, 'cached_value': str(cached) if cached is not None else None,
+                        'number_format': cell.number_format, 'bold': bool(cell.font.bold),
+                        'fill': cell.fill.patternType, 'style_id': cell.style_id,
+                        'hyperlink': cell.hyperlink.target if cell.hyperlink else None})
+                self.xlsx_sheets.append(sheet_data)
                 if sheet.sheet_state != 'visible':
                     self.warning('숨겨진 시트가 포함되어 있습니다.')
                 self.add('heading', sheet.title, '<h1>' + escape(sheet.title) + '</h1>')
@@ -426,27 +449,41 @@ class NativeExtractor:
                     spans = {(m.min_row, m.min_col): m for m in merged}
                     covered = {(r, c) for m in merged for r in range(m.min_row, m.max_row + 1)
                                for c in range(m.min_col, m.max_col + 1) if (r, c) != (m.min_row, m.min_col)}
-                    rows = []
-                    for row in range(1, max_row + 1):
-                        parts = []
-                        for col in range(1, max_col + 1):
-                            if (row, col) in covered:
-                                continue
-                            cell = sheet.cell(row, col)
-                            value = cell.value
-                            if cell.data_type == 'f':
-                                cached = value_sheet.cell(row, col).value
-                                value = f'수식 {value}' + (f' / 저장된 결과 {cached}' if cached is not None else ' / 저장된 결과 없음')
-                                if cached is None:
-                                    self.warning('저장된 계산 결과가 없는 수식이 있습니다.')
-                            text = '' if value is None else str(value)
-                            span = spans.get((row, col))
-                            attrs = (f' rowspan="{span.max_row - span.min_row + 1}" colspan="{span.max_col - span.min_col + 1}"' if span else '')
-                            parts.append(f'<td{attrs}>{escape(text)}</td>')
-                        rows.append('<tr>' + ''.join(parts) + '</tr>')
-                    location = {'kind': 'xlsx_range', 'sheet': sheet.title, 'start': 'A1',
-                                'end': f'{get_column_letter(max_col)}{max_row}'}
-                    self.add('table', html='<table>' + ''.join(rows) + '</table>', location=location)
+                    # Empty rows are tentative boundaries, never cross a merged
+                    # range. Keep original row numbers on every resulting region.
+                    occupied_rows = {cell.row for cell in cells}
+                    occupied_rows.update(r for m in merged for r in range(m.min_row, m.max_row + 1))
+                    bands = []
+                    for row in sorted(occupied_rows):
+                        if not bands or row > bands[-1][-1] + 1:
+                            bands.append([row])
+                        else:
+                            bands[-1].append(row)
+                    for band in bands:
+                        rows = []
+                        for row in band:
+                            parts = []
+                            for col in range(1, max_col + 1):
+                                if (row, col) in covered:
+                                    continue
+                                cell = sheet.cell(row, col)
+                                value = cell.value
+                                if cell.data_type == 'f':
+                                    cached = value_sheet.cell(row, col).value
+                                    value = f'수식 {value}' + (f' / 저장된 결과 {cached}' if cached is not None else ' / 저장된 결과 없음')
+                                    if cached is None:
+                                        self.warning('저장된 계산 결과가 없는 수식이 있습니다.')
+                                text = '' if value is None else str(value)
+                                span = spans.get((row, col))
+                                attrs = (f' rowspan="{span.max_row - span.min_row + 1}" colspan="{span.max_col - span.min_col + 1}"' if span else '')
+                                parts.append(f'<td{attrs}>{escape(text)}</td>')
+                            rows.append('<tr>' + ''.join(parts) + '</tr>')
+                        location = {'kind': 'xlsx_range', 'sheet': sheet.title, 'start': f'A{band[0]}',
+                                    'end': f'{get_column_letter(max_col)}{band[-1]}'}
+                        self.add('table', html='<table>' + ''.join(rows) + '</table>', location=location,
+                                 layout={'space': 'xlsx_region', 'row_offset': band[0] - 1,
+                                         'column_offset': 0, 'boundary_origin': 'inferred',
+                                         'boundary_status': 'unverified'})
                 if sheet._charts:
                     from indexer.parsing.xlsx_chart_preview import chart_preview, renderer_status
                     for chart_index, chart in enumerate(sheet._charts):

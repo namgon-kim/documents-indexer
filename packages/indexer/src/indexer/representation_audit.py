@@ -40,9 +40,13 @@ def audit_representation(elements, chunks):
             continue
         present = {(cell["row"], cell["column"]) for chunk in chunks
                    if element["element_id"] in chunk.get("element_ids", []) for cell in chunk.get("table_cells", [])}
+        layout = element.get('layout') or {}
+        row_offset = layout.get('row_offset', 0) if layout.get('space') == 'xlsx_region' else 0
+        column_offset = layout.get('column_offset', 0) if layout.get('space') == 'xlsx_region' else 0
         for cell in cells_from(table):
-            if cell.text and (cell.row + 1, cell.column + 1) not in present:
-                missing_cells.append({"element_id": element["element_id"], "row": cell.row + 1, "column": cell.column + 1})
+            row, column = cell.row + 1 + row_offset, cell.column + 1 + column_offset
+            if cell.text and (row, column) not in present:
+                missing_cells.append({"element_id": element["element_id"], "row": row, "column": column})
     return {"excluded": excluded, "unrepresented_elements": unrepresented, "missing_table_cells": missing_cells,
             "missing_text_terms": missing_text_terms, "shortened_heading_chunks": shortened_headings,
             "shortened_context_elements": shortened_context}

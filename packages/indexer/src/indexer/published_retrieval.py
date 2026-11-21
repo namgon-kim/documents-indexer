@@ -4,6 +4,7 @@ import json
 from contextlib import nullcontext
 
 import httpx
+from openpyxl.utils import get_column_letter
 from qdrant_client.http.exceptions import ApiException
 
 from indexer.contracts import IndexerError
@@ -160,6 +161,11 @@ class PublishedRetrieval:
                             location = source.get("office_location")
                             if location:
                                 ref = {**location, "role": role}
+                                if role == 'evidence' and location.get('kind') == 'xlsx_range' and chunk.get('table_cells'):
+                                    cells = chunk['table_cells']
+                                    ref['start'] = f"{get_column_letter(min(c['column'] for c in cells))}{min(c['row'] for c in cells)}"
+                                    ref['end'] = f"{get_column_letter(max(c['column'] for c in cells))}{max(c['row'] for c in cells)}"
+                                    ref['status'] = 'unverified'
                                 if ref not in refs:
                                     refs.append(ref)
                             source_page = source.get("page")

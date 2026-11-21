@@ -188,6 +188,12 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                     if cell.text and (cell.row + 1, cell.column + 1) not in represented:
                         parts.append({"text": cell.text, "label": "", "row": cell.row + 1, "column": cell.column + 1})
                         uncertain = True
+                layout = element.get('layout') or {}
+                if layout.get('space') == 'xlsx_region':
+                    for part in parts:
+                        part['row'] += layout.get('row_offset', 0)
+                        part['column'] += layout.get('column_offset', 0)
+                    uncertain = True
                 parts.sort(key=lambda item: (item["row"], item["column"]))
                 table_parts_by_policy = (list(row) for _, row in groupby(parts, key=lambda part: part["row"])) if profile == "spreadsheet" else [parts]
                 groups = (group for row in table_parts_by_policy for group in table_groups(table_heading, row, target_chars, max_bytes))
@@ -203,6 +209,11 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                                       "label_origin": part.get("label_origin", "parser")}
                                                      for part, line in zip(group, lines, strict=True)],
                                   "quality": "unverified" if uncertain or context_ids else "extracted"}, body_prefix=table_heading)
+                    if layout.get('space') == 'xlsx_region':
+                        # Retain only this chunk's cells instead of copying the
+                        # entire region into every source segment.
+                        chunks[-1]['source_segments'][0]['text'] = '\n'.join(part['text'] for part in group)
+                        chunks[-1]['source_range_quality'] = 'unverified'
                 continue
         if kind in {"figure", "chart", "image"} and element["element_id"] in figures:
             flush()
