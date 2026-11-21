@@ -458,7 +458,7 @@ class NativeExtractor:
                         preview = chart_preview(path, sheet.title, chart_index)
                         if preview:
                             self.image(preview, 'png', location, layout, preview=True)
-                            self.warning('Excel 차트는 원본 시트에서 생성한 대략적인 미리보기로, 실제 표시와 다를 수 있습니다.')
+                            self.limitation('Excel 차트는 원본 시트에서 생성한 대략적인 미리보기로, 실제 표시와 다를 수 있습니다.')
                         else:
                             office, rasterizer = renderer_status()
                             missing = ', '.join(name for name, command in [('LibreOffice', office), ('Poppler(pdftoppm)', rasterizer)] if not command)

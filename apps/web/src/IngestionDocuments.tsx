@@ -88,7 +88,7 @@ function DocumentCard({item, busy, modelEnabled, embeddingProfile, supportsDpi, 
   const coverage = job.coverage;
   const notices: string[] = [];
   if (coverage?.missing_pages.length) notices.push(`${coverageMessage(coverage)} 읽지 못한 페이지: ${coverage.missing_pages.join(", ")}`);
-  if (coverage?.unknown_scope) notices.push("전체 페이지의 누락 여부를 확인하지 못했습니다.");
+  if (coverage?.unknown_scope && item.format === "pdf") notices.push("전체 페이지의 누락 여부를 확인하지 못했습니다.");
   if (coverage?.provider_incomplete) notices.push("일부 내용이 처리되지 않았거나 결과의 완전성을 확인할 수 없습니다.");
   notices.push(...(coverage?.warnings || []));
   if (coverage?.visual_without_text_pages?.length) notices.push(`그림·도식에서 글자를 확인하지 못한 페이지: ${coverage.visual_without_text_pages.join(", ")}. OCR 실패일 수 있습니다.`);

@@ -897,13 +897,22 @@ def test_xlsx_chart_preview_is_available_for_review_and_failed_render_is_reporte
     workbook.save(source)
     workbook.close()
     saved = {}
-    monkeypatch.setattr(previews, 'chart_preview', lambda *args: b'chart-preview')
-    result = NativeExtractor(None, 'native_text', save_image=lambda key, data: saved.update({key: data})).extract(source, 'xlsx')
+    monkeypatch.setattr(previews, 'chart_preview', lambda *args: png())
+    result = NativeExtractor(ImageParser(), 'native_visual', save_image=lambda key, data: saved.update({key: data})).extract(source, 'xlsx')
     image = next(item for item in result.elements if item.get('_origin') == 'native_image')
     assert image['_image_is_preview'] and image['source_location']['cell'] == 'D16'
-    assert saved[image['_asset_id']] == b'chart-preview'
+    assert saved[image['_asset_id']] == png()
     assert next(item for item in normalize_elements(result.elements) if item.get('asset_id'))['image_is_preview']
-    assert result.incomplete
+    assert not result.incomplete
+    assert not result.raw['warnings']
+    assert any('대략적인 미리보기' in item for item in result.raw['limitations'])
+    from indexer.ingestion_graph import make_graph
+    from indexer.ingestion_service import unresolved_visuals
+    state = make_graph(ImageParser()).invoke({'path': str(source), 'document_id': 'd', 'job_id': 'j',
+        'settings': {'extraction_mode': 'native_visual', 'target_chars': 400, 'overlap_chars': 0}})
+    assert not state['coverage']['provider_incomplete']
+    assert not unresolved_visuals(state['normalized'])
+    assert state['coverage']['unknown_scope'] and state['coverage']['limitations']
     monkeypatch.setattr(previews, 'chart_preview', lambda *args: None)
     failed = NativeExtractor(None, 'native_text').extract(source, 'xlsx')
     assert failed.incomplete and any('D16' in warning for warning in failed.raw['warnings'])
