@@ -3,6 +3,7 @@
 import math
 import re
 from datetime import date, datetime, time, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from xml.etree.ElementTree import tostring
 
 from openpyxl.cell import Cell
@@ -47,16 +48,37 @@ def decode_raw(value, kind, number_format, epoch):
     return value
 
 
-def cell_record(cell, value, formula, cached, merge, *, hidden=None):
+
+SIMPLE_DATE_MASK = re.compile(r'(?:yyyy|yy|mm?|dd?)(?:[-/. ](?:yyyy|yy|mm?|dd?)){2}', re.IGNORECASE)
+DATE_PART = re.compile(r'yyyy|yy|mm?|dd?', re.IGNORECASE)
+
+
+def display_value(value, kind, number_format):
+    if kind == 'boolean':
+        return ('TRUE' if value else 'FALSE'), 'formatted'
+    if kind in {'integer', 'number'} and re.fullmatch(r'0+', number_format):
+        # Work on the typed value without converting integers through binary floats.
+        rounded = Decimal(str(value)).to_integral_value(rounding=ROUND_HALF_UP)
+        digits = format(rounded.copy_abs(), 'f').zfill(len(number_format))
+        return ('-' if rounded.is_signed() else '') + digits, 'formatted'
+    if kind in {'date', 'datetime'} and SIMPLE_DATE_MASK.fullmatch(number_format):
+        parts = DATE_PART.findall(number_format.lower())
+        if {part[0] for part in parts} == {'y', 'm', 'd'}:
+            day = date.fromisoformat(value[:10])
+            fields = {'yyyy': f'{day.year:04}', 'yy': f'{day.year % 100:02}', 'mm': f'{day.month:02}',
+                      'm': str(day.month), 'dd': f'{day.day:02}', 'd': str(day.day)}
+            return DATE_PART.sub(lambda match: fields[match[0].lower()], number_format), 'formatted'
+    return ('' if value is None else str(value)), 'canonical'
+
+
+def cell_record(cell, value, formula, cached, merge, *, cache_xml_type=None, hidden=None):
     data_type = hidden['cell_type'] if hidden else cell.data_type
     value, value_type = typed_value(value, data_type)
-    cached, cache_type = typed_value(cached, data_type)
-    display = cached if formula else value
-    text = ('계산값 없음' if formula else '') if display is None else str(display)
-    display_kind = 'canonical'
-    if type(display) in {int, float} and re.fullmatch(r'0+', cell.number_format):
-        text = f'{display:.0f}'.zfill(len(cell.number_format) + int(display < 0))
-        display_kind = 'formatted'
+    cached, cache_type = typed_value(cached, cache_xml_type)
+    text, display_kind = display_value(cached, cache_type, cell.number_format) if formula else display_value(
+        value, value_type, cell.number_format)
+    if formula and cached is None:
+        text, display_kind = '계산값 없음', 'missing_cache'
     link = cell.hyperlink
     return {'address': cell.coordinate, 'type': data_type, 'value': value, 'value_type': value_type,
             'formula': formula, 'cached_value': cached, 'cached_value_type': cache_type,
@@ -130,12 +152,12 @@ def sheet_record(book, sheet, inspected, values):
         value = cell.value
         if value is None and raw.get('inline_present'):
             value = raw['inline_text']
-        record = cell_record(cell, None if formula else value, formula, cached, merge)
+        record = cell_record(cell, None if formula else value, formula, cached, merge,
+                             cache_xml_type=details.get('cell_type'))
         record.update(raw_value=raw.get('raw_value'), raw_xml_type=raw.get('xml_type'),
                       source_style_id=raw.get('source_style_id'), hyperlink=links.get(cell.coordinate, record['hyperlink']))
         if formula:
             record['raw_cached_value'] = details.get('cached_value')
-            record['cached_value'], record['cached_value_type'] = typed_value(cached, details.get('cell_type'))
         result['cells'].append(record)
     visible = {item['address'] for item in result['cells']}
     for key in raw_cells.keys() - visible - hidden_values:
@@ -156,9 +178,11 @@ def sheet_record(book, sheet, inspected, values):
                    if hidden['formula_attributes'] is not None else None)
         value = decode_raw(hidden['value'], hidden['cell_type'], cell.number_format, book.epoch)
         record = cell_record(cell, None if formula else value, formula, value if formula else None,
-                             hidden['merged_range'], hidden=hidden)
+                             hidden['merged_range'], cache_xml_type=hidden['cell_type'] if formula else None, hidden=hidden)
         record.update(raw_value=hidden['raw_value'], raw_xml_type=hidden['cell_type'],
                       source_style_id=hidden['style_id'], hyperlink=links.get(hidden['cell']))
+        if formula:
+            record['raw_cached_value'] = hidden['raw_value']
         result['hidden_merged_cells'].append({'cell': hidden['cell'], **record})
     extents = [(cell['address'], cell['address']) for cell in [*result['cells'], *result['hidden_merged_cells']]
                if cell['has_content']]
@@ -187,11 +211,25 @@ def workbook_styles(book, sheets):
             'date_epoch': book.epoch.isoformat()}
 
 
-def search_value(cell):
+
+def formula_label(cell):
+    formula = cell['formula']
+    if not formula:
+        return ''
+    text = formula.get('text') or formula.get('raw_text')
+    return f'수식 {text}' if text else '수식'
+
+
+def source_value(cell):
+    """Keep the displayed value's whitespace and show the formula on its own line."""
     text = cell['display_text']
-    if cell['formula']:
-        formula = cell['formula'].get('text') or cell['formula'].get('raw_text')
-        text = ' / '.join(filter(None, (text, f'수식 {formula}' if formula else '수식')))
+    label = formula_label(cell)
+    if cell['hidden_merged']:
+        text = f'병합 내부 숨은 값\n{text}'
+    return f'{text}\n{label}' if label else text
+
+def search_value(cell):
+    text = ' / '.join(filter(None, (cell['display_text'], formula_label(cell))))
     if cell['hidden_merged']:
         text = f'병합 내부 숨은 값 {cell["address"]} / {text}'
     return text

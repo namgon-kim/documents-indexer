@@ -4,10 +4,9 @@ import re
 from collections import Counter, defaultdict
 from unicodedata import normalize
 
-from bs4 import BeautifulSoup
 from openpyxl.utils.cell import coordinate_to_tuple
 
-from indexer.parsing.normalization import cells_from
+from indexer.parsing.normalization import cells_from, parse_table_html
 
 
 def normalized(value):
@@ -19,7 +18,7 @@ def inventory(elements):
     xlsx_rows = defaultdict(dict)
     for element in elements:
         page = element.get("page")
-        table = BeautifulSoup(element.get("html") or "", "html.parser").find("table")
+        table = parse_table_html(element.get("html") or "").find("table")
         table_cells = cells_from(table) if table and not table.find("table") else []
         location = element.get('office_location') or {}
         if location.get('kind') == 'xlsx_range' and (table_cells or element.get('xlsx_region')):

@@ -11,7 +11,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import httpx
-from bs4 import BeautifulSoup
 
 from indexer.artifact_store import ArtifactStore, atomic_json
 from indexer.content_comparison import compare
@@ -19,7 +18,7 @@ from indexer.contracts import IndexerError
 from indexer.documents import CHUNK_DEFAULTS, select_profile
 from indexer.ingestion_graph import make_graph
 from indexer.parsing.contracts import Parser
-from indexer.parsing.normalization import cells_from
+from indexer.parsing.normalization import cells_from, parse_table_html
 from indexer.representation_audit import audit_representation
 from indexer.review_status import normalize_review_status
 from indexer.visual_relations import xlsx_anchor_matches
@@ -855,7 +854,7 @@ class IngestionService:
             for element in elements:
                 if element.get("page") != page or not element.get("text"):
                     continue
-                table = BeautifulSoup(element.get("html") or "", "html.parser").find("table")
+                table = parse_table_html(element.get("html") or "").find("table")
                 cells = cells_from(table) if table and not table.find("table") else []
                 result.append({"element_id": element["element_id"], "job_id": element.get("job_id", job_id),
                                "kind": element["kind"], "text": element["text"],

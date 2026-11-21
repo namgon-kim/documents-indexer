@@ -3,10 +3,8 @@
 import re
 from itertools import pairwise
 
-from bs4 import BeautifulSoup
-
 from indexer.element_scope import same_scope
-from indexer.parsing.normalization import cells_from
+from indexer.parsing.normalization import cells_from, parse_table_html
 from indexer.table_continuity import TABLE_NUMBER, column_headers, header_signature
 
 CAPTION = re.compile(r"^[<\[(]?\s*(?:표|table)(?=\s|\d|[.:])", re.IGNORECASE)
@@ -17,7 +15,7 @@ def table_relationships(elements):
     relations = {}
     tables = {}
     for index, element in enumerate(elements):
-        table = BeautifulSoup(element["html"], "html.parser").find("table")
+        table = parse_table_html(element["html"]).find("table")
         if not table or table.find("table"):
             continue
         cells = cells_from(table)

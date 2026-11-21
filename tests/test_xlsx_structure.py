@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime
 from uuid import uuid4
+from xml.etree import ElementTree
 from zipfile import ZipFile
 
 import httpx
@@ -66,7 +67,7 @@ def test_original_values_and_style_model_keep_types_cache_and_line_breaks(tmp_pa
     sheet['D3'] = True
     sheet['E3'] = '=1+2'
     sheet['F3'] = '=2+2'
-    sheet['G4'] = 'first\nsecond'
+    sheet['G4'] = 'first\n  second'
     sheet['G4'].font = Font(color='FF121314', bold=True)
     sheet['G4'].fill = PatternFill('solid', fgColor='FF445566')
     sheet['G4'].border = Border(left=Side(style='thin', color='FF778899'))
@@ -75,20 +76,72 @@ def test_original_values_and_style_model_keep_types_cache_and_line_breaks(tmp_pa
     sheet.column_dimensions.group('D', 'F', hidden=True)
     book.save(path)
     patch_sheet(path, cached_path, lambda data: data.replace(b'<f>1+2</f><v></v>', b'<f>1+2</f><v>3</v>'))
-    raw = native(cached_path)['parser_result']
+    state = native(cached_path)
+    raw = state['parser_result']
     sheet = raw['xlsx_sheets'][0]
     cells = {item['address']: item for item in sheet['cells']}
     assert cells['C3']['value'] == '2024-11-21T00:00:00' and cells['C3']['date_format'] == 'dd/mm/yyyy'
     assert cells['C3']['raw_value'].isdigit()
+    assert cells['C3']['display_text'] == '21/11/2024' and cells['C3']['display_kind'] == 'formatted'
     assert cells['D3']['value'] is True
     assert cells['E3']['formula']['text'] == '=1+2' and cells['E3']['value'] is None
     assert cells['E3']['cached_value'] == 3 and cells['E3']['cached_value_type'] == 'integer'
     assert cells['F3']['cached_value'] is None and cells['F3']['display_text'] == '계산값 없음'
-    assert cells['G4']['value'] == 'first\nsecond'
+    assert cells['G4']['value'] == cells['G4']['display_text'] == 'first\n  second'
+    assert any('first\n  second' in item['text'] for item in state['normalized'])
     assert cells['G4']['hyperlink']['target'] == 'https://example.test'
     style = raw['xlsx_style_model']['styles'][cells['G4']['style_id']]
     assert all(color in style[key] for color, key in [('FF121314', 'font'), ('FF445566', 'fill'), ('FF778899', 'border')])
     assert sheet['hidden_rows'] == [4] and sheet['hidden_column_ranges'] == [{'start': 4, 'end': 6}]
+
+
+
+def test_xlsx_display_and_formula_cache_keep_independent_types(tmp_path):
+    original, patched = tmp_path / 'values.xlsx', tmp_path / 'cached.xlsx'
+    book = Workbook()
+    sheet = book.active
+    for key, value, mask in [('A1', 1, '00000000000000000000'), ('B1', '=IF(TRUE,"","filled")', 'General'),
+                             ('C1', '=FALSE()', 'General'), ('D1', '=DATE(2024,2,9)', 'yyyy-mm-dd'),
+                             ('E1', '=1/0', 'General'), ('F1', '=1+2', 'General')]:
+        sheet[key] = value
+        sheet[key].number_format = mask
+    sheet.merge_cells('G1:H1')
+    sheet['G1'] = 'Merged'
+    book.save(original)
+
+    def add_caches(data):
+        namespace = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+        root = ElementTree.fromstring(data)
+        cells = {cell.get('r'): cell for cell in root.iter(namespace + 'c')}
+        for key, original_type, cached in [('A1', 'n', '9007199254740993'), ('B1', 'str', ''),
+                                           ('C1', 'b', '0'), ('D1', 'n', '45331'), ('E1', 'e', '#DIV/0!')]:
+            cells[key].set('t', original_type)
+            cells[key].find(namespace + 'v').text = cached
+        row = root.find(f'{namespace}sheetData/{namespace}row')
+        hidden = ElementTree.SubElement(row, namespace + 'c', r='H1', t='str')
+        ElementTree.SubElement(hidden, namespace + 'f').text = 'IF(TRUE,"","filled")'
+        ElementTree.SubElement(hidden, namespace + 'v')
+        return ElementTree.tostring(root)
+
+    patch_sheet(original, patched, add_caches)
+    state = native(patched)
+    cells = {cell['address']: cell for cell in state['parser_result']['xlsx_sheets'][0]['cells']}
+    assert cells['A1']['value'] == 9007199254740993 and cells['A1']['value_type'] == 'integer'
+    assert cells['A1']['raw_xml_type'] == 'n' and cells['A1']['display_text'] == '00009007199254740993'
+    assert cells['B1']['cache_status'] == 'stored' and cells['B1']['display_text'] == ''
+    assert cells['B1']['cached_value_type'] == 'string' and cells['B1']['raw_cached_value'] == ''
+    assert cells['C1']['cached_value'] is False and cells['C1']['display_text'] == 'FALSE'
+    assert cells['D1']['cached_value_type'] == 'datetime' and cells['D1']['display_text'] == '2024-02-09'
+    assert cells['D1']['cached_value'] == '2024-02-09T00:00:00'
+    assert cells['E1']['cached_value_type'] == 'error' and cells['E1']['display_text'] == '#DIV/0!'
+    assert cells['F1']['cached_value'] is None and cells['F1']['display_kind'] == 'missing_cache'
+    assert cells['F1']['display_text'] == '계산값 없음'
+    assert all(cells[key]['value'] is None and cells[key]['formula']['text'].startswith('=') for key in ('B1', 'C1', 'D1', 'E1', 'F1'))
+    hidden = state['parser_result']['xlsx_sheets'][0]['hidden_merged_cells'][0]
+    assert hidden['address'] == 'H1' and hidden['cached_value'] == hidden['raw_cached_value'] == ''
+    assert hidden['cache_status'] == 'stored'
+    assert any('계산값 없음 / 수식 =1+2' in chunk['text'] for chunk in state['chunks'])
+    assert any('계산값 없음\n수식 =1+2' in item['text'] for item in state['normalized'])
 
 
 def test_adjacent_tables_use_registered_ranges_and_keep_absolute_fragments(tmp_path):

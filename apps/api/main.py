@@ -746,7 +746,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             elements = storage.load_job(str(document_id), str(job_id), "elements")
             element = next(item for item in elements if item.get("element_id") == element_id)
             if cells is not None:
-                from indexer.parsing.xlsx_source import search_value
+                from indexer.parsing.xlsx_source import source_value
 
                 keys = cells.split(',')
                 region = element.get('xlsx_region')
@@ -756,7 +756,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                     source = [workbook.cell(region['sheet'], key) for key in keys]
                 if any(cell is None for cell in source):
                     raise KeyError('unavailable cells')
-                return {'content': {'text': '\n'.join(f'{cell["address"]} · {search_value(cell)}' for cell in source)},
+                return {'content': {'text': '\n'.join(f'{cell["address"]} · {source_value(cell)}' for cell in source)},
                         'kind': element['kind'], 'cells': source}
             return {"content": {"text": element["text"]}, "page": element.get("page"),
                     "coordinates": element.get("coordinates"), "kind": element.get("kind")}

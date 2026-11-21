@@ -4,6 +4,7 @@ import pytest
 from indexer.chunking import make_chunks, normalize_elements
 from indexer.contracts import IndexerError
 from indexer.parsing.contracts import ParserConfig, ParseRequest
+from indexer.parsing.normalization import cells_from, parse_table_html
 from indexer.parsing.paddle_vl_adapter import PaddleVLParser
 from indexer.parsing.upstage_adapter import UpstageParser
 from indexer.structure_relations import figure_relationships
@@ -64,11 +65,61 @@ def test_paddle_table_escaped_newlines_and_inferred_headers(tmp_path):
         {'block_label': 'table', 'block_content': table}]}}]}}
     with httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response))) as client:
         result = PaddleVLParser(ParserConfig('paddle_vl', 'http://example', ''), client).parse(ParseRequest(path, 'pdf', page_count=1))
-    chunks = make_chunks('d', 'j', normalize_elements(result.elements), 400, 0)
+    elements = normalize_elements(result.elements)
+    assert '• 가\n• 나' in elements[0]['text']
+    chunks = make_chunks('d', 'j', elements, 400, 0)
     assert all('\\n' not in c['text'] for c in chunks)
     segment = next(s for c in chunks for s in c['table_segments'] if '• 가' in s['value'])
     assert '목표' in segment['label'] and segment['label_origin'] == 'inferred'
     assert result.raw == response
+
+
+
+def test_common_html_keeps_line_breaks_and_indentation_in_evidence():
+    html = """<table>
+    <tr><th scope="col">Unit<br> price</th><th scope="col">Notes</th></tr>
+    <tr><td>1.<span>25</span></td>
+    <td><div>first<br>  second<br><br>last</div>
+    <pre>    indented
+        child</pre>
+    <code><span>  call()</span>
+      arg</code><script>discard</script></td></tr>
+    </table>"""
+    soup = parse_table_html(html)
+    original = str(soup)
+    cells = cells_from(soup.table)
+    assert str(soup) == original
+    assert cells[2].text == '1.25'
+    assert cells[3].text == 'first\n  second\n\nlast\n    indented\n        child\n  call()\n      arg'
+    assert cells[3].search_text == 'first second last indented child call() arg'
+    assert cells[0].search_text == 'Unit price'
+
+    elements = normalize_elements([{'category': 'table', 'page': 1, 'content': {'html': html}}])
+    assert cells[3].text in elements[0]['text']
+    chunk = make_chunks('d', 'j', elements, 400, 0)[0]
+    assert 'Unit price / 1.25' in chunk['text']
+    assert cells[3].search_text in chunk['text'] and cells[3].text not in chunk['text']
+    assert cells[3].text in chunk['source_segments'][0]['text']
+    assert 'discard' not in chunk['text']
+
+
+
+def test_table_whitespace_style_applies_across_inline_elements():
+    html = '<table style="white-space: pre-wrap"><tr><td><span>start</span>\n    <span>end</span></td></tr></table>'
+    source = 'start\n    end'
+    assert cells_from(parse_table_html(html).table)[0].text == source
+    elements = normalize_elements([{'category': 'table', 'page': 1, 'content': {'html': html}}])
+    assert elements[0]['text'] == source
+    assert make_chunks('d', 'j', elements, 400, 0)[0]['table_segments'][0]['value'] == 'start end'
+
+
+def test_plain_html_cells_keep_inline_text_and_ordinary_search_labels():
+    html = '<table><tr><th>Role</th><th>Value</th></tr><tr><td>Fee</td><td><b>pre</b>paid &amp; ready</td></tr></table>'
+    elements = normalize_elements([{'category': 'table', 'page': 1, 'content': {'html': html}}])
+    chunks = make_chunks('d', 'j', elements, 400, 0)
+    segments = [part for chunk in chunks for part in chunk['table_segments']]
+    assert any(part['label'] == 'Fee / Value' and part['value'] == 'prepaid & ready' for part in segments)
+    assert 'prepaid & ready' in elements[0]['text']
 
 
 def test_paddle_textless_image_is_reviewable(tmp_path):
