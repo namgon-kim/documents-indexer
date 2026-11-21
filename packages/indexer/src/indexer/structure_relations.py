@@ -19,8 +19,6 @@ def table_relationships(elements):
         if not table or table.find("table"):
             continue
         cells = cells_from(table)
-        if not cells:
-            continue
         caption_tag = table.find("caption")
         caption = caption_tag.get_text(" ", strip=True) if caption_tag else ""
         caption_id = None
@@ -33,8 +31,10 @@ def table_relationships(elements):
                                 and elements[i]["kind"] == "table" and same_scope(elements[i], element)]
                 if not other_tables:
                     caption, caption_id = nearby[0]["text"], nearby[0]["element_id"]
-        tables[index] = {"element": element, "cells": cells, "caption": caption, "caption_id": caption_id}
-        relations[element["element_id"]] = {"caption": caption, "caption_id": caption_id}
+        empty_table = (not any(cell.search_text for cell in cells) if cells else not table.find(["td", "th"]))
+        relations[element["element_id"]] = {"caption": caption, "caption_id": caption_id, "empty_table": empty_table}
+        if cells:
+            tables[index] = {"element": element, "cells": cells, "caption": caption, "caption_id": caption_id}
     indices = list(tables)
     for left, right in pairwise(indices):
         previous, current = tables[left], tables[right]

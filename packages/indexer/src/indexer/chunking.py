@@ -134,6 +134,11 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
         if len(matches) == 1 and matches[0][1]:
             title_context.add(current['element_id'])
     relationships = table_relationships(elements)
+    caption_tables = defaultdict(list)
+    for element in elements:
+        relation = relationships.get(element["element_id"], {})
+        if relation.get("empty_table") and relation.get("caption_id") and not element.get("xlsx_region"):
+            caption_tables[relation["caption_id"]].append(element["element_id"])
     figures = figure_relationships(elements)
     furniture_pages = defaultdict(set)
     for element in elements:
@@ -258,9 +263,16 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             continue
         if table:
             flush()
-            cells = cells_from(table) if not table.find("table") else []
+            relation = relationships.get(element["element_id"], {})
+            external_caption_only = relation.get("empty_table") and relation.get("caption_id")
+            if external_caption_only:
+                # Some parsers also put the adjacent caption in the empty table's text fallback.
+                if clean(text) == clean(embedding_text(relation["caption"])):
+                    continue
+                cells = []
+            else:
+                cells = cells_from(table) if not table.find("table") else []
             if cells:
-                relation = relationships.get(element["element_id"], {})
                 parts, uncertain = table_parts(cells, relation.get("inherited_headers", ()),
                                                infer_first_row=(element.get('coordinate_space') or {}).get('provider') == 'paddle_vl'
                                                or element.get('source_origin') == 'native_extraction')
@@ -344,16 +356,21 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             continue
         groups = split_text(text, chars=budget, max_bytes=max_bytes - byte_size(heading) - 1,
                             overlap=overlap_chars)
+        extra = {"representation_version": TABLE_REPRESENTATION} if table else None
+        if tables := caption_tables.get(element["element_id"]):
+            extra = {"context_element_ids": tables,
+                     "relations": [{"type": "caption_of", "origin": "inferred", "status": "unverified",
+                                    "element_id": table_id} for table_id in tables]}
         for part_number, part in enumerate(groups):
             append_chunk("\n".join(filter(None, (heading, part))), [element], part_number,
-                         kind if kind in {"figure", "chart", "table"} else "text", element["heading_path"],
-                         {"representation_version": TABLE_REPRESENTATION} if table else None)
+                         kind if kind in {"figure", "chart", "table"} else "text", element["heading_path"], extra)
     flush()
     captions = {element["element_id"]: embedding_text(element["text"]) for element in elements
                 if element["kind"] == "caption" and element["text"]}
     included_captions = {relation["element_id"] for chunk in chunks for relation in chunk.get("relations", [])
                          if relation.get("type") == "caption" and captions.get(relation["element_id"])
                          and captions[relation["element_id"]] in chunk["text"]}
+    included_captions.difference_update(caption_tables)
     chunks = [chunk for chunk in chunks if not (chunk["kind"] == "text" and len(chunk["element_ids"]) == 1
               and chunk["element_ids"][0] in included_captions)]
     for element in elements:
