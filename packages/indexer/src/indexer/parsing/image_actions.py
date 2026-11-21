@@ -142,5 +142,5 @@ def apply_image_actions(base, actions, parser, image_path, checkpoint, persist, 
     if any(not replacement for replacement in replacements.values()) and '텍스트를 확인할 수 없는 이미지가 있습니다.' not in warnings:
         warnings.append('텍스트를 확인할 수 없는 이미지가 있습니다.')
     raw['warnings'] = warnings
-    return ParseResult(base['provider'], merged, raw, incomplete=bool(warnings) or bool(base.get('unavailable'))
+    return ParseResult(base['provider'], merged, raw, incomplete=any(message not in raw.get('xlsx_notices', []) for message in warnings) or bool(base.get('unavailable'))
                        or bool((base.get('coverage') or {}).get('unavailable_pages')))

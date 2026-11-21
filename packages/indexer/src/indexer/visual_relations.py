@@ -1,6 +1,16 @@
 """Conservative links between original embedded images and document elements."""
 
 
+def xlsx_anchor_matches(anchor, cells):
+    start_row, start_col = anchor.get('start_row'), anchor.get('start_column')
+    if type(start_row) is not int or type(start_col) is not int:
+        return False
+    end_row = anchor.get('end_row', start_row)
+    end_col = anchor.get('end_column', start_col)
+    return any(start_row - 1 <= cell['row'] <= max(start_row, end_row or start_row) + 1
+               and start_col - 1 <= cell['column'] <= max(start_col, end_col or start_col) + 1 for cell in cells)
+
+
 def _same_scope(left, right):
     a, b = left.get('office_location') or {}, right.get('office_location') or {}
     if a.get('kind') == b.get('kind') == 'pptx_slide':

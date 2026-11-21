@@ -8,11 +8,52 @@ from openpyxl.utils import get_column_letter
 from qdrant_client.http.exceptions import ApiException
 
 from indexer.contracts import IndexerError
+from indexer.visual_relations import xlsx_anchor_matches
+from indexer.xlsx_query import execute, unavailable, verified_tables
+from indexer.xlsx_structure import STRUCTURE_VERSION
 
 
 class PublishedRetrieval:
     def __init__(self, publisher, storage):
         self.publisher, self.storage = publisher, storage
+
+    def _xlsx_snapshot(self, document_id, version):
+        try:
+            manifest = self.publisher.get_version(version)
+            if not manifest or document_id in self.publisher.deleted_documents():
+                raise unavailable()
+            chunks = self.publisher.document_chunks(document_id, manifest)
+            jobs = {item['job_id'] for item in chunks if item.get('job_id')}
+            if len(jobs) != 1:
+                raise unavailable()
+            job_id = jobs.pop()
+            raw = self.storage.load_job(document_id, job_id, 'parser_result')
+            if raw.get('xlsx_structure_version') != STRUCTURE_VERSION:
+                raise unavailable()
+            return manifest['version'], job_id, raw, chunks
+        except (FileNotFoundError, KeyError) as error:
+            raise unavailable() from error
+
+    def xlsx_catalog(self, document_id, version=None):
+        guard = getattr(self.publisher, 'search_lock', None)
+        with guard if guard is not None else nullcontext():
+            pinned, job_id, raw, _ = self._xlsx_snapshot(document_id, version)
+            return {'index_version': pinned, 'job_id': job_id, 'tables': verified_tables(raw)}
+
+    def xlsx_query(self, document_id, version, plan):
+        guard = getattr(self.publisher, 'search_lock', None)
+        with guard if guard is not None else nullcontext():
+            pinned, job_id, raw, chunks = self._xlsx_snapshot(document_id, version)
+            if not verified_tables(raw):
+                raise unavailable()
+            try:
+                result = execute(raw, plan)
+            except ValueError as error:
+                raise IndexerError('XLSX_QUERY_INVALID', str(error)) from error
+            evidence = next((item for item in chunks if item.get('xlsx_sheet') == plan.sheet
+                             and item.get('xlsx_region_start') == plan.start), None)
+            return {**result, 'document_id': document_id, 'job_id': job_id, 'index_version': pinned,
+                    'element_id': evidence['element_ids'][0] if evidence else None}
 
     @staticmethod
     def _expand_table(results, indexed):
@@ -74,6 +115,7 @@ class PublishedRetrieval:
                                            request.rerank, str(request.index_version) if request.index_version else None)
             documents = {}
             elements_by_job = {}
+            xlsx_relations_by_job = {}
             hits = []
             chunk_path = self.publisher.root / result["index_version"] / "chunks.json"
             indexed = {item["chunk_id"]: item for item in json.loads(chunk_path.read_text(encoding="utf-8"))}
@@ -122,9 +164,7 @@ class PublishedRetrieval:
                             if link.get('type') == 'cell_anchor':
                                 anchor = image.get('layout') or {}
                                 cells = chunk.get('table_cells', [])
-                                if not cells or not any(abs(cell['row'] - anchor.get('start_row', -100)) <= 1
-                                                        and abs(cell['column'] - anchor.get('start_column', -100)) <= 1
-                                                        for cell in cells):
+                                if not xlsx_anchor_matches(anchor, cells):
                                     continue
                             image_ids.add(image['element_id'])
                             related_images.append({**link, 'url': f'/v1/ingest/{document_id}/jobs/{job_id}/elements/{image["element_id"]}/image',
@@ -161,7 +201,18 @@ class PublishedRetrieval:
                             location = source.get("office_location")
                             if location:
                                 ref = {**location, "role": role}
-                                if role == 'evidence' and location.get('kind') == 'xlsx_range' and chunk.get('table_cells'):
+                                exact = next((item['office_location'] for item in chunk.get('element_refs', [])
+                                              if item['element_id'] == eid and (item.get('office_location') or {}).get('cells')), None)
+                                if role == 'evidence' and exact:
+                                    ref = {**exact, 'role': role}
+                                    for address in chunk.get('xlsx_context_cells', []):
+                                        if address not in exact['cells']:
+                                            context_ref = {'kind': 'xlsx_cell', 'sheet': exact['sheet'], 'cell': address,
+                                                           'role': 'context', 'origin': exact.get('origin'),
+                                                           'status': exact.get('status', 'unverified')}
+                                            if context_ref not in refs:
+                                                refs.append(context_ref)
+                                elif role == 'evidence' and location.get('kind') == 'xlsx_range' and chunk.get('table_cells'):
                                     cells = chunk['table_cells']
                                     ref['start'] = f"{get_column_letter(min(c['column'] for c in cells))}{min(c['row'] for c in cells)}"
                                     ref['end'] = f"{get_column_letter(max(c['column'] for c in cells))}{max(c['row'] for c in cells)}"
@@ -180,15 +231,36 @@ class PublishedRetrieval:
                         for element_id in evidence_ids] if job_id else []
                 context_urls = [f"/v1/ingest/{document_id}/jobs/{job_id}/elements/{element_id}"
                                 for element_id in context_ids] if job_id else []
+                if chunk.get('xlsx_region_start') and urls:
+                    cells = list(dict.fromkeys(cell['address'] for cell in chunk['table_cells']))
+                    base_url = urls[0]
+                    urls = [base_url + '?cells=' + ','.join(cells[start:start + 100])
+                            for start in range(0, len(cells), 100)]
+                    xlsx_context = [address for address in chunk.get('xlsx_context_cells', []) if address not in cells]
+                    context_urls.extend(base_url + '?cells=' + ','.join(xlsx_context[start:start + 100])
+                                        for start in range(0, len(xlsx_context), 100))
                 before_text = (before.get("body_text") or before["text"])[-600:] if before else ""
                 after_text = (after.get("body_text") or after["text"])[:600] if after else ""
                 context_text = "\n".join(filter(None, [chunk.get("heading_text"), before_text,
                     chunk.get("body_text") or chunk["text"], after_text])) if before or after else chunk["text"]
+                row_relations = []
+                if chunk.get('xlsx_region_start'):
+                    if key not in xlsx_relations_by_job:
+                        try:
+                            raw = self.storage.load_job(document_id, job_id, 'parser_result')
+                            xlsx_relations_by_job[key] = raw.get('xlsx_row_relations', [])
+                        except FileNotFoundError:
+                            xlsx_relations_by_job[key] = []
+                    rows = {cell['row'] for cell in chunk['table_cells']}
+                    row_relations = [link for link in xlsx_relations_by_job[key] if any(
+                        point['sheet'] == chunk['xlsx_sheet'] and point['region_start'] == chunk['xlsx_region_start']
+                        and point['row'] in rows for point in (link['left'], link['right']))]
                 hits.append({**chunk, "unit_id": chunk["chunk_id"], "filename": documents[document_id]["filename"],
                              "search_text": chunk["text"], "context_text": context_text,
                              "context_before": before_text, "context_after": after_text,
                              "context_element_ids": context_ids,
                              "related_images": related_images,
+                             **({"xlsx_row_relations": row_relations} if row_relations else {}),
                              "source_refs": refs, "evidence_urls": urls, "context_urls": context_urls})
             return {**result, "results": hits}
         except ApiException as error:

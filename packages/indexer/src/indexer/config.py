@@ -63,6 +63,12 @@ class Config:
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-6.1-terra"
     llm_models: tuple[str, ...] = ()
+    xlsx_structure_enabled: bool = False
+    xlsx_structure_model: str = ""
+    xlsx_structure_max_input_bytes: int = 64000
+    xlsx_structure_max_output_tokens: int = 4096
+    xlsx_structure_max_sheets: int = 3
+    xlsx_structure_timeout: int = 20
     default_target_chars: int = 1000
     default_overlap_chars: int = 150
     default_ocr_policy: str = "automatic"

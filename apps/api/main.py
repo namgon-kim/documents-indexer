@@ -29,6 +29,7 @@ from indexer.parser_profiles import ParserProfiles
 from indexer.parsing.contracts import ParserConfig
 from indexer.parsing.registry import build_registry
 from indexer.parsing.settings import parse_options
+from indexer.parsing.xlsx_analysis import StructureAnalyzer
 from indexer.published_retrieval import PublishedRetrieval
 from indexer.reranker import CohereReranker
 from indexer.settings import (
@@ -40,6 +41,8 @@ from indexer.settings import (
     save_overrides,
     values,
 )
+from indexer.xlsx_query import PublishedTableQuery
+from indexer.xlsx_structure import STRUCTURE_VERSION, SheetProposal, occupied
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from qdrant_client import QdrantClient
 from starlette.concurrency import run_in_threadpool
@@ -149,7 +152,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                                    lock=getattr(previous, "lock", None), search_lock=getattr(previous, "search_lock", None))
         service = IngestionService(ArtifactStore(candidate.data_dir), provider, publisher,
                                    max_pages=candidate.max_pages, retry_pages=candidate.retry_pages,
-                                   parser_factory=recreate_parser)
+                                   parser_factory=recreate_parser, xlsx_analyzer=StructureAnalyzer(candidate, http))
         profiles = EmbeddingProfiles(candidate.data_dir, publisher, http)
         profiles.list()
         service.embedding_profiles = profiles
@@ -503,6 +506,38 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         except ValueError as error:
             raise IndexerError("REPROCESS_UNAVAILABLE", str(error), 409) from error
 
+    @app.get("/v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure", dependencies=[Depends(auth.require)])
+    def xlsx_structure(request: Request, document_id: UUID, job_id: UUID):
+        publisher = getattr(request.app.state, 'index_publisher', None)
+        if publisher and str(document_id) in publisher.deleted_documents():
+            raise IndexerError('XLSX_STRUCTURE_UNAVAILABLE', 'XLSX 구조를 찾을 수 없습니다.', 404)
+        try:
+            raw = request.app.state.ingestion.storage.load_job(str(document_id), str(job_id), 'parser_result')
+        except (FileNotFoundError, AttributeError) as error:
+            raise IndexerError('XLSX_STRUCTURE_UNAVAILABLE', 'XLSX 구조를 찾을 수 없습니다.', 404) from error
+        if raw.get('xlsx_structure_version') != STRUCTURE_VERSION:
+            raise IndexerError('XLSX_STRUCTURE_UNAVAILABLE', '문서를 다시 읽은 뒤 구조를 검토해 주세요.', 409)
+        return {key: value for key, value in raw.items() if key.startswith('xlsx_')}
+
+    @app.post("/v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure", status_code=202, dependencies=[Depends(auth.require)])
+    def review_xlsx(request: Request, document_id: UUID, job_id: UUID, body: dict[str, SheetProposal]):
+        if not config.external_processing:
+            raise IndexerError('EXTERNAL_PROCESSING_DISABLED', '외부 문서 처리가 비활성화되어 있습니다.', 403)
+        if not body:
+            raise IndexerError('XLSX_REVIEW_INVALID', '수정한 시트를 지정해 주세요.')
+        try:
+            with operation_lock:
+                service = request.app.state.ingestion
+                base = service.storage.load_job(str(document_id), str(job_id), 'processing')
+                result = service.enqueue_reprocess(str(document_id), str(job_id), 'rechunk', base['settings'],
+                                                   xlsx_review=body)
+                wake.set()
+                return result
+        except (FileNotFoundError, AttributeError) as error:
+            raise IndexerError('JOB_NOT_FOUND', '기준 작업을 찾을 수 없습니다.', 404) from error
+        except ValueError as error:
+            raise IndexerError('XLSX_REVIEW_INVALID', str(error)) from error
+
     @app.get("/v1/ingest/{document_id}/jobs/{job_id}", dependencies=[Depends(auth.require)])
     def ingestion_job(request: Request, document_id: UUID, job_id: UUID):
         if not hasattr(request.app.state, "ingestion"):
@@ -561,6 +596,16 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         except (FileNotFoundError, ValueError, AttributeError) as error:
             raise IndexerError("REVIEW_UNAVAILABLE", str(error), 409) from error
 
+    @app.get("/v1/ingest/{document_id}/xlsx-tables", dependencies=[Depends(auth.require)])
+    def xlsx_tables(request: Request, document_id: UUID, index_version: UUID | None = None, profile_id: str | None = None):
+        retrieval = selected_retrieval(request, profile_id, index_version)
+        return retrieval.xlsx_catalog(str(document_id), str(index_version) if index_version else None)
+
+    @app.post("/v1/xlsx-query", dependencies=[Depends(auth.require)])
+    def xlsx_query(request: Request, body: PublishedTableQuery):
+        retrieval = selected_retrieval(request, body.profile_id, body.index_version)
+        return retrieval.xlsx_query(str(body.document_id), str(body.index_version) if body.index_version else None, body)
+
     @app.post("/v1/retrieve", dependencies=[Depends(auth.require)])
     def retrieve_new(request: Request, body: IngestionSearchRequest):
         if not hasattr(request.app.state, "index_publisher"):
@@ -576,9 +621,13 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             **({"profile_id": body.profile_id} if body.profile_id else {})))
 
     def selected_retrieval(request: Request, profile_id, version):
-        service = request.app.state.ingestion
+        service = getattr(request.app.state, 'ingestion', None)
+        if service is None:
+            raise IndexerError('INDEX_NOT_READY', '검색 색인이 설정되지 않았습니다.', 503)
         try:
             selected = service.publisher_for(profile_id)
+            if selected is None:
+                raise IndexerError('INDEX_NOT_READY', '검색 색인이 설정되지 않았습니다.', 503)
             if version:
                 manifest = selected.get_version(str(version))
                 if not manifest or manifest["embedding_profile"]["profile_id"] != selected.embedder.profile.profile_id:
@@ -649,14 +698,27 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         return {"profile_id": profile_id, "dimensions": publisher.embedder.profile.dimensions, "validated": True}
 
     @app.get("/v1/ingest/{document_id}/jobs/{job_id}/elements/{element_id}", dependencies=[Depends(auth.require)])
-    def ingestion_evidence(request: Request, document_id: UUID, job_id: UUID, element_id: str):
+    def ingestion_evidence(request: Request, document_id: UUID, job_id: UUID, element_id: str, cells: str | None = None):
         if not hasattr(request.app.state, "ingestion"):
             raise IndexerError("PARSER_NOT_CONFIGURED", "파서 연결을 설정해 주세요.", 503)
         if str(document_id) in request.app.state.index_publisher.deleted_documents():
             raise IndexerError("EVIDENCE_NOT_FOUND", "근거를 찾을 수 없습니다.", 404)
         try:
-            elements = request.app.state.ingestion.storage.load_job(str(document_id), str(job_id), "elements")
+            storage = request.app.state.ingestion.storage
+            elements = storage.load_job(str(document_id), str(job_id), "elements")
             element = next(item for item in elements if item.get("element_id") == element_id)
+            if cells is not None:
+                from indexer.parsing.xlsx_source import search_value
+
+                keys = cells.split(',')
+                region = element.get('xlsx_region')
+                if not region or len(keys) > 100 or set(keys) - {cell['address'] for cell in region['cells']}:
+                    raise KeyError('unavailable cells')
+                raw = storage.load_job(str(document_id), str(job_id), 'parser_result')
+                sheet = next(item for item in raw['xlsx_sheets'] if item['name'] == region['sheet'])
+                source = occupied(sheet)
+                return {'content': {'text': '\n'.join(f'{key} · {search_value(source[key])}' for key in keys)},
+                        'kind': element['kind'], 'cells': [source[key] for key in keys]}
             return {"content": {"text": element["text"]}, "page": element.get("page"),
                     "coordinates": element.get("coordinates"), "kind": element.get("kind")}
         except (FileNotFoundError, StopIteration, KeyError) as error:
@@ -811,7 +873,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError("INDEX_NOT_READY", "검색 색인이 설정되지 않았습니다.", 503)
         if not config.external_processing:
             raise IndexerError("EXTERNAL_PROCESSING_DISABLED", "외부 질의 처리가 비활성화되어 있습니다.", 403)
-        if body.rerank and not rerank_available(request):
+        if body.rerank and not body.xlsx_full_table and not rerank_available(request):
             raise IndexerError("RERANK_UNAVAILABLE", "재순위 서비스 설정을 확인해 주세요.", 503)
         retrieval = selected_retrieval(request, body.profile_id, body.index_version)
         chat = request.app.state.published_chat

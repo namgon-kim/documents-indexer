@@ -7,6 +7,7 @@ import httpx
 
 from indexer.contracts import IndexerError
 from indexer.embedding_input import byte_size, context_prefix, embedding_text, split_text
+from indexer.office_locations import set_xlsx_chunk_evidence
 from indexer.representation import table_groups
 
 
@@ -36,14 +37,16 @@ def split_chunk(chunk, max_bytes):
     segments = chunk.get("table_segments") or []
     # Table rows carry their source cell locations in each fragment.
     if segments:
-        prefix = context_prefix("\n".join(text.split("\n")[:-len(segments)]), max_bytes // 3)
-        source_parts = [{"row": segment["row"], "column": segment["column"],
+        body = "\n".join(segment['text'] for segment in segments)
+        original_prefix = text.removesuffix(body).rstrip()
+        prefix = context_prefix(original_prefix, max_bytes // 3)
+        source_parts = [{**segment, "row": segment["row"], "column": segment["column"],
                          "label": segment.get("label", ""), "text": segment.get("value", segment["text"]),
                          "label_origin": segment.get("label_origin", "parser")}
                         for segment in segments]
         parts = []
         for group in table_groups(prefix, source_parts, max_bytes, max_bytes):
-            converted = [{"row": item["row"], "column": item["column"], "label": item["label"],
+            converted = [{**item, "row": item["row"], "column": item["column"], "label": item["label"],
                           "value": item["text"], "label_origin": item.get("label_origin", "parser"),
                           "text": " / ".join(filter(None, [item["label"], item["text"]]))}
                          for item in group]
@@ -67,6 +70,12 @@ def split_chunk(chunk, max_bytes):
         if part_segments is not None:
             item["table_segments"] = part_segments
             item["table_cells"] = [{"row": part["row"], "column": part["column"]} for part in part_segments]
+            item['body_text'] = "\n".join(part['text'] for part in part_segments)
+            if chunk.get('xlsx_region_start'):
+                set_xlsx_chunk_evidence(item, part_segments)
+            elif chunk.get('source_range_quality') == 'unverified':
+                item['source_segments'] = [{**chunk['source_segments'][0],
+                                            'text': "\n".join(part['value'] for part in part_segments)}]
         else:
             item["heading_text"] = heading
             body_fragment = value.removeprefix(heading + "\n") if heading else value

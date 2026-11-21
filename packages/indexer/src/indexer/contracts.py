@@ -63,6 +63,7 @@ class ChatRequest(BaseModel):
     document_id: UUID | None = None
     index_version: UUID | None = None
     top_k: int = Field(default=5, ge=1, le=20)
+    xlsx_full_table: bool = False
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = None
     model: str | None = Field(default=None, min_length=1, max_length=128)
     method: Literal["bm25", "dense", "hybrid"] = "hybrid"

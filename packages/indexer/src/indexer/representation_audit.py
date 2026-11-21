@@ -43,6 +43,13 @@ def audit_representation(elements, chunks):
         layout = element.get('layout') or {}
         row_offset = layout.get('row_offset', 0) if layout.get('space') == 'xlsx_region' else 0
         column_offset = layout.get('column_offset', 0) if layout.get('space') == 'xlsx_region' else 0
+        if region := element.get('xlsx_region'):
+            if region['kind'] == 'title' and any(element['element_id'] in chunk.get('context_element_ids', []) for chunk in chunks):
+                continue
+            missing_cells.extend({'element_id': element['element_id'], 'row': cell['row'], 'column': cell['column']}
+                                 for cell in region['cells'] if cell['text'].strip()
+                                 and (cell['row'], cell['column']) not in present)
+            continue
         for cell in cells_from(table):
             row, column = cell.row + 1 + row_offset, cell.column + 1 + column_offset
             if cell.text and (row, column) not in present:

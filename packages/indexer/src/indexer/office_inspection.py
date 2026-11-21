@@ -43,7 +43,7 @@ def _relationships(archive, name, base):
     return result
 
 
-def inspect_office(path):
+def inspect_office(path, *, native_cells=False):
     kind = path.suffix.lower()
     if kind not in {".xlsx", ".pptx"}:
         return None
@@ -57,18 +57,18 @@ def inspect_office(path):
             if any(item.flag_bits & 1 or PurePosixPath(item.filename).is_absolute()
                    or ".." in PurePosixPath(item.filename).parts or "\\" in item.filename for item in entries):
                 raise ValueError("원본 문서 내부 파일을 확인할 수 없습니다")
-            return _spreadsheet(archive) if kind == ".xlsx" else _presentation(archive)
+            return _spreadsheet(archive, native_cells) if kind == ".xlsx" else _presentation(archive)
     except (BadZipFile, KeyError, ValueError, ElementTree.ParseError) as error:
         raise IndexerError("INVALID_DOCUMENT", "문서 내부 구조를 확인할 수 없습니다.", 415) from error
 
 
-def _spreadsheet(archive):
+def _spreadsheet(archive, native_cells):
     workbook = _xml(archive, "xl/workbook.xml")
     relations = _relationships(archive, "xl/_rels/workbook.xml.rels", "xl")
     shared = []
     if 'xl/sharedStrings.xml' in archive.namelist():
         root = _xml(archive, 'xl/sharedStrings.xml')
-        shared = [''.join(node.text or '' for node in item.iter(f'{MAIN}t')) for item in root.findall(f'{MAIN}si')]
+        shared = [''.join(node.text or '' for node in [*item.findall(f'{MAIN}t'), *item.findall(f'{MAIN}r/{MAIN}t')]) for item in root.findall(f'{MAIN}si')]
     sheets = []
     for node in workbook.findall(f"{MAIN}sheets/{MAIN}sheet"):
         name, rel_id = node.get("name"), node.get(REL)
@@ -93,6 +93,10 @@ def _spreadsheet(archive):
             bounds = range_boundaries(item.get('ref', ''))
             merges.append((item.get('ref'), bounds))
         summary['hidden_merged_cells'] = []
+        if native_cells:
+            summary['native_cells'] = {}
+            summary['native_links'] = _sheet_links(archive, target, sheet)
+            summary['native_charts'] = _sheet_charts(archive, target, sheet)
         for cell in sheet.iter(f"{MAIN}c"):
             address = cell.get('r', '')
             if not re.fullmatch(r"[A-Za-z]{1,3}[1-9][0-9]{0,6}", address):
@@ -104,15 +108,23 @@ def _spreadsheet(archive):
             inline = cell.find(f'{MAIN}is')
             formula = cell.find(f'{MAIN}f')
             raw = value.text if value is not None else None
+            if native_cells:
+                summary['native_cells'][address.upper()] = {'raw_value': raw, 'xml_type': cell.get('t') or 'n',
+                    'source_style_id': int(cell.get('s', '0')),
+                    'inline_text': ''.join(node.text or '' for node in [*inline.findall(f'{MAIN}t'),
+                                                                       *inline.findall(f'{MAIN}r/{MAIN}t')])
+                    if inline is not None else None, 'inline_present': inline is not None}
             if owner and (raw is not None or inline is not None or formula is not None):
-                text = ''.join(node.text or '' for node in inline.iter(f'{MAIN}t')) if inline is not None else raw
+                text = ''.join(node.text or '' for node in [*inline.findall(f'{MAIN}t'), *inline.findall(f'{MAIN}r/{MAIN}t')]) if inline is not None else raw
                 if cell.get('t') == 's' and raw is not None:
                     index = int(raw)
                     if not 0 <= index < len(shared):
                         raise ValueError('공유 문자열을 확인할 수 없습니다')
                     text = shared[index]
                 summary['hidden_merged_cells'].append({'cell': address.upper(), 'merged_range': owner,
-                    'value': text, 'cell_type': cell.get('t'), 'formula': formula.text if formula is not None else None})
+                    'value': text, 'raw_value': raw, 'cell_type': cell.get('t') or 'n',
+                    'style_id': int(cell.get('s', '0')), 'formula': formula.text if formula is not None else None,
+                    'formula_attributes': dict(formula.attrib) if formula is not None else None})
             if formula is None:
                 continue
             value = cell.find(f"{MAIN}v")
@@ -124,6 +136,54 @@ def _spreadsheet(archive):
     return {"format": "xlsx", "sheets": sheets, "parser_page_mapping": "unknown",
             "hidden_content_policy": "provider_dependent"}
 
+
+
+def _relationship_part(part):
+    directory, filename = posixpath.split(part)
+    return posixpath.join(directory, '_rels', filename + '.rels'), directory
+
+
+def _sheet_links(archive, part, sheet):
+    path, _ = _relationship_part(part)
+    external = {}
+    if path in archive.namelist():
+        external = {rel.get('Id'): rel.get('Target') for rel in _xml(archive, path).findall(PKG_REL)
+                    if rel.get('TargetMode') == 'External' and rel.get('Type', '').endswith('/hyperlink')}
+    links = {}
+    for link in sheet.findall(f'{MAIN}hyperlinks/{MAIN}hyperlink'):
+        links[link.get('ref')] = {'target': external.get(link.get(REL)),
+                                 **{key: link.get(key) for key in ('location', 'display', 'tooltip')}}
+    return links
+
+
+def _sheet_charts(archive, part, sheet):
+    namespace = '{http://schemas.openxmlformats.org/drawingml/2006/chart}'
+    path, directory = _relationship_part(part)
+    drawing_nodes = sheet.findall(f'{MAIN}drawing')
+    if not drawing_nodes or path not in archive.namelist():
+        return []
+    sheet_relations = _relationships(archive, path, directory)
+    charts = []
+    for node in drawing_nodes:
+        drawing_part = sheet_relations.get(node.get(REL))
+        if not drawing_part:
+            continue
+        drawing = _xml(archive, drawing_part)
+        path, directory = _relationship_part(drawing_part)
+        if path not in archive.namelist():
+            continue
+        drawing_relations = _relationships(archive, path, directory)
+        for chart in drawing.iter(f'{namespace}chart'):
+            source = drawing_relations.get(chart.get(REL))
+            if source:
+                chart_xml = _xml(archive, source)
+                data = archive.read(source)
+                try:
+                    definition = data.decode('utf-8-sig')
+                except UnicodeError:
+                    definition = ElementTree.tostring(chart_xml, encoding='unicode')
+                charts.append({'source_path': source, 'definition_xml': definition})
+    return charts
 
 def _presentation(archive):
     presentation = _xml(archive, "ppt/presentation.xml")

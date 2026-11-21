@@ -50,11 +50,12 @@ class ProcessingState(TypedDict, total=False):
     recovery_mode: str
     resume_index: bool
     publication: dict[str, Any]
+    xlsx_review: dict[str, Any]
 
 
 def make_graph(parser: Parser, on_parsed=None, on_represented=None, on_quality=None,
                max_pages=2000, retry_pages=200, on_provider=None, on_progress=None, on_inspected=None,
-               on_embedding=None, on_index=None, on_image=None):
+               on_embedding=None, on_index=None, on_image=None, xlsx_analyzer=None):
     def inspect(state: ProcessingState):
         path = Path(state["path"])
         if not path.is_file():
@@ -103,7 +104,8 @@ def make_graph(parser: Parser, on_parsed=None, on_represented=None, on_quality=N
             if mode != 'parser':
                 from indexer.parsing.native_documents import NativeExtractor
                 save_image = (lambda image_id, data: on_image(state, image_id, data)) if on_image else None
-                result = NativeExtractor(parser, mode, request.checkpoint, request.persist, request.progress, save_image).extract(path, request.format)
+                result = NativeExtractor(parser, mode, request.checkpoint, request.persist, request.progress, save_image,
+                                         xlsx_analyzer=xlsx_analyzer, xlsx_review=state.get('xlsx_review')).extract(path, request.format)
             else:
                 result = parser.parse(request)
         if on_parsed:

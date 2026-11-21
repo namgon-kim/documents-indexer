@@ -63,6 +63,14 @@ def test_excel_direct_and_image_results_keep_source_and_order(tmp_path):
     assert any('이미지 글자' in c['text'] for c in chunks)
 
 
+
+def make_xlsx_state(path):
+    from indexer.ingestion_graph import make_graph
+
+    return make_graph(ImageParser()).invoke({'path': str(path), 'document_id': 'd', 'job_id': 'j',
+        'settings': {'extraction_mode': 'native_text', 'target_chars': 400, 'overlap_chars': 0}})
+
+
 def test_xlsx_regions_keep_absolute_cells_and_merged_rows(tmp_path):
     from indexer.ingestion_graph import make_graph
     from indexer.representation_audit import audit_representation
@@ -81,10 +89,13 @@ def test_xlsx_regions_keep_absolute_cells_and_merged_rows(tmp_path):
     state = make_graph(ImageParser()).invoke({'path': str(path), 'document_id': 'd', 'job_id': 'j',
         'settings': {'extraction_mode': 'native_text', 'target_chars': 400, 'overlap_chars': 0}})
     tables = [item for item in state['normalized'] if item['kind'] == 'table']
-    assert len(tables) == 3
-    assert tables[1]['layout']['boundary_origin'] == 'inferred'
-    assert tables[1]['office_location']['start'] == 'A5'
-    assert tables[2]['office_location']['end'] == 'B10'
+    assert len(tables) == 1
+    assert tables[0]['layout']['boundary_origin'] == 'inferred'
+    assert tables[0]['office_location']['start'] == 'A1'
+    assert tables[0]['office_location']['end'] == 'B10'
+    sheet_result = state['parser_result']['xlsx_sheets'][0]
+    assert {'axis': 'row', 'after': 2, 'reason': 'blank_row'} in sheet_result['boundary_candidates']
+    assert all(hint['after'] not in {8, 9} for hint in sheet_result['boundary_candidates'])
     cells = {(cell['row'], cell['column']) for chunk in state['chunks'] for cell in chunk.get('table_cells', [])}
     assert {(1, 1), (5, 1), (6, 2), (8, 1), (10, 2)} <= cells
     assert not audit_representation(state['normalized'], state['chunks'])['missing_table_cells']
@@ -111,6 +122,10 @@ def test_xlsx_retains_value_hidden_inside_merge_in_source_xml(tmp_path):
     hidden = result.raw['xlsx_sheets'][0]['hidden_merged_cells']
     assert hidden[0]['cell'] == 'D1' and hidden[0]['value'] == '숨은 값'
     assert hidden[0]['merged_range'] == 'A1:D1'
+    state = make_xlsx_state(modified)
+    assert any(cell['address'] == 'D1' and cell['hidden_merged']
+               for chunk in state['chunks'] for cell in chunk.get('table_cells', []))
+    assert not result.incomplete
     assert any('병합 영역 안에 숨은 값' in warning for warning in result.raw['warnings'])
 
 
@@ -952,6 +967,9 @@ def test_xlsx_chart_preview_is_available_for_review_and_failed_render_is_reporte
     result = NativeExtractor(ImageParser(), 'native_visual', save_image=lambda key, data: saved.update({key: data})).extract(source, 'xlsx')
     image = next(item for item in result.elements if item.get('_origin') == 'native_image')
     assert image['_image_is_preview'] and image['source_location']['cell'] == 'D16'
+    chart_model = result.raw['xlsx_sheets'][0]['charts'][0]
+    assert chart_model['kind'] == 'chart' and chart_model['start']['column'] == 4
+    assert chart_model['source_path'].startswith('xl/charts/') and 'barChart' in chart_model['definition_xml']
     assert saved[image['_asset_id']] == png()
     assert next(item for item in normalize_elements(result.elements) if item.get('asset_id'))['image_is_preview']
     assert not result.incomplete

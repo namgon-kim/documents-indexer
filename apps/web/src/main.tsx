@@ -21,7 +21,7 @@ function locationLabel(hit: Hit) {
     const refs = hit.source_refs.filter(ref => (ref.role || "evidence") === role);
     const pages = [...new Set(refs.flatMap(ref => ref.page === undefined ? [] : [ref.page]))];
     const locations = refs.flatMap(ref => ref.kind === "xlsx_range" ? [`시트 ${ref.sheet} · ${ref.start}:${ref.end}`]
-      : ref.kind === "xlsx_cell" ? [`시트 ${ref.sheet} · ${ref.cell} (위치 확인 필요)`]
+      : ref.kind === "xlsx_cell" ? [`시트 ${ref.sheet} · ${ref.cell}${ref.status === "unverified" ? " (위치 확인 필요)" : ""}`]
       : ref.kind === "hwpx_section" ? [`HWPX 구역 ${ref.section}`]
       : ref.kind === "docx_block" ? [`DOCX 본문 ${ref.block}`]
       : ref.kind === "hwp_paragraph" ? [`HWP 구역 ${typeof ref.section === "number" ? ref.section + 1 : ref.section} · ${ref.paragraph === undefined ? "문단 위치 미확인" : `추출 문단 ${ref.paragraph + 1}`}`]
@@ -40,6 +40,7 @@ function App() {
   const [options, setOptions] = useState<Options>();
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [query, setQuery] = useState("");
+  const [xlsxFullTable, setXlsxFullTable] = useState(false);
   const [resultLimit, setResultLimit] = useState(5);
   const [searchMethod, setSearchMethod] = useState<"hybrid" | "bm25" | "dense">("hybrid");
   const [rerank, setRerank] = useState(false);
@@ -188,6 +189,8 @@ function App() {
     } catch (reason) { showError(reason); }
   }
 
+  const xlsxScope = documents.some(item => item.document_id === scope && item.source_format === "xlsx");
+
   async function search(event: FormEvent) {
     event.preventDefault();
     if (!session || !query.trim()) return;
@@ -201,7 +204,7 @@ function App() {
       setMessages(items => [...items, {role: "user", content: question}]);
       setQuery("");
       const response = await api<{ answer: string; sources: Hit[]; index_version: string }>("/v1/ingest-chat", session, {
-        message: question, history: previous, ...(chatModel ? { model: chatModel } : {}), ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}), ...(scope ? { document_id: scope } : {}), ...(version ? { index_version: version } : {}),
+        message: question, history: previous, ...(xlsxScope && xlsxFullTable ? {xlsx_full_table: true} : {}), ...(chatModel ? { model: chatModel } : {}), ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}), ...(scope ? { document_id: scope } : {}), ...(version ? { index_version: version } : {}),
         ...(options?.ingestion_enabled ? {method: searchMethod, rerank: rerank && Boolean(options.rerank_available), profile_id: embeddingProfile} : {}),
       });
       setMessages(items => [...items, {role: "assistant", content: response.answer, sources: response.sources, index_version: response.index_version}]);
@@ -340,11 +343,13 @@ function App() {
             </option>)}
           </select></label>
           {options?.ingestion_enabled && <label className="check" title={options.rerank_available ? undefined : "설정에서 재순위 제공자를 연결하면 사용할 수 있습니다"}><input type="checkbox" checked={rerank && Boolean(options.rerank_available)} disabled={!options.rerank_available} onChange={event => setRerank(event.target.checked)}/> 재순위 적용</label>}
-          <label className="wide">문서<select value={scope} onChange={event => setScope(event.target.value)}>
+          <label className="wide">문서<select value={scope} onChange={event => {setScope(event.target.value); setXlsxFullTable(false);}}>
             <option value="">모든 문서</option>
             {documents.filter(item => item.active_result).map(item =>
               <option key={item.document_id} value={item.document_id}>{item.filename.normalize("NFC")} · {item.document_id.slice(0, 8)}</option>)}
           </select></label>
+          {xlsxScope && <label className="check wide"><input type="checkbox" checked={xlsxFullTable}
+            onChange={event => setXlsxFullTable(event.target.checked)}/> 검증된 Excel 표 전체에서 개수·분포·날짜 범위 조회</label>}
         </>}/>}
     </>}
   </main>;
