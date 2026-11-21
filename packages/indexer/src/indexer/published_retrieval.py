@@ -1,7 +1,7 @@
 """게시된 청크를 검색과 대화가 공유하는 근거 계약으로 변환한다."""
 
 import json
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 
 import httpx
 from openpyxl.utils import get_column_letter
@@ -9,80 +9,74 @@ from qdrant_client.http.exceptions import ApiException
 
 from indexer.contracts import IndexerError
 from indexer.visual_relations import xlsx_anchor_matches
-from indexer.xlsx_query import execute, join_candidates, unavailable, verified_tables
-from indexer.xlsx_structure import STRUCTURE_VERSION, confirmed, occupied
+from indexer.xlsx_access import CANDIDATE_LIMIT, open_workbook
+from indexer.xlsx_query import execute, preview_mapping, unavailable
+from indexer.xlsx_structure import confirmed
 
 
 class PublishedRetrieval:
     def __init__(self, publisher, storage):
         self.publisher, self.storage = publisher, storage
 
+    @contextmanager
     def _xlsx_snapshot(self, document_id, version):
-        try:
-            manifest = self.publisher.get_version(version)
-            if not manifest or document_id in self.publisher.deleted_documents():
-                raise unavailable()
-            chunks = self.publisher.document_chunks(document_id, manifest)
-            jobs = {item['job_id'] for item in chunks if item.get('job_id')}
-            if len(jobs) != 1:
-                raise unavailable()
-            job_id = jobs.pop()
-            raw = self.storage.load_job(document_id, job_id, 'parser_result')
-            if raw.get('xlsx_structure_version') != STRUCTURE_VERSION:
-                raise unavailable()
-            return manifest['version'], job_id, raw, chunks
-        except (FileNotFoundError, KeyError) as error:
-            raise unavailable() from error
+        with ExitStack() as stack:
+            try:
+                manifest = self.publisher.get_version(version)
+                if not manifest or document_id in self.publisher.deleted_documents():
+                    raise unavailable()
+                source = self.publisher.xlsx_source(document_id, manifest)
+                if not source:
+                    raise unavailable()
+                job_id = source['job_id']
+                workbook = stack.enter_context(open_workbook(self.storage, document_id, job_id))
+            except (OSError, KeyError, ValueError) as error:
+                raise unavailable() from error
+            yield manifest['version'], job_id, workbook, source['regions']
 
     def xlsx_catalog(self, document_id, version=None):
         guard = getattr(self.publisher, 'search_lock', None)
-        with guard if guard is not None else nullcontext():
-            pinned, job_id, raw, _ = self._xlsx_snapshot(document_id, version)
-            return {'index_version': pinned, 'job_id': job_id, 'tables': verified_tables(raw)}
+        with guard if guard is not None else nullcontext(), self._xlsx_snapshot(document_id, version) as snapshot:
+            pinned, job_id, workbook, _ = snapshot
+            return {'index_version': pinned, 'job_id': job_id, 'tables': workbook.catalog()}
 
     def xlsx_join_candidates(self, document_id, version, sheet, start, right_sheet, right_start, offset):
         guard = getattr(self.publisher, 'search_lock', None)
-        with guard if guard is not None else nullcontext():
-            pinned, job_id, raw, _ = self._xlsx_snapshot(document_id, version)
-            tables = {(r['sheet'], r['start']) for r in verified_tables(raw)}
-            if not {(sheet, start), (right_sheet, right_start)} <= tables:
-                raise IndexerError('XLSX_QUERY_INVALID', '연결할 확인된 표를 지정해 주세요.')
+        with guard if guard is not None else nullcontext(), self._xlsx_snapshot(document_id, version) as snapshot:
+            pinned, job_id, workbook, _ = snapshot
+            tables = {(r['sheet'], r['start']) for r in workbook.catalog()}
+            if sheet == right_sheet or not {(sheet, start), (right_sheet, right_start)} <= tables:
+                raise IndexerError('XLSX_QUERY_INVALID', '서로 다른 시트에서 확인된 표를 지정해 주세요.')
+            candidates, total = workbook.candidate_page(sheet, start, right_sheet, right_start, offset, 100)
+            return {'index_version': pinned, 'job_id': job_id, 'complete': total <= CANDIDATE_LIMIT,
+                    'total': min(total, CANDIDATE_LIMIT), 'offset': offset, 'candidates': candidates}
+
+    def xlsx_join_preview(self, document_id, version, plan):
+        guard = getattr(self.publisher, 'search_lock', None)
+        with guard if guard is not None else nullcontext(), self._xlsx_snapshot(document_id, version) as snapshot:
+            pinned, job_id, workbook, _ = snapshot
             try:
-                candidates, complete = join_candidates(raw, sheet, start, right_sheet, right_start)
+                return {**preview_mapping(workbook, plan), 'index_version': pinned, 'job_id': job_id}
             except ValueError as error:
                 raise IndexerError('XLSX_QUERY_INVALID', str(error)) from error
-            cells = {item['name']: occupied(item) for item in raw['xlsx_sheets']
-                     if item['name'] in {sheet, right_sheet}}
-            page = candidates[offset:offset + 100]
-            for item in page:
-                for side in ('left', 'right'):
-                    point = item[side]
-                    point['values'] = [cells[point['sheet']][key]['display_text'][:160] for key in point['cells']]
-            return {'index_version': pinned, 'job_id': job_id, 'complete': complete, 'total': len(candidates),
-                    'offset': offset, 'candidates': page}
 
     def xlsx_query(self, document_id, version, plan):
         guard = getattr(self.publisher, 'search_lock', None)
-        with guard if guard is not None else nullcontext():
-            pinned, job_id, raw, chunks = self._xlsx_snapshot(document_id, version)
-            if not verified_tables(raw):
+        with guard if guard is not None else nullcontext(), self._xlsx_snapshot(document_id, version) as snapshot:
+            pinned, job_id, workbook, regions = snapshot
+            if not workbook.catalog():
                 raise unavailable()
             try:
-                result = execute(raw, plan)
+                result = execute(workbook, plan)
             except ValueError as error:
                 raise IndexerError('XLSX_QUERY_INVALID', str(error)) from error
-            evidence = next((item for item in chunks if item.get('xlsx_sheet') == plan.sheet
-                             and item.get('xlsx_region_start') == plan.start), None)
+            sources = {(sheet, start): eid for sheet, start, eid in regions}
             scopes = [result['scope']]
             if result['join']:
                 scopes.append(result['join']['right_scope'])
-            refs = []
-            for scope in scopes:
-                chunk = next((item for item in chunks if item.get('xlsx_sheet') == scope['sheet']
-                              and item.get('xlsx_region_start') == scope['start']), None)
-                refs.append({**scope, 'element_id': chunk['element_ids'][0] if chunk else None})
+            refs = [{**scope, 'element_id': sources.get((scope['sheet'], scope['start']))} for scope in scopes]
             return {**result, 'document_id': document_id, 'job_id': job_id, 'index_version': pinned,
-                    'element_id': evidence['element_ids'][0] if evidence else None, 'source_ranges': refs}
+                    'element_id': refs[0]['element_id'], 'source_ranges': refs}
 
     @staticmethod
     def _expand_table(results, indexed):

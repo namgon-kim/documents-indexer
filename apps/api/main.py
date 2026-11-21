@@ -3,7 +3,7 @@ import json
 import tempfile
 import threading
 import zipfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
@@ -41,9 +41,9 @@ from indexer.settings import (
     save_overrides,
     values,
 )
-from indexer.xlsx_query import PublishedTableQuery
-from indexer.xlsx_review import cell_window, sheet_detail, sheet_summary
-from indexer.xlsx_structure import STRUCTURE_VERSION, SheetProposal, occupied
+from indexer.xlsx_access import open_workbook
+from indexer.xlsx_query import JoinPreview, PublishedTableQuery
+from indexer.xlsx_structure import STRUCTURE_VERSION, SheetProposal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from qdrant_client import QdrantClient
 from starlette.concurrency import run_in_threadpool
@@ -507,31 +507,32 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         except ValueError as error:
             raise IndexerError("REPROCESS_UNAVAILABLE", str(error), 409) from error
 
+    @contextmanager
     def load_xlsx_structure(request, document_id, job_id):
         publisher = getattr(request.app.state, 'index_publisher', None)
         if publisher and str(document_id) in publisher.deleted_documents():
             raise IndexerError('XLSX_STRUCTURE_UNAVAILABLE', 'XLSX 구조를 찾을 수 없습니다.', 404)
         try:
-            raw = request.app.state.ingestion.storage.load_job(str(document_id), str(job_id), 'parser_result')
+            storage = request.app.state.ingestion.storage
+            with open_workbook(storage, str(document_id), str(job_id)) as workbook:
+                yield workbook
         except (FileNotFoundError, AttributeError) as error:
             raise IndexerError('XLSX_STRUCTURE_UNAVAILABLE', 'XLSX 구조를 찾을 수 없습니다.', 404) from error
-        if raw.get('xlsx_structure_version') != STRUCTURE_VERSION:
-            raise IndexerError('XLSX_STRUCTURE_UNAVAILABLE', '문서를 다시 읽은 뒤 구조를 검토해 주세요.', 409)
-        return raw
+        except (OSError, ValueError) as error:
+            raise IndexerError('XLSX_STRUCTURE_UNAVAILABLE', '이 작업의 XLSX 구조를 열 수 없습니다.', 409) from error
 
-    def pick_xlsx_sheet(raw, name):
-        sheet = next((item for item in raw['xlsx_sheets'] if item['name'] == name), None)
+    def pick_xlsx_sheet(workbook, name):
+        sheet = workbook.sheet(name)
         if sheet is None:
             raise IndexerError('XLSX_SHEET_NOT_FOUND', '시트를 찾을 수 없습니다.', 404)
         return sheet
 
     @app.get("/v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure", dependencies=[Depends(auth.require)])
     def xlsx_structure(request: Request, document_id: UUID, job_id: UUID, sheet: str | None = None):
-        raw = load_xlsx_structure(request, document_id, job_id)
-        if sheet is not None:
-            return sheet_detail(pick_xlsx_sheet(raw, sheet))
-        return {'xlsx_structure_version': STRUCTURE_VERSION,
-                'xlsx_sheets': [sheet_summary(item) for item in raw['xlsx_sheets']]}
+        with load_xlsx_structure(request, document_id, job_id) as workbook:
+            if sheet is not None:
+                return pick_xlsx_sheet(workbook, sheet)
+            return {'xlsx_structure_version': STRUCTURE_VERSION, 'xlsx_sheets': workbook.summaries()}
 
     @app.get("/v1/ingest/{document_id}/jobs/{job_id}/xlsx-cells", dependencies=[Depends(auth.require)])
     def xlsx_cells(request: Request, document_id: UUID, job_id: UUID, sheet: str,
@@ -540,8 +541,8 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                    rows: Annotated[int, Query(ge=1, le=25)] = 10,
                    columns: Annotated[int, Query(ge=1, le=20)] = 8,
                    address: Annotated[str | None, Query(pattern=r'^[A-Z]{1,3}[1-9][0-9]{0,6}$', max_length=10)] = None):
-        raw = load_xlsx_structure(request, document_id, job_id)
-        return cell_window(raw, pick_xlsx_sheet(raw, sheet), row, column, rows, columns, exact=address)
+        with load_xlsx_structure(request, document_id, job_id) as workbook:
+            return workbook.window(pick_xlsx_sheet(workbook, sheet), row, column, rows, columns, exact=address)
 
     @app.post("/v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure", status_code=202, dependencies=[Depends(auth.require)])
     def review_xlsx(request: Request, document_id: UUID, job_id: UUID, body: dict[str, SheetProposal]):
@@ -632,6 +633,11 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         retrieval = selected_retrieval(request, profile_id, index_version)
         return retrieval.xlsx_join_candidates(str(document_id), str(index_version), sheet, start,
                                               right_sheet, right_start, offset)
+
+    @app.post("/v1/xlsx-join-preview", dependencies=[Depends(auth.require)])
+    def xlsx_join_preview(request: Request, body: JoinPreview):
+        retrieval = selected_retrieval(request, body.profile_id, body.index_version)
+        return retrieval.xlsx_join_preview(str(body.document_id), str(body.index_version), body)
 
     @app.post("/v1/xlsx-query", dependencies=[Depends(auth.require)])
     def xlsx_query(request: Request, body: PublishedTableQuery):
@@ -746,11 +752,12 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                 region = element.get('xlsx_region')
                 if not region or len(keys) > 100 or set(keys) - {cell['address'] for cell in region['cells']}:
                     raise KeyError('unavailable cells')
-                raw = storage.load_job(str(document_id), str(job_id), 'parser_result')
-                sheet = next(item for item in raw['xlsx_sheets'] if item['name'] == region['sheet'])
-                source = occupied(sheet)
-                return {'content': {'text': '\n'.join(f'{key} · {search_value(source[key])}' for key in keys)},
-                        'kind': element['kind'], 'cells': [source[key] for key in keys]}
+                with load_xlsx_structure(request, document_id, job_id) as workbook:
+                    source = [workbook.cell(region['sheet'], key) for key in keys]
+                if any(cell is None for cell in source):
+                    raise KeyError('unavailable cells')
+                return {'content': {'text': '\n'.join(f'{cell["address"]} · {search_value(cell)}' for cell in source)},
+                        'kind': element['kind'], 'cells': source}
             return {"content": {"text": element["text"]}, "page": element.get("page"),
                     "coordinates": element.get("coordinates"), "kind": element.get("kind")}
         except (FileNotFoundError, StopIteration, KeyError) as error:

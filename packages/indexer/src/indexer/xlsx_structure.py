@@ -268,34 +268,40 @@ def local_structure(sheet):
             return fallback_structure(sheet), candidates
 
 
-def row_candidates(sheets):
-    """Link only rows sharing an identifier and a name under verified headers."""
+def identity_rows(sheet, cells=None):
+    """Read the legacy ID/name identity columns from confirmed tables."""
     aliases = {'id': 'id', 'code': 'id', 'identifier': 'id', '번호': 'id', '코드': 'id', '학번': 'id',
                'name': 'name', '이름': 'name', '명칭': 'name', '성명': 'name'}
+    cells = occupied(sheet) if cells is None else cells
+    for region in sheet['regions']:
+        if not confirmed(region) or not region['headers']:
+            continue
+        labels = defaultdict(list)
+        for key in region['headers']:
+            row, col = coordinate_to_tuple(key)
+            label = aliases.get(cells[key]['display_text'].strip().casefold())
+            if label:
+                labels[label].append(col)
+        if set(labels) != {'id', 'name'} or any(len(cols) != 1 for cols in labels.values()):
+            continue
+        end, _ = coordinate_to_tuple(region['end'])
+        for data_row in range(row + 1, end - region['totals_rows'] + 1):
+            keys = [address(data_row, labels[label][0]) for label in ('id', 'name')]
+            if any(key not in cells or key in sheet['excluded'] or cells[key]['hidden_merged'] or cells[key].get('merged_range')
+                   or cells[key].get('cache_status') == 'missing' for key in keys):
+                continue
+            values = tuple(cells[key]['display_text'].strip().casefold() for key in keys)
+            if all(values):
+                yield values[0], {'sheet': sheet['name'], 'row': data_row, 'cells': keys,
+                                  'region_start': region['start'], 'name_key': values[1]}
+
+
+def row_candidates(sheets):
+    """Find exact matches and identifier conflicts under confirmed headers."""
     index = defaultdict(lambda: defaultdict(list))
     for sheet in sheets:
-        cells = {key: cell for key, cell in occupied(sheet).items() if key not in sheet['excluded']}
-        for region in sheet['regions']:
-            if not confirmed(region) or not region['headers']:
-                continue
-            labels = defaultdict(list)
-            for key in region['headers']:
-                row, col = coordinate_to_tuple(key)
-                label = aliases.get(cells[key]['display_text'].strip().casefold())
-                if label:
-                    labels[label].append(col)
-            if set(labels) != {'id', 'name'} or any(len(cols) != 1 for cols in labels.values()):
-                continue
-            end, _ = coordinate_to_tuple(region['end'])
-            for data_row in range(row + 1, end - region['totals_rows'] + 1):
-                keys = [address(data_row, labels[label][0]) for label in ('id', 'name')]
-                if any(key not in cells or cells[key]['hidden_merged'] or cells[key].get('merged_range')
-                       or cells[key].get('cache_status') == 'missing' for key in keys):
-                    continue
-                values = tuple(cells[key]['display_text'].strip().casefold() for key in keys)
-                if all(values):
-                    index[values[0]][sheet['name']].append({'sheet': sheet['name'], 'row': data_row, 'cells': keys,
-                                                            'region_start': region['start'], 'name_key': values[1]})
+        for identifier, point in identity_rows(sheet):
+            index[identifier][sheet['name']].append(point)
     relations = []
     # Bound ambiguous fan-out. Preserve both original row addresses on each candidate.
     for by_sheet in index.values():

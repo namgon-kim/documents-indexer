@@ -3,9 +3,9 @@
 from openpyxl.formula import Tokenizer
 from openpyxl.formula.tokenizer import TokenizerError
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.cell import coordinate_to_tuple, range_to_tuple
+from openpyxl.utils.cell import range_to_tuple
 
-from indexer.xlsx_structure import confirmed, occupied, verification
+from indexer.xlsx_structure import confirmed, verification
 
 
 def region_summary(region):
@@ -53,24 +53,15 @@ def cross_sheet_references(cell, sheet_name, sheet_names):
     return refs
 
 
-def cell_window(raw, sheet, row, column, rows, columns, *, exact=None):
+def cell_projection(cell, sheet_name=None, sheet_names=None, *, exact=False):
+    if exact:
+        return {**cell, 'formula_references': cross_sheet_references(cell, sheet_name, sheet_names)}
     keys = ('address', 'display_text', 'hidden_merged', 'merged_range', 'cache_status')
-    sheet_names = {item['name'].casefold(): item['name'] for item in raw['xlsx_sheets']}
-    selected = []
-    cells = occupied(sheet)
-    for key, cell in cells.items():
-        r, c = coordinate_to_tuple(key)
-        if exact and key != exact:
-            continue
-        if not exact and not (row <= r < row + rows and column <= c < column + columns):
-            continue
-        item = {name: cell[name] for name in keys}
-        if exact:
-            item = cell.copy()
-            item['formula_references'] = cross_sheet_references(cell, sheet['name'], sheet_names)
-        else:
-            item.update(display_text=cell['display_text'][:200], truncated=len(cell['display_text']) > 200)
-        selected.append(item)
+    return {**{key: cell[key] for key in keys}, 'display_text': cell['display_text'][:200],
+            'truncated': len(cell['display_text']) > 200}
+
+
+def window_response(sheet, row, column, rows, columns, cells):
     _, _, right, bottom = sheet['bounds']
-    return {'cells': selected, 'row': row, 'column': column,
+    return {'cells': cells, 'row': row, 'column': column,
             'last_row': min(bottom, row + rows - 1), 'last_column': min(right, column + columns - 1)}

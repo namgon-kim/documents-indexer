@@ -5,6 +5,7 @@ import json
 import shutil
 import threading
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -18,6 +19,22 @@ from indexer.embedding_cache import EmbeddingCache
 from indexer.embedding_input import PREPROCESSING_VERSION
 from indexer.search_engine import SearchService
 
+
+def _office_source(chunks):
+    jobs = {item['job_id'] for item in chunks if item.get('job_id')}
+    if len(jobs) != 1:
+        return None
+    regions = {}
+    for chunk in chunks:
+        if chunk.get('xlsx_region_start'):
+            regions.setdefault((chunk['xlsx_sheet'], chunk['xlsx_region_start']), chunk['element_ids'][0])
+    return {'job_id': jobs.pop(), 'regions': [[*key, eid] for key, eid in regions.items()]}
+
+
+@lru_cache(maxsize=24)
+def _legacy_office_source(path, document_id, revision):
+    with path.open(encoding='utf-8') as stream:
+        return _office_source([chunk for chunk in json.load(stream) if chunk['document_id'] == document_id])
 
 class AllowedChunks:
     def __init__(self, retriever, allowed):
@@ -86,6 +103,15 @@ class IndexPublisher:
         path = self.root / manifest["version"] / "chunks.json"
         return [chunk for chunk in json.loads(path.read_text(encoding="utf-8"))
                 if chunk["document_id"] == document_id]
+
+    def xlsx_source(self, document_id, manifest):
+        if document_id not in manifest['document_ids']:
+            return None
+        if source := manifest.get('xlsx_sources', {}).get(document_id):
+            return source
+        path = self.root / manifest['version'] / 'chunks.json'
+        stat = path.stat()
+        return _legacy_office_source(path, document_id, (stat.st_ino, stat.st_mtime_ns, stat.st_size))
 
     def prepare(self, document_id: str, new_chunks: list[dict], progress=None):
         if not new_chunks or any(chunk["document_id"] != document_id for chunk in new_chunks):
@@ -163,6 +189,9 @@ class IndexPublisher:
             atomic_json(folder / "chunks.json", chunks)
             manifest = {"version": version, "collection": collection, "embedding_profile": contract,
                         "document_ids": sorted(by_document), "chunk_count": len(chunks),
+                        "xlsx_sources": {doc: source for doc, rows in by_document.items()
+                                         if any(item.get('xlsx_region_start') for item in rows)
+                                         and (source := _office_source(rows))},
                         "representation_versions": sorted({item.get("representation_version", "unknown") for item in chunks}),
                         "created_at": datetime.now(UTC).isoformat()}
             atomic_json(folder / "manifest.json", manifest)
@@ -222,6 +251,7 @@ class IndexPublisher:
                 atomic_json(chunks_path, retained)
                 manifest["document_ids"] = sorted({item["document_id"] for item in retained})
                 manifest["chunk_count"] = len(retained)
+                manifest.get("xlsx_sources", {}).pop(document_id, None)
                 atomic_json(manifest_path, manifest)
                 for pointer, active in active_pointers.items():
                     if active["version"] == manifest["version"]:

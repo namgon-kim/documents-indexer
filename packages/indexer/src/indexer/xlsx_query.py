@@ -82,16 +82,50 @@ class ApprovedJoin(BaseModel):
     approved_pairs: list[RowPair] = Field(min_length=1, max_length=5000)
 
 
+
+class JoinKey(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    left: str = Field(pattern=COLUMN, max_length=3)
+    right: str = Field(pattern=COLUMN, max_length=3)
+    type: Literal['text', 'number', 'date', 'datetime', 'boolean']
+
+
+class MappedJoin(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    sheet: str = Field(min_length=1, max_length=31)
+    start: str = Field(pattern=TABLE_START, max_length=10)
+    cardinality: Literal['one_to_one', 'one_to_many', 'many_to_one']
+    keys: list[JoinKey] = Field(min_length=1, max_length=4)
+
+    @model_validator(mode='after')
+    def distinct_columns(self):
+        if len({key.left for key in self.keys}) != len(self.keys) or len({key.right for key in self.keys}) != len(self.keys):
+            raise ValueError('같은 쪽의 열을 연결 키에 중복 지정할 수 없습니다')
+        return self
+
+
+class JoinPreview(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    document_id: UUID = Field(strict=False)
+    index_version: UUID = Field(strict=False)
+    profile_id: str | None = Field(default=None, min_length=1, max_length=64)
+    sheet: str = Field(min_length=1, max_length=31)
+    start: str = Field(pattern=TABLE_START, max_length=10)
+    join: MappedJoin
+    include_hidden_rows: bool = True
+    offset: int = Field(default=0, ge=0, le=5000)
+
+
 class PublishedTableQuery(QueryPlan):
     document_id: UUID = Field(strict=False)
     index_version: UUID | None = Field(default=None, strict=False)
     profile_id: str | None = Field(default=None, min_length=1, max_length=64)
-    join: ApprovedJoin | None = None
+    join: ApprovedJoin | MappedJoin | None = None
 
     @model_validator(mode='after')
     def pin_approval(self):
         if self.join and not self.index_version:
-            raise ValueError('행 연결을 승인한 색인 버전을 지정해 주세요')
+            raise ValueError('행을 연결할 색인 버전을 지정해 주세요')
         return self
 
 
@@ -158,6 +192,8 @@ def _prepare_filter(rule, types):
 
 
 def verified_tables(raw):
+    if not isinstance(raw, dict):
+        return raw.catalog()
     if raw.get('xlsx_structure_version') != STRUCTURE_VERSION:
         return []
     catalog = []
@@ -187,6 +223,7 @@ class TableData:
     problems: dict
     populated: set
     hidden: set
+    available_rows: set
 
     def column(self, key):
         number = column_index_from_string(key)
@@ -195,7 +232,11 @@ class TableData:
         return number
 
     def get(self, row, column):
-        key = address(row, column)
+        value, kind, issue = self.raw_cell(row, column)
+        return value, _kind(kind), issue
+
+    def raw_cell(self, row, column):
+        key = row, column
         return *self.values.get(key, (None, 'null')), self.problems.get(key)
 
     def record(self, row):
@@ -207,8 +248,29 @@ class TableData:
         return record
 
 
-def _read_table(raw, sheet_name, region_start, include_hidden):
-    sheet = next((item for item in raw['xlsx_sheets'] if item['name'] == sheet_name), None)
+
+def typed_table_cell(cell, excluded):
+    if excluded:
+        return None, 'null', 'excluded_cell'
+    if cell['hidden_merged'] or cell.get('cache_status') == 'missing':
+        return None, 'null', 'hidden_merged' if cell['hidden_merged'] else 'missing_cache'
+    value, value_type = _value(cell)
+    return value, value_type, 'excel_error' if value_type == 'error' else None
+
+
+def _table_cells(raw, sheet, area, columns):
+    if not isinstance(raw, dict):
+        yield from raw.table_cells(sheet['name'], area, columns)
+        return
+    for key, cell in occupied(sheet).items():
+        position = coordinate_to_tuple(key)
+        if contains(area, position):
+            yield *position, *typed_table_cell(cell, key in sheet['excluded'])
+
+
+def _read_table(raw, sheet_name, region_start, include_hidden, selected=None):
+    sheet = (next((item for item in raw['xlsx_sheets'] if item['name'] == sheet_name), None)
+             if isinstance(raw, dict) else raw.sheet(sheet_name))
     region = next((r for r in sheet['regions'] if r['start'] == region_start and r['kind'] == 'table'
                    and confirmed(r)), None) if sheet else None
     if not region:
@@ -219,30 +281,36 @@ def _read_table(raw, sheet_name, region_start, include_hidden):
     if region['title'] and coordinate_to_tuple(region['title'])[0] == start:
         start += 1
     end = bottom - region['totals_rows']
-    cells = {key: cell for key, cell in occupied(sheet).items() if contains(area, coordinate_to_tuple(key))}
+    data_area = left, start, right, end
+    columns = None if selected is None or isinstance(raw, dict) else {column_index_from_string(key) for key in selected}
+    if columns is not None and any(not left <= column <= right for column in columns):
+        raise ValueError('표 범위에 속한 열을 지정해 주세요')
     values, problems = {}, {}
-    populated = set()
-    for key, cell in cells.items():
-        row, _ = coordinate_to_tuple(key)
-        if not start <= row <= end or key == region['title']:
+    populated, available_rows = set(), set()
+    if columns is not None:
+        for row, available in raw.row_availability(sheet_name, data_area):
+            populated.add(row)
+            if available:
+                available_rows.add(row)
+    title = coordinate_to_tuple(region['title']) if region['title'] else None
+    for row, col, value, kind, issue in _table_cells(raw, sheet, data_area, columns):
+        key = row, col
+        if key == title:
             continue
         populated.add(row)
-        if key in sheet['excluded']:
-            problems[key] = 'excluded_cell'
-        elif cell['hidden_merged'] or cell.get('cache_status') == 'missing':
-            problems[key] = 'hidden_merged' if cell['hidden_merged'] else 'missing_cache'
+        if issue:
+            problems[key] = issue
         else:
-            value, value_type = _value(cell)
-            values[key] = value, _kind(value_type)
-            if value_type == 'error':
-                problems[key] = 'excel_error'
+            available_rows.add(row)
+        if issue in {None, 'excel_error'}:
+            values[key] = value, kind
     for ref in sheet['merged_ranges']:
         a, b, c, d = range_boundaries(ref)
         if contains(area, (b, a)):
             for row in range(max(start, b), min(d, end) + 1):
                 for col in range(a, c + 1):
-                    if (row, col) != (b, a):
-                        problems.setdefault(address(row, col), 'covered_merge')
+                    if (row, col) != (b, a) and (columns is None or col in columns):
+                        problems.setdefault((row, col), 'covered_merge')
     hidden = {row for row in sheet['hidden_rows'] if start <= row <= end}
     skipped = 0 if include_hidden else len(hidden)
     scope = {'sheet': sheet_name, 'start': region['start'], 'end': region['end'], 'verification': verification(region),
@@ -252,13 +320,16 @@ def _read_table(raw, sheet_name, region_start, include_hidden):
              'hidden_columns': [get_column_letter(col) for col in range(left, right + 1)
                                 if any(item['start'] is not None and item['end'] is not None
                                        and item['start'] <= col <= item['end'] for item in sheet['hidden_column_ranges'])],
-             'excluded_cells': sorted(key for key in sheet['excluded'] if key in cells)}
-    return TableData(scope, left, right, values, problems, populated, set() if include_hidden else hidden)
+             'excluded_cells': sorted(key for key in sheet['excluded'] if contains(area, coordinate_to_tuple(key)))}
+    return TableData(scope, left, right, values, problems, populated, set() if include_hidden else hidden, available_rows)
 
 
 def join_candidates(raw, sheet, start, right_sheet, right_start):
     if sheet == right_sheet:
         raise ValueError('서로 다른 시트의 표 두 개를 지정해 주세요')
+    if not isinstance(raw, dict):
+        candidates, total = raw.candidate_page(sheet, start, right_sheet, right_start, 0, 5000)
+        return candidates, total <= 5000
     # Recompute from original cells to apply current confidence and conflict rules to older published jobs.
     wanted = {(sheet, start), (right_sheet, right_start)}
     selected = [{**item, 'regions': [r for r in item['regions'] if (item['name'], r['start']) in wanted]}
@@ -293,6 +364,78 @@ def _join_rows(raw, left, right, join):
     return pairs, details
 
 
+
+def _join_key(value, kind, expected):
+    if expected == 'text' and kind == 'string':
+        return value if value.strip() else None
+    if expected == 'number' and kind in {'integer', 'number'}:
+        return Decimal(str(value))
+    if expected == kind and kind in {'boolean', 'date', 'datetime'}:
+        return value
+    if expected == 'date' and kind == 'datetime':
+        date_time = datetime.fromisoformat(value)
+        return date_time.date().isoformat() if date_time.time() == time() else None
+    return None
+
+
+def _mapped_key_groups(table, columns):
+    groups = defaultdict(list)
+    rejected = Counter()
+    for row in sorted(table.populated - table.hidden):
+        values = []
+        for column, expected in columns:
+            value, kind, issue = table.raw_cell(row, column)
+            converted = _join_key(value, kind, expected) if issue is None and value is not None else None
+            if converted is None:
+                rejected[issue or ('blank_key' if value is None or (kind == 'string' and not value.strip())
+                                   else 'key_type_mismatch')] += 1
+                break
+            values.append(converted)
+        else:
+            groups[tuple(values)].append(row)
+    return groups, dict(rejected)
+
+
+def mapped_rows(left, right, join):
+    if left.scope['sheet'] == right.scope['sheet']:
+        raise ValueError('서로 다른 시트의 표 두 개를 지정해 주세요')
+    left_columns = [(left.column(key.left), key.type) for key in join.keys]
+    right_columns = [(right.column(key.right), key.type) for key in join.keys]
+    lhs, left_issues = _mapped_key_groups(left, left_columns)
+    rhs, right_issues = _mapped_key_groups(right, right_columns)
+    for groups, required, label in ((lhs, join.cardinality != 'many_to_one', '왼쪽'),
+                                     (rhs, join.cardinality != 'one_to_many', '오른쪽')):
+        duplicates = sum(len(rows) > 1 for rows in groups.values())
+        if required and duplicates:
+            raise ValueError(f'{label} 표의 고유 키가 중복됩니다 ({duplicates}개 키). 열 매핑과 관계 유형을 확인해 주세요')
+    pairs = sorted((a, b) for key in lhs.keys() & rhs.keys() for a in lhs[key] for b in rhs[key])
+    details = {'right_scope': right.scope, 'approval': 'column_mapping', 'cardinality': join.cardinality,
+               'keys': [key.model_dump() for key in join.keys], 'candidate_pairs': len(pairs),
+               'ambiguous_pairs': 0, 'unapproved_pairs': 0, 'joined_rows': len(pairs), 'matched_pairs': [],
+               'left_key_issues': left_issues, 'right_key_issues': right_issues,
+               'unmatched_left_rows': len(left.populated - left.hidden - {a for a, _ in pairs}),
+               'unmatched_right_rows': len(right.populated - right.hidden - {b for _, b in pairs})}
+    return pairs, details
+
+
+def preview_mapping(raw, plan):
+    join = plan.join
+    left = _read_table(raw, plan.sheet, plan.start, plan.include_hidden_rows, {key.left for key in join.keys})
+    right = _read_table(raw, join.sheet, join.start, plan.include_hidden_rows, {key.right for key in join.keys})
+    pairs, details = mapped_rows(left, right, join)
+    preview = []
+    for a, b in pairs[plan.offset:plan.offset + 100]:
+        points = {}
+        for side, table, row in (('left', left, a), ('right', right, b)):
+            columns = [table.column(getattr(key, side)) for key in join.keys]
+            points[side] = {'sheet': table.scope['sheet'], 'row': row,
+                            'cells': [address(row, col) for col in columns],
+                            'values': [str(table.raw_cell(row, col)[0])[:160] for col in columns]}
+        preview.append(points)
+    return {'candidates': preview, 'total': len(pairs), 'offset': plan.offset,
+            'scope': left.scope, 'join': details}
+
+
 def _number_summary(operation, values):
     if not values:
         return {'value': None, 'numeric_values': 0}
@@ -316,13 +459,30 @@ def _number_summary(operation, values):
 
 
 def execute(raw, plan):
-    left = _read_table(raw, plan.sheet, plan.start, plan.include_hidden_rows)
+    join = getattr(plan, 'join', None)
+
+    def columns(side):
+        if plan.operation == 'rows':
+            return None
+        needed = {rule.column for rule in plan.filters if rule.side == side}
+        if plan.column and plan.column_side == side:
+            needed.add(plan.column)
+        if plan.group_by and plan.group_side == side:
+            needed.add(plan.group_by)
+        if isinstance(join, MappedJoin):
+            needed.update(getattr(key, side) for key in join.keys)
+        return needed
+
+    left = _read_table(raw, plan.sheet, plan.start, plan.include_hidden_rows, columns('left'))
     tables = {'left': left}
     join_details = None
-    if join := getattr(plan, 'join', None):
-        right = _read_table(raw, join.sheet, join.start, plan.include_hidden_rows)
+    if join:
+        right = _read_table(raw, join.sheet, join.start, plan.include_hidden_rows, columns('right'))
         tables['right'] = right
-        pairs, join_details = _join_rows(raw, left, right, join)
+        if isinstance(join, MappedJoin):
+            pairs, join_details = mapped_rows(left, right, join)
+        else:
+            pairs, join_details = _join_rows(raw, left, right, join)
     else:
         pairs = [(row, None) for row in sorted(left.populated - left.hidden)]
 
@@ -352,7 +512,6 @@ def execute(raw, plan):
     rows, temporal, numbers = [], [], []
     issues, distribution, group_counts = Counter(), Counter(), Counter()
     group_numbers = defaultdict(list)
-    populated_left = {coordinate_to_tuple(key)[0] for key in left.values if key not in left.problems}
     for pair in pairs:
         evaluations = []
         for selector, predicate in filters:
@@ -365,7 +524,7 @@ def execute(raw, plan):
             unknown += 1
             issues.update(issue for decision, issue in evaluations if decision is None)
             continue
-        if plan.operation == 'count' and pair[0] not in populated_left:
+        if plan.operation == 'count' and pair[0] not in left.available_rows:
             unknown += 1
             issues['unavailable_row'] += 1
             continue
@@ -432,7 +591,8 @@ def execute(raw, plan):
     return {'operation': plan.operation, 'result': result, 'complete': not (
                 unknown or missing or issues or result.get('omitted_buckets') or result.get('omitted_groups')
                 or result.get('has_more') or (plan.operation == 'rows' and plan.offset)
-                or (join_details and (join_details['ambiguous_pairs'] or join_details['unapproved_pairs']))),
+                or (join_details and (join_details['ambiguous_pairs'] or join_details['unapproved_pairs']
+                                      or join_details.get('left_key_issues') or join_details.get('right_key_issues')))),
             'scope': left.scope, 'join': join_details,
             'unknown_filter_rows': unknown, 'unavailable_values': missing, 'blank_values': blanks, 'issues': dict(issues)}
 

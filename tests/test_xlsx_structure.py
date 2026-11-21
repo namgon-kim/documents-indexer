@@ -1,7 +1,9 @@
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime
+from uuid import uuid4
 from zipfile import ZipFile
 
 import httpx
@@ -19,7 +21,15 @@ from indexer.ingestion_service import IngestionService
 from indexer.parsing.contracts import ParseResult
 from indexer.parsing.xlsx_analysis import StructureAnalyzer
 from indexer.published_retrieval import PublishedRetrieval
-from indexer.xlsx_query import PublishedTableQuery, QueryPlan, execute, verified_tables
+from indexer.xlsx_access import open_workbook
+from indexer.xlsx_query import (
+    JoinPreview,
+    PublishedTableQuery,
+    QueryPlan,
+    execute,
+    preview_mapping,
+    verified_tables,
+)
 from indexer.xlsx_structure import SheetProposal, validate
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
@@ -297,6 +307,18 @@ def test_xlsx_review_search_evidence_and_aggregate_use_published_job(tmp_path):
             assert joined.status_code == 200
             assert joined.json()['result']['value'] == 2
             assert {ref['sheet'] for ref in joined.json()['source_ranges']} == {'Roster', 'Linked'}
+            mapped = {'document_id': doc, 'index_version': version, 'sheet': 'Roster', 'start': 'A1',
+                      'join': {'sheet': 'Linked', 'start': 'A1', 'cardinality': 'many_to_one',
+                               'keys': [{'left': 'A', 'right': 'A', 'type': 'number'}]}}
+            preview = client.post('/v1/xlsx-join-preview', json=mapped)
+            assert preview.status_code == 200 and preview.json()['total'] == 2
+            counted = client.post('/v1/xlsx-query', json={**mapped, 'operation': 'count'})
+            assert counted.json()['result']['matched_rows'] == 2
+            window = client.get(prefix + '/xlsx-cells', params={'sheet': 'Roster', 'row': 17, 'column': 4,
+                                                                  'rows': 1, 'columns': 1})
+            assert window.json()['cells'][0]['address'] == 'D17'
+            assert client.get(prefix + '/xlsx-cells', params={'sheet': 'Roster', 'address': 'D17'}).json()['cells'][0]['formula']
+
             published = client.post(f'/v1/ingest/{doc}/jobs/{new_job}/accept-content-changes', json={})
             assert published.status_code == 200, published.text
             previous = client.get(hit['evidence_urls'][0]).json()['cells']
@@ -481,7 +503,6 @@ def test_duplicates_and_name_conflicts_cannot_be_joined(tmp_path):
 
 def test_bounded_grid_and_cross_sheet_formula_references(tmp_path):
     from indexer.parsing.native_documents import NativeExtractor
-    from indexer.xlsx_review import cell_window, sheet_detail
 
     path = tmp_path / 'grid.xlsx'
     book = Workbook()
@@ -493,12 +514,16 @@ def test_bounded_grid_and_cross_sheet_formula_references(tmp_path):
     sheet['B2'] = "=SUM('Other''s sheet'!$B$2:$B$3)"
     book.save(path)
     raw = NativeExtractor(None, 'native_text').extract(path, 'xlsx').raw
-    data = raw['xlsx_sheets'][0]
-    assert not {'cells', 'hidden_merged_cells'}.intersection(sheet_detail(data))
-    preview = cell_window(raw, data, 1, 1, 10, 8)['cells']
-    assert len(preview) == 80 and max(len(item['display_text']) for item in preview) == 200
-    assert cell_window(raw, data, 1, 1, 10, 8, exact='B2')['cells'][0]['formula_references'] == [
-        {'sheet': "Other's sheet", 'start': 'B2', 'end': 'B3'}]
+    storage = ArtifactStore(tmp_path)
+    doc, job = str(uuid4()), str(uuid4())
+    storage.save_job(doc, job, 'parser_result', raw)
+    with open_workbook(storage, doc, job) as workbook:
+        data = workbook.sheet('Sheet')
+        assert not {'cells', 'hidden_merged_cells'}.intersection(data)
+        preview = workbook.window(data, 1, 1, 10, 8)['cells']
+        assert len(preview) == 80 and max(len(item['display_text']) for item in preview) == 200
+        assert workbook.window(data, 1, 1, 10, 8, exact='B2')['cells'][0]['formula_references'] == [
+            {'sheet': "Other's sheet", 'start': 'B2', 'end': 'B3'}]
 
 
 def test_xlsx_title_with_note_is_context_with_unverified_relationship(tmp_path):
@@ -518,3 +543,104 @@ def test_xlsx_title_with_note_is_context_with_unverified_relationship(tmp_path):
     data = next(chunk for chunk in state['chunks'] if any(item['address'] == 'B5' for item in chunk['table_cells']))
     assert title['element_ids'][0] in data['context_element_ids']
     assert data['relations'][0]['status'] == 'unverified' and not data['relations'][0]['adjacent']
+
+
+def test_mapped_join_handles_foreign_keys_types_composite_keys_and_cardinality(tmp_path):
+    path = tmp_path / 'orders.xlsx'
+    book = Workbook()
+    orders = book.active
+    orders.title = 'Orders'
+    orders.append(['고객번호', '지점', '금액'])
+    for row in [('001', '서울', 10), ('001', '서울', 20), ('001', '부산', 5), (1, '서울', 50),
+                (None, '서울', 70), ('002', '서울', 99), ('001', '서울', 100)]:
+        orders.append(row)
+    orders.row_dimensions[8].hidden = True
+    orders.add_table(Table(displayName='OrderData', ref='A1:C8'))
+    customers = book.create_sheet('Customers')
+    customers.append(['고객ID', '지역', '등급'])
+    customers.append(['001', '서울', '골드'])
+    customers.append(['001', '부산', '실버'])
+    customers.add_table(Table(displayName='CustomerData', ref='A1:C3'))
+    book.save(path)
+    raw = native(path)['parser_result']
+    storage = ArtifactStore(tmp_path)
+    doc, job = str(uuid4()), str(uuid4())
+    storage.save_job(doc, job, 'parser_result', raw)
+    request = {'document_id': doc, 'index_version': str(uuid4()), 'sheet': 'Orders', 'start': 'A1',
+               'include_hidden_rows': False, 'join': {'sheet': 'Customers', 'start': 'A1',
+                   'cardinality': 'many_to_one', 'keys': [{'left': key, 'right': key, 'type': 'text'} for key in 'AB']}}
+    plan = PublishedTableQuery.model_validate({**request, 'operation': 'sum', 'column': 'C',
+                                               'group_by': 'C', 'group_side': 'right'})
+    with open_workbook(storage, doc, job) as workbook:
+        result = execute(workbook, plan)
+        assert result == execute(raw, plan)
+        assert result['result']['value'] == 35
+        assert [(group['group'], group['value']) for group in result['result']['groups']] == [('골드', 30), ('실버', 5)]
+        assert result['join']['left_key_issues'] == {'key_type_mismatch': 1, 'blank_key': 1}
+        assert result['join']['unmatched_left_rows'] == 3 and result['scope']['hidden_rows_excluded'] == 1
+        assert not result['complete']
+        preview = preview_mapping(workbook, JoinPreview.model_validate({**request, 'offset': 1}))
+        assert preview['total'] == 3 and [item['left']['row'] for item in preview['candidates']] == [3, 4]
+        assert preview['candidates'][0]['right']['cells'] == ['A2', 'B2']
+        with pytest.raises(ValueError, match='고유 키가 중복'):
+            execute(workbook, PublishedTableQuery.model_validate({**request, 'operation': 'count',
+                    'join': {**request['join'], 'keys': request['join']['keys'][:1]}}))
+        with pytest.raises(ValueError, match='고유 키가 중복'):
+            execute(workbook, PublishedTableQuery.model_validate({**request, 'operation': 'count',
+                    'join': {**request['join'], 'cardinality': 'one_to_one'}}))
+        reverse = PublishedTableQuery.model_validate({**request, 'sheet': 'Customers', 'operation': 'count',
+            'join': {**request['join'], 'sheet': 'Orders', 'cardinality': 'one_to_many'}})
+        assert execute(workbook, reverse)['result']['matched_rows'] == 3
+
+
+def test_xlsx_index_reuses_legacy_source_and_recovers_after_atomic_replacement(tmp_path, monkeypatch):
+    from indexer import xlsx_access
+    from indexer.artifact_store import atomic_json
+
+    path = tmp_path / 'tables.xlsx'
+    fixture_tables(path)
+    raw = native(path)['parser_result']
+    storage = ArtifactStore(tmp_path)
+    doc, job = str(uuid4()), str(uuid4())
+    folder = storage.document_dir(doc) / 'jobs' / job
+    atomic_json(folder / 'parser_result.json', raw)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        def read(_):
+            with open_workbook(storage, doc, job) as workbook:
+                return workbook.window(workbook.sheet('Roster'), 2, 1, 1, 1)['cells'][0]['display_text']
+        assert list(pool.map(read, range(3))) == ['1', '1', '1']
+    with monkeypatch.context() as patch:
+        def fail(*_args):
+            pytest.fail('warm worksheet read should not deserialize parser_result.json')
+        patch.setattr(xlsx_access.json, 'load', fail)
+        assert read(0) == '1'
+    source = raw['xlsx_sheets'][0]['cells'][4]
+    assert source['address'] == 'A2'
+    source.update(value=900, display_text='900')
+    atomic_json(folder / 'parser_result.json', raw)
+    assert read(0) == '900'
+    (folder / 'xlsx-access.sqlite3').write_bytes(b'invalid sqlite')
+    assert read(0) == '900'
+
+
+def test_legacy_candidate_page_skips_duplicate_groups_without_losing_order(tmp_path):
+    path = tmp_path / 'duplicates.xlsx'
+    book = Workbook()
+    for i in range(2):
+        sheet = book.active if i == 0 else book.create_sheet()
+        sheet.title = f'Table{i}'
+        sheet.append(['ID', 'Name'])
+        for _ in range(100):
+            sheet.append([1, 'Duplicate'])
+        sheet.add_table(Table(displayName=f'Range{i}', ref='A1:B101'))
+    book.save(path)
+    storage = ArtifactStore(tmp_path)
+    doc, job = str(uuid4()), str(uuid4())
+    storage.save_job(doc, job, 'parser_result', native(path)['parser_result'])
+    with open_workbook(storage, doc, job) as workbook:
+        page, total = workbook.candidate_page('Table0', 'A1', 'Table1', 'A1', 98, 3)
+        assert total == 10000
+        assert [(item['left']['row'], item['right']['row']) for item in page] == [(2, 100), (2, 101), (3, 2)]
+        assert all(item['matching_rows'] == [100, 100] and item['ambiguous'] for item in page)
+        page, _ = workbook.candidate_page('Table0', 'A1', 'Table1', 'A1', 4999, 100)
+        assert len(page) == 1
