@@ -40,7 +40,9 @@
 
 ## XLSX 구조 계약
 
-- `GET /v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure`는 직접 추출 결과의 셀, 스타일, 명시 표, 경계 후보, 검증 상태, 제외 이유, 차트 정의 및 시트 간 행 연결 후보를 반환한다.
-- 같은 경로에 `POST`로 시트 이름을 키로 하는 수정안을 보낸다. 시트마다 `regions`와 `excluded`를 지정한다. 영역에는 `start`, `end`, `kind`, `headers`, `title`, `uncertain`이 있고, 제외 목록은 셀 주소에서 이유 문자열로 매핑한다. 서버는 좌표, 병합, 선언된 Excel 표, 헤더와 셀 할당을 검증한 뒤 새 작업을 등록한다.
-- `GET /v1/ingest/{document_id}/xlsx-tables`로 게시된 버전에서 검증된 표와 열을 확인한다. `POST /v1/xlsx-query`는 `document_id`, 시트 `sheet`, 표 시작 주소 `start` 및 `operation`을 받는다. 연산은 `count`, `distribution`, `date_range`, `rows`다. 분포와 날짜 범위는 `column`이 필요하며 `filters`는 열 주소, 허용 연산자와 타입이 맞는 값을 사용한다. 집계는 헤더 및 선언된 합계 행을 제외하고 원본 범위를 순회한다. 행 조회는 `offset`과 `limit`으로 나누며 응답에는 고정된 색인 버전, 범위와 불완전성이 포함된다.
-- `xlsx_structure_version=2`, 청크 `xlsx-structure-v2` 구조는 직접 추출 또는 같은 버전의 구조 수정 작업에 적용된다. 이전 게시 색인은 기존 검색과 복구를 지원한다. 이전 파싱 산출물에 새 구조를 적용할 때는 청크 재생성 대신 직접 추출로 새 작업을 만든다.
+- `GET /v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure`는 시트 목록을 반환한다. `sheet`를 지정하면 해당 시트의 영역, 검증 상태, 병합 범위와 제외 이유를 반환한다. `GET .../xlsx-cells`는 시트의 셀 격자 일부를 반환한다. 창은 최대 25행 × 20열이며 셀 미리보기는 200자로 제한한다. `address`로 개별 셀의 전체 값과 다른 시트의 정적 A1 참조를 본다. 외부 통합 문서, 이름 범위, 동적 참조는 해석 범위에서 제외한다.
+- 구조 조회 경로에 `POST`로 시트 이름을 키로 하는 수정안을 보낸다. 시트마다 `regions`와 `excluded`를 지정한다. 영역에는 `start`, `end`, `kind`, `headers`, `title`, `uncertain`이 있고, 제외 목록은 셀 주소에서 이유 문자열로 매핑한다. 서버는 좌표, 병합, 선언된 Excel 표, 헤더와 셀 할당을 검증한 뒤 새 작업을 등록한다.
+- 영역의 `verification` 값은 `explicit` (Excel 등록), `user_verified` (사용자 확인), `llm_validated` (모델 제안의 구조 검사 통과), `inferred` (로컬 추정)이다. 앞의 두 상태가 전체 표 조회 대상이다. 이 규칙은 이미 게시된 v2 결과에도 적용된다.
+- `GET /v1/ingest/{document_id}/xlsx-tables`로 게시된 버전에서 조회할 수 있는 표와 열을 확인한다. `POST /v1/xlsx-query`는 `document_id`, 시트 `sheet`, 표 시작 주소 `start` 및 `operation`을 받는다. 연산은 `count`, `distribution`, `date_range`, `rows`, `sum`, `average`, `min`, `max`다. 분포·날짜 범위·수치 집계는 `column`을 사용한다. 개수와 수치 집계에 `group_by`를 지정할 수 있다. 헤더와 선언된 합계 행은 집계 대상에서 빠지며 누락된 계산값과 제외 셀은 결과에 표시한다.
+- `GET /v1/ingest/{document_id}/xlsx-join-candidates`는 고정된 `index_version`과 `sheet`, `start`, `right_sheet`, `right_start`를 받는다. 조회에 승인한 후보는 `POST /v1/xlsx-query`의 `join`에 `sheet`, `start`, `approved_pairs`로 지정한다. 각 쌍은 `left_row`와 `right_row`를 담는다. 한 요청에서 승인한 쌍만 내부 결합한다. 중복 식별자, 이름 충돌 및 원본과 다른 연결은 거부한다. 필터의 `side`와 집계 열의 `column_side`, 그룹 열의 `group_side`로 좌우 표를 지정한다. 응답에는 미결합·미승인 건수, 조건에 맞은 행 쌍 및 양쪽 원문 범위가 포함된다.
+- `xlsx_structure_version=2`, 청크 `xlsx-structure-v2` 구조는 직접 추출 또는 같은 버전의 구조 수정 작업에 적용된다. 이전 게시 색인은 기존 검색과 복구를 지원한다. 이전 파싱 산출물에 새 구조를 적용할 때는 직접 추출로 새 작업을 만든다.

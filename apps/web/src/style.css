@@ -444,3 +444,11 @@ label:has(> input[type="checkbox"]) { display: flex !important; align-items: cen
 .extraction-limitations strong { color: #55454b; font-size: .84rem; }
 .extraction-limitations ul { margin: 7px 0 0; padding-left: 18px; }
 .extraction-limitations li + li { margin-top: 5px; }
+
+.xlsx-grid-scroll { overflow: auto; max-width: 100%; margin-block: 12px; }
+.xlsx-grid { border-collapse: collapse; min-width: 100%; table-layout: fixed; }
+.xlsx-grid th, .xlsx-grid td { border: 1px solid #ded3d6; padding: 5px 8px; min-width: 52px; }
+.xlsx-grid td.xlsx-grid-region { background: #f9f1f3; }
+.xlsx-grid td.xlsx-grid-selected { background: #f2dce2; }
+.xlsx-grid td button { text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; }
+.xlsx-grid-navigation { display: flex; flex-wrap: wrap; gap: 6px; }

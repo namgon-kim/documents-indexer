@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import replace
 from datetime import datetime
 from zipfile import ZipFile
@@ -18,7 +19,7 @@ from indexer.ingestion_service import IngestionService
 from indexer.parsing.contracts import ParseResult
 from indexer.parsing.xlsx_analysis import StructureAnalyzer
 from indexer.published_retrieval import PublishedRetrieval
-from indexer.xlsx_query import QueryPlan, execute
+from indexer.xlsx_query import PublishedTableQuery, QueryPlan, execute, verified_tables
 from indexer.xlsx_structure import SheetProposal, validate
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
@@ -167,7 +168,16 @@ def test_structure_analysis_is_opt_in_bounded_validated_and_versioned(tmp_path):
             state = native(path, StructureAnalyzer(replace(config, **changes), http))
             return state['parser_result']['xlsx_sheets'][0]
         assert extract()['analysis_status'] == 'disabled'
-        assert extract(external_processing=True)['analysis_status'] == 'analyzed'
+        analyzed = extract(external_processing=True)
+        assert analyzed['analysis_status'] == 'analyzed'
+        proposal = analyzed['regions'][0]
+        assert proposal['verification'] == 'llm_validated' and proposal['status'] == 'unverified'
+        # Old published artifacts may contain the pre-fix status.
+        proposal['status'] = 'verified'
+        raw = {'xlsx_sheets': [analyzed], 'xlsx_structure_version': 2}
+        assert verified_tables(raw) == []
+        with pytest.raises(ValueError, match='사용자가 확인한 표'):
+            execute(raw, QueryPlan(sheet='Sheet', start='A1', operation='count'))
         assert extract(external_processing=True)['analysis_status'] == 'cached'
         assert extract(external_processing=True, xlsx_structure_max_input_bytes=20)['analysis_status'] == 'input_limit'
         failed = extract(external_processing=True, xlsx_structure_model='invalid')
@@ -234,19 +244,23 @@ def test_xlsx_review_search_evidence_and_aggregate_use_published_job(tmp_path):
         return httpx.Response(200, json={'model': payload['model'], 'data': [
             {'index': index, 'embedding': [1.0, 0.5]} for index in range(len(payload['input']))]})
     with httpx.Client(transport=httpx.MockTransport(remote)) as http:
-        qdrant = QdrantClient(':memory:')
+        endpoint = os.getenv('TEST_QDRANT_URL')
+        qdrant = QdrantClient(url=endpoint) if endpoint else QdrantClient(':memory:')
         publisher = IndexPublisher(tmp_path, qdrant, EmbeddingClient(
             http, 'https://example.test/v1', 'fake', EmbeddingProfile('p', 'doc', 'query', 2)))
         storage = ArtifactStore(tmp_path)
         service = IngestionService(storage, object(), publisher)
-        first = service.ingest(path, settings=SETTINGS)
-        assert first['status'] == 'completed'
-        doc, job, version = (first[key] for key in ('document_id', 'job_id', 'index_version'))
-        prefix = f'/v1/ingest/{doc}/jobs/{job}'
         config = Config(tmp_path, access_key='key', external_processing=True, llm_api_key='fake')
         with TestClient(create_app(config, ingestion_service=service), base_url='https://testserver') as client:
             login = client.post('/v1/auth/login', json={'access_key': 'key'}, headers={'Origin': 'https://testserver'})
             client.headers.update({'Origin': 'https://testserver', 'X-CSRF-Token': login.json()['csrf_token']})
+            upload = client.post('/v1/ingest', files={'file': (path.name, path.read_bytes())},
+                                 data={'settings': json.dumps(SETTINGS)})
+            assert upload.status_code == 200, upload.text
+            first = upload.json()
+            assert first['status'] == 'completed'
+            doc, job, version = (first[key] for key in ('document_id', 'job_id', 'index_version'))
+            prefix = f'/v1/ingest/{doc}/jobs/{job}'
             hit = client.post('/v1/retrieve', json={'query': '이름16', 'method': 'bm25'}).json()['results'][0]
             assert hit['source_refs'][-1]['start'] == 'A17'
             evidence = client.get(hit['evidence_urls'][0]).json()['cells']
@@ -269,9 +283,24 @@ def test_xlsx_review_search_evidence_and_aggregate_use_published_job(tmp_path):
                 if status['status'] not in {'queued', 'processing'}:
                     break
                 sleep(0.02)
-            updated = client.get(f'/v1/ingest/{doc}/jobs/{new_job}/xlsx-structure').json()
-            assert updated['xlsx_sheets'][0]['excluded'] == {'D17': '검색에서 제외하는 수식'}
+            updated = client.get(f'/v1/ingest/{doc}/jobs/{new_job}/xlsx-structure', params={'sheet': 'Roster'}).json()
+            assert updated['excluded'] == {'D17': '검색에서 제외하는 수식'}
             assert publisher.active()['version'] == version and status['can_accept_content_changes']
+            matches = client.get(f'/v1/ingest/{doc}/xlsx-join-candidates', params={
+                'index_version': version, 'sheet': 'Roster', 'start': 'A1', 'right_sheet': 'Linked', 'right_start': 'A1'})
+            assert matches.status_code == 200
+            pair = next(item for item in matches.json()['candidates'] if not item['ambiguous'])
+            assert pair['left']['values'] == ['2', '이름2']
+            joined = client.post('/v1/xlsx-query', json={'document_id': doc, 'index_version': version,
+                'sheet': 'Roster', 'start': 'A1', 'operation': 'sum', 'column': 'A', 'column_side': 'right',
+                'join': {'sheet': 'Linked', 'start': 'A1', 'approved_pairs': [{'left_row': 3, 'right_row': 2}]}})
+            assert joined.status_code == 200
+            assert joined.json()['result']['value'] == 2
+            assert {ref['sheet'] for ref in joined.json()['source_ranges']} == {'Roster', 'Linked'}
+            published = client.post(f'/v1/ingest/{doc}/jobs/{new_job}/accept-content-changes', json={})
+            assert published.status_code == 200, published.text
+            previous = client.get(hit['evidence_urls'][0]).json()['cells']
+            assert previous == evidence and publisher.active()['version'] != version
         retrieval = PublishedRetrieval(publisher, storage)
         chat = RagChat(config, retrieval, http).invoke(ChatRequest(message='전체 개수는?', document_id=doc,
                                                                     index_version=version, xlsx_full_table=True))
@@ -371,3 +400,121 @@ def test_reviewed_title_uses_body_context_and_keeps_address(tmp_path):
     assert not any(title['element_id'] in chunk['element_ids'] for chunk in state['chunks'])
     body = next(chunk for chunk in state['chunks'] if '정상' in chunk['text'])
     assert '매출 현황' in body['text'] and title['element_id'] in body['context_element_ids']
+
+
+def test_empty_merge_and_adjacent_registered_table_stay_readable(tmp_path):
+    path = tmp_path / 'empty-merge.xlsx'
+    book = Workbook()
+    sheet = book.active
+    sheet.merge_cells('A1:B2')
+    sheet['A3'], sheet['B3'] = 'ID', '이름'
+    sheet['A3'].font = sheet['B3'].font = Font(bold=True)
+    sheet['A4'], sheet['B4'] = 1, '존재하는 값'
+    sheet['C1'], sheet['D1'], sheet['C2'], sheet['D2'] = 'Code', 'Name', 2, 'Registered'
+    sheet.add_table(Table(displayName='Adjacent', ref='C1:D2'))
+    book.save(path)
+    state = native(path)
+    data = state['parser_result']['xlsx_sheets'][0]
+    assert data['merged_ranges'] == ['A1:B2']
+    assert [item['start'] for item in data['regions'] if item['verification'] == 'explicit'] == ['C1']
+    assert any('존재하는 값' in chunk['text'] for chunk in state['chunks'])
+
+
+def test_numeric_aggregates_after_manual_review_and_missing_data(tmp_path):
+    path = tmp_path / 'ordinary.xlsx'
+    book = Workbook()
+    sheet = book.active
+    sheet.append(['그룹', '금액'])
+    sheet.append(['A', 1.25])
+    sheet.append([])
+    sheet.append(['A', 2.75])
+    sheet.append(['B', 9])
+    sheet.append(['B', '=10+5'])
+    sheet.append(['B', 20])
+    sheet.row_dimensions[5].hidden = True
+    book.save(path)
+    raw = native(path)['parser_result']
+    assert verified_tables(raw) == []
+    data = raw['xlsx_sheets'][0]
+    data['regions'] = validate(data, SheetProposal.model_validate({
+        'regions': [region('A1', 'B7', headers=('A1', 'B1'))], 'excluded': {'B7': '검토에서 제외'}}), 'user')
+    data['excluded'] = {'B7': '검토에서 제외'}
+    common = {'sheet': 'Sheet', 'start': 'A1', 'include_hidden_rows': False}
+    count = execute(raw, QueryPlan(**common, operation='count'))
+    assert count['result']['matched_rows'] == 4 and count['scope']['scanned_rows'] == 5
+    for op, expected in [('sum', 4), ('average', 2), ('min', 1.25), ('max', 2.75)]:
+        summary = execute(raw, QueryPlan(**common, operation=op, column='B', group_by='A'))
+        assert summary['result']['value'] == expected and summary['result']['numeric_values'] == 2
+        assert summary['result']['groups'][0]['value'] == expected
+        assert summary['scope']['verification'] == 'user_verified'
+        assert summary['issues'] == {'missing_cache': 1, 'excluded_cell': 1}
+        assert not summary['complete']
+
+
+def test_duplicates_and_name_conflicts_cannot_be_joined(tmp_path):
+    path = tmp_path / 'join.xlsx'
+    book = Workbook()
+    for i, names in enumerate([('First', [(1, '가'), (2, '나'), (2, '나'), (3, '다')]),
+                               ('Second', [(1, '가'), (2, '나'), (3, '다른 이름')])]):
+        sheet = book.active if not i else book.create_sheet()
+        sheet.title = names[0]
+        sheet.append(['ID', 'Name'])
+        for row in names[1]:
+            sheet.append(row)
+        sheet.add_table(Table(displayName=f'Table{i}', ref=f'A1:B{sheet.max_row}'))
+    book.save(path)
+    raw = native(path)['parser_result']
+    def plan(row):
+        return PublishedTableQuery.model_validate({
+            'document_id': 'bb58ab7a-806e-4130-818b-f78eda55d3ac',
+            'index_version': '7db28131-ad86-4c34-8a8c-6dcd2f16d23e',
+            'sheet': 'First', 'start': 'A1', 'operation': 'rows',
+            'filters': [{'column': 'B', 'side': 'right', 'operator': 'eq', 'value': '가'}],
+            'join': {'sheet': 'Second', 'start': 'A1', 'approved_pairs': [row]}})
+    for row in [{'left_row': 3, 'right_row': 3}, {'left_row': 5, 'right_row': 4}]:
+        with pytest.raises(ValueError, match='충돌'):
+            execute(raw, plan(row))
+    output = execute(raw, plan({'left_row': 2, 'right_row': 2}))
+    assert output['result']['rows'][0]['right_cells']['A']['source'] == 'A2'
+    assert output['join']['ambiguous_pairs'] == 3 and not output['complete']
+
+
+def test_bounded_grid_and_cross_sheet_formula_references(tmp_path):
+    from indexer.parsing.native_documents import NativeExtractor
+    from indexer.xlsx_review import cell_window, sheet_detail
+
+    path = tmp_path / 'grid.xlsx'
+    book = Workbook()
+    sheet = book.active
+    for _ in range(110):
+        sheet.append(['long ' * 100] * 50)
+    named = book.create_sheet("Other's sheet")
+    named['B2'] = 7
+    sheet['B2'] = "=SUM('Other''s sheet'!$B$2:$B$3)"
+    book.save(path)
+    raw = NativeExtractor(None, 'native_text').extract(path, 'xlsx').raw
+    data = raw['xlsx_sheets'][0]
+    assert not {'cells', 'hidden_merged_cells'}.intersection(sheet_detail(data))
+    preview = cell_window(raw, data, 1, 1, 10, 8)['cells']
+    assert len(preview) == 80 and max(len(item['display_text']) for item in preview) == 200
+    assert cell_window(raw, data, 1, 1, 10, 8, exact='B2')['cells'][0]['formula_references'] == [
+        {'sheet': "Other's sheet", 'start': 'B2', 'end': 'B3'}]
+
+
+def test_xlsx_title_with_note_is_context_with_unverified_relationship(tmp_path):
+    path = tmp_path / 'report.xlsx'
+    book = Workbook()
+    sheet = book.active
+    sheet['A1'], sheet['A2'] = '매출', '매출은 세전 기준'
+    sheet['A4'], sheet['B4'], sheet['A5'], sheet['B5'] = 'ID', '금액', 1, 20
+    book.save(path)
+    review = {'Sheet': {'regions': [
+        region('A1', 'A1', 'title', title='A1'), region('A2', 'A2', 'text'),
+        region('A4', 'B5', headers=('A4', 'B4')),
+    ], 'excluded': {}}}
+    state = make_graph(None).invoke({'path': str(path), 'document_id': 'd', 'job_id': 'j',
+                                    'settings': SETTINGS, 'xlsx_review': review})
+    title = next(chunk for chunk in state['chunks'] if chunk['kind'] == 'title')
+    data = next(chunk for chunk in state['chunks'] if any(item['address'] == 'B5' for item in chunk['table_cells']))
+    assert title['element_ids'][0] in data['context_element_ids']
+    assert data['relations'][0]['status'] == 'unverified' and not data['relations'][0]['adjacent']

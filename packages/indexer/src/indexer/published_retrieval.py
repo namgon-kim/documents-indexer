@@ -9,8 +9,8 @@ from qdrant_client.http.exceptions import ApiException
 
 from indexer.contracts import IndexerError
 from indexer.visual_relations import xlsx_anchor_matches
-from indexer.xlsx_query import execute, unavailable, verified_tables
-from indexer.xlsx_structure import STRUCTURE_VERSION
+from indexer.xlsx_query import execute, join_candidates, unavailable, verified_tables
+from indexer.xlsx_structure import STRUCTURE_VERSION, confirmed, occupied
 
 
 class PublishedRetrieval:
@@ -40,6 +40,27 @@ class PublishedRetrieval:
             pinned, job_id, raw, _ = self._xlsx_snapshot(document_id, version)
             return {'index_version': pinned, 'job_id': job_id, 'tables': verified_tables(raw)}
 
+    def xlsx_join_candidates(self, document_id, version, sheet, start, right_sheet, right_start, offset):
+        guard = getattr(self.publisher, 'search_lock', None)
+        with guard if guard is not None else nullcontext():
+            pinned, job_id, raw, _ = self._xlsx_snapshot(document_id, version)
+            tables = {(r['sheet'], r['start']) for r in verified_tables(raw)}
+            if not {(sheet, start), (right_sheet, right_start)} <= tables:
+                raise IndexerError('XLSX_QUERY_INVALID', '연결할 확인된 표를 지정해 주세요.')
+            try:
+                candidates, complete = join_candidates(raw, sheet, start, right_sheet, right_start)
+            except ValueError as error:
+                raise IndexerError('XLSX_QUERY_INVALID', str(error)) from error
+            cells = {item['name']: occupied(item) for item in raw['xlsx_sheets']
+                     if item['name'] in {sheet, right_sheet}}
+            page = candidates[offset:offset + 100]
+            for item in page:
+                for side in ('left', 'right'):
+                    point = item[side]
+                    point['values'] = [cells[point['sheet']][key]['display_text'][:160] for key in point['cells']]
+            return {'index_version': pinned, 'job_id': job_id, 'complete': complete, 'total': len(candidates),
+                    'offset': offset, 'candidates': page}
+
     def xlsx_query(self, document_id, version, plan):
         guard = getattr(self.publisher, 'search_lock', None)
         with guard if guard is not None else nullcontext():
@@ -52,8 +73,16 @@ class PublishedRetrieval:
                 raise IndexerError('XLSX_QUERY_INVALID', str(error)) from error
             evidence = next((item for item in chunks if item.get('xlsx_sheet') == plan.sheet
                              and item.get('xlsx_region_start') == plan.start), None)
+            scopes = [result['scope']]
+            if result['join']:
+                scopes.append(result['join']['right_scope'])
+            refs = []
+            for scope in scopes:
+                chunk = next((item for item in chunks if item.get('xlsx_sheet') == scope['sheet']
+                              and item.get('xlsx_region_start') == scope['start']), None)
+                refs.append({**scope, 'element_id': chunk['element_ids'][0] if chunk else None})
             return {**result, 'document_id': document_id, 'job_id': job_id, 'index_version': pinned,
-                    'element_id': evidence['element_ids'][0] if evidence else None}
+                    'element_id': evidence['element_ids'][0] if evidence else None, 'source_ranges': refs}
 
     @staticmethod
     def _expand_table(results, indexed):
@@ -198,13 +227,16 @@ class PublishedRetrieval:
                             source = elements_by_job[key].get(eid)
                             if source is None:
                                 raise IndexerError("SEARCH_UNAVAILABLE", "검색 결과의 원문 근거를 확인할 수 없습니다.", 409)
+                            xlsx_region = source.get('xlsx_region')
                             location = source.get("office_location")
+                            if xlsx_region and location and not confirmed(xlsx_region):
+                                location = {**location, 'status': 'unverified'}
                             if location:
                                 ref = {**location, "role": role}
                                 exact = next((item['office_location'] for item in chunk.get('element_refs', [])
                                               if item['element_id'] == eid and (item.get('office_location') or {}).get('cells')), None)
                                 if role == 'evidence' and exact:
-                                    ref = {**exact, 'role': role}
+                                    ref = {**exact, 'status': location.get('status', 'unverified'), 'role': role}
                                     for address in chunk.get('xlsx_context_cells', []):
                                         if address not in exact['cells']:
                                             context_ref = {'kind': 'xlsx_cell', 'sheet': exact['sheet'], 'cell': address,
@@ -257,6 +289,8 @@ class PublishedRetrieval:
                         and point['row'] in rows for point in (link['left'], link['right']))]
                 hits.append({**chunk, "unit_id": chunk["chunk_id"], "filename": documents[document_id]["filename"],
                              "search_text": chunk["text"], "context_text": context_text,
+                             **({"quality": "unverified"} if chunk.get('xlsx_region_start') and any(
+                                 ref.get('role') == 'evidence' and ref.get('status') == 'unverified' for ref in refs) else {}),
                              "context_before": before_text, "context_after": after_text,
                              "context_element_ids": context_ids,
                              "related_images": related_images,

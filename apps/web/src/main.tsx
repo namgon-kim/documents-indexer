@@ -349,7 +349,7 @@ function App() {
               <option key={item.document_id} value={item.document_id}>{item.filename.normalize("NFC")} · {item.document_id.slice(0, 8)}</option>)}
           </select></label>
           {xlsxScope && <label className="check wide"><input type="checkbox" checked={xlsxFullTable}
-            onChange={event => setXlsxFullTable(event.target.checked)}/> 검증된 Excel 표 전체에서 개수·분포·날짜 범위 조회</label>}
+            onChange={event => setXlsxFullTable(event.target.checked)}/> 확인된 Excel 표 전체에서 개수·분포·날짜·수치 집계</label>}
         </>}/>}
     </>}
   </main>;

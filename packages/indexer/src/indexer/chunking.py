@@ -17,6 +17,7 @@ from indexer.office_locations import set_xlsx_chunk_evidence
 from indexer.parsing.normalization import PAGE_FURNITURE, cells_from, list_items_from
 from indexer.representation import table_groups, table_parts
 from indexer.structure_relations import figure_relationships, table_relationships
+from indexer.xlsx_structure import confirmed
 
 
 def normalize_elements(raw_elements: list[dict]) -> list[dict]:
@@ -94,19 +95,33 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
     chunks = []
     pending = []
     linked_titles = {}
-    for current, following in pairwise(elements):
-        title, body = current.get('xlsx_region'), following.get('xlsx_region')
-        if (not title or not body or title['kind'] != 'title' or title['status'] != 'verified'
-                or title['sheet'] != body['sheet'] or body['kind'] == 'title'
-                or body['title_text'] or not any(cell['text'].strip() for cell in body['cells'])):
+    title_context = set()
+    for index, current in enumerate(elements):
+        title = current.get('xlsx_region')
+        if not title or title['kind'] != 'title' or not confirmed(title):
             continue
-        title_row, title_left = coordinate_to_tuple(title['start'])
-        title_end, title_right = coordinate_to_tuple(title['end'])
-        body_row, body_left = coordinate_to_tuple(body['start'])
-        _, body_right = coordinate_to_tuple(body['end'])
-        if title_row <= title_end < body_row <= title_end + 2 and max(title_left, body_left) <= min(title_right, body_right):
-            linked_titles[following['element_id']] = current
-    title_context = {item['element_id'] for item in linked_titles.values()}
+        _, left = coordinate_to_tuple(title['start'])
+        bottom, right = coordinate_to_tuple(title['end'])
+        matches = []
+        for distance, following in enumerate(elements[index + 1:index + 5], 1):
+            body = following.get('xlsx_region')
+            if not body or body['sheet'] != title['sheet'] or body['kind'] == 'title':
+                break
+            row, start_col = coordinate_to_tuple(body['start'])
+            _, end_col = coordinate_to_tuple(body['end'])
+            if row > bottom + 5:
+                break
+            if not (bottom < row and max(left, start_col) <= min(right, end_col)):
+                continue
+            if (body['kind'] == 'text' and len(body['cells']) == 1
+                    and len(body['cells'][0]['text']) <= 240 and distance <= 2):
+                continue
+            if not body['title_text'] and any(cell['text'].strip() for cell in body['cells']):
+                matches.append((following['element_id'], distance == 1 and row <= bottom + 2))
+        for element_id, direct in matches:
+            linked_titles[element_id] = (current, direct and len(matches) == 1)
+        if len(matches) == 1 and matches[0][1]:
+            title_context.add(current['element_id'])
     relationships = table_relationships(elements)
     figures = figure_relationships(elements)
     furniture_pages = defaultdict(set)
@@ -187,12 +202,12 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             flush()
             if element['element_id'] in title_context:
                 continue
-            linked_title = linked_titles.get(element['element_id'])
+            linked_title, direct_title = linked_titles.get(element['element_id'], (None, False))
             cells = {item['address']: item for item in region['cells']}
-            header_keys = region['headers'] if region['status'] == 'verified' else []
+            header_keys = region['headers'] if confirmed(region) else []
             labels = {cells[key]['column']: cells[key]['text'] for key in header_keys}
             header_row = max((cells[key]['row'] for key in header_keys), default=0)
-            title = region['title_text'] if region['status'] == 'verified' else None
+            title = region['title_text'] if confirmed(region) else None
             if linked_title:
                 title = linked_title['xlsx_region']['title_text']
             prefix = context_prefix(' > '.join(dict.fromkeys(filter(None, [heading, title]))),
@@ -204,7 +219,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 label = ''
                 if item['row'] > header_row and not item['hidden_merged']:
                     label = labels.get(item['column'], '')
-                    if (region['kind'] == 'key_value' and region['status'] == 'verified'
+                    if (region['kind'] == 'key_value' and confirmed(region)
                             and item['address'] != region['title']):
                         label = row_labels.get(item['row'], '')
                         row_labels.setdefault(item['row'], item['text'])
@@ -221,7 +236,10 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                  'xlsx_region_kind': region['kind'], 'xlsx_sheet': region['sheet'],
                                  'xlsx_context_cells': [key for key in [region['title'] if title else None, *header_keys] if key],
                                  'context_element_ids': [linked_title['element_id']] if linked_title else [],
-                                 'quality': 'extracted' if region['status'] == 'verified' else 'unverified',
+                                 'relations': [{'type': 'xlsx_title', 'origin': 'inferred',
+                                                'status': 'unverified', 'element_id': linked_title['element_id'],
+                                                'adjacent': direct_title}] if linked_title else [],
+                                 'quality': 'extracted' if confirmed(region) else 'unverified',
                              }, body_prefix=prefix)
                 set_xlsx_chunk_evidence(chunks[-1], segments)
             continue

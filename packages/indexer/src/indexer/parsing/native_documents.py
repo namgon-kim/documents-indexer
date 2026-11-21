@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import traceback
 import warnings
 import zlib
 from html import escape
@@ -417,9 +418,9 @@ class NativeExtractor:
             from indexer.xlsx_structure import (
                 STRUCTURE_VERSION,
                 SheetProposal,
-                local_structure,
                 occupied,
                 row_candidates,
+                safe_local_structure,
                 validate,
             )
             source = inspect_office(path, native_cells=True)
@@ -446,7 +447,7 @@ class NativeExtractor:
                     _, _, max_col, max_row = sheet_data['bounds']
                     if max_row > 5000 or max_col > 100 or max_row * max_col > 25000:
                         raise IndexerError('NATIVE_TABLE_LIMIT', '시트 크기가 직접 추출 범위를 넘습니다. 다른 파서를 사용해 주세요.', 413)
-                    regions, candidates = local_structure(sheet_data)
+                    regions, candidates = safe_local_structure(sheet_data)
                     sheet_data.update(regions=regions, boundary_candidates=candidates, excluded={})
                     if sheet.title in review:
                         try:
@@ -526,6 +527,8 @@ class NativeExtractor:
         except IndexerError:
             raise
         except Exception as error:
+            LOG.error('XLSX native extraction failed (%s)\n%s', type(error).__name__,
+                      ''.join(traceback.format_tb(error.__traceback__)))
             raise IndexerError('NATIVE_EXTRACTION_FAILED', 'Excel 내용 또는 삽입 이미지를 읽을 수 없습니다.', 422) from error
 
     def _xlsx_regions(self, sheet):

@@ -10,7 +10,7 @@ from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,6 +42,7 @@ from indexer.settings import (
     values,
 )
 from indexer.xlsx_query import PublishedTableQuery
+from indexer.xlsx_review import cell_window, sheet_detail, sheet_summary
 from indexer.xlsx_structure import STRUCTURE_VERSION, SheetProposal, occupied
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from qdrant_client import QdrantClient
@@ -506,8 +507,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         except ValueError as error:
             raise IndexerError("REPROCESS_UNAVAILABLE", str(error), 409) from error
 
-    @app.get("/v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure", dependencies=[Depends(auth.require)])
-    def xlsx_structure(request: Request, document_id: UUID, job_id: UUID):
+    def load_xlsx_structure(request, document_id, job_id):
         publisher = getattr(request.app.state, 'index_publisher', None)
         if publisher and str(document_id) in publisher.deleted_documents():
             raise IndexerError('XLSX_STRUCTURE_UNAVAILABLE', 'XLSX 구조를 찾을 수 없습니다.', 404)
@@ -517,7 +517,31 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError('XLSX_STRUCTURE_UNAVAILABLE', 'XLSX 구조를 찾을 수 없습니다.', 404) from error
         if raw.get('xlsx_structure_version') != STRUCTURE_VERSION:
             raise IndexerError('XLSX_STRUCTURE_UNAVAILABLE', '문서를 다시 읽은 뒤 구조를 검토해 주세요.', 409)
-        return {key: value for key, value in raw.items() if key.startswith('xlsx_')}
+        return raw
+
+    def pick_xlsx_sheet(raw, name):
+        sheet = next((item for item in raw['xlsx_sheets'] if item['name'] == name), None)
+        if sheet is None:
+            raise IndexerError('XLSX_SHEET_NOT_FOUND', '시트를 찾을 수 없습니다.', 404)
+        return sheet
+
+    @app.get("/v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure", dependencies=[Depends(auth.require)])
+    def xlsx_structure(request: Request, document_id: UUID, job_id: UUID, sheet: str | None = None):
+        raw = load_xlsx_structure(request, document_id, job_id)
+        if sheet is not None:
+            return sheet_detail(pick_xlsx_sheet(raw, sheet))
+        return {'xlsx_structure_version': STRUCTURE_VERSION,
+                'xlsx_sheets': [sheet_summary(item) for item in raw['xlsx_sheets']]}
+
+    @app.get("/v1/ingest/{document_id}/jobs/{job_id}/xlsx-cells", dependencies=[Depends(auth.require)])
+    def xlsx_cells(request: Request, document_id: UUID, job_id: UUID, sheet: str,
+                   row: Annotated[int, Query(ge=1, le=5000)] = 1,
+                   column: Annotated[int, Query(ge=1, le=100)] = 1,
+                   rows: Annotated[int, Query(ge=1, le=25)] = 10,
+                   columns: Annotated[int, Query(ge=1, le=20)] = 8,
+                   address: Annotated[str | None, Query(pattern=r'^[A-Z]{1,3}[1-9][0-9]{0,6}$', max_length=10)] = None):
+        raw = load_xlsx_structure(request, document_id, job_id)
+        return cell_window(raw, pick_xlsx_sheet(raw, sheet), row, column, rows, columns, exact=address)
 
     @app.post("/v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure", status_code=202, dependencies=[Depends(auth.require)])
     def review_xlsx(request: Request, document_id: UUID, job_id: UUID, body: dict[str, SheetProposal]):
@@ -600,6 +624,14 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
     def xlsx_tables(request: Request, document_id: UUID, index_version: UUID | None = None, profile_id: str | None = None):
         retrieval = selected_retrieval(request, profile_id, index_version)
         return retrieval.xlsx_catalog(str(document_id), str(index_version) if index_version else None)
+
+    @app.get("/v1/ingest/{document_id}/xlsx-join-candidates", dependencies=[Depends(auth.require)])
+    def xlsx_join_candidates(request: Request, document_id: UUID, index_version: UUID,
+                             sheet: str, start: str, right_sheet: str, right_start: str,
+                             offset: Annotated[int, Query(ge=0, le=5000)] = 0, profile_id: str | None = None):
+        retrieval = selected_retrieval(request, profile_id, index_version)
+        return retrieval.xlsx_join_candidates(str(document_id), str(index_version), sheet, start,
+                                              right_sheet, right_start, offset)
 
     @app.post("/v1/xlsx-query", dependencies=[Depends(auth.require)])
     def xlsx_query(request: Request, body: PublishedTableQuery):

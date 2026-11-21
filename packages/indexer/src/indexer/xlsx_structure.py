@@ -1,5 +1,7 @@
 """Spreadsheet structure proposals and validation against native cells."""
 
+import logging
+import traceback
 from collections import defaultdict
 from itertools import combinations, product
 from typing import Annotated, Literal
@@ -10,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from indexer.office_locations import valid_cell
 
+LOG = logging.getLogger(__name__)
 STRUCTURE_VERSION = 2
 Address = Annotated[str, Field(pattern=r'^[A-Z]{1,3}[1-9][0-9]{0,6}$', max_length=10)]
 
@@ -46,6 +49,39 @@ def contains(bounds, point):
 def occupied(sheet):
     return {cell['address']: cell for cell in [*sheet['cells'], *sheet['hidden_merged_cells']]
             if cell.get('has_content')}
+
+
+
+def verification(region):
+    origin = region.get('origin')
+    if origin == 'explicit' and region.get('table_name'):
+        return 'explicit'
+    if origin == 'user' and region.get('status') == 'verified' and not region.get('uncertain'):
+        return 'user_verified'
+    if origin == 'llm':
+        return 'llm_validated'
+    return 'inferred'
+
+
+def confirmed(region):
+    return verification(region) in {'explicit', 'user_verified'}
+
+
+def safe_local_structure(sheet):
+    try:
+        return local_structure(sheet)
+    except (KeyError, ValueError, IndexError, TypeError) as error:
+        # Log stack frames and exception type without echoing workbook contents.
+        LOG.warning('XLSX structure inference failed (%s)\n%s', type(error).__name__,
+                    ''.join(traceback.format_tb(error.__traceback__)))
+        return fallback_structure(sheet), []
+
+
+def fallback_structure(sheet):
+    if not occupied(sheet):
+        return []
+    return [_region(sheet['bounds']).model_dump() |
+            {'origin': 'inferred', 'status': 'unverified', 'verification': 'inferred'}]
 
 
 def validate(sheet, proposal, origin):
@@ -104,10 +140,12 @@ def validate(sheet, proposal, origin):
                 raise ValueError('항목·값 영역의 각 행에는 두 셀이 필요합니다')
         seen.append(area)
         claimed.update(members)
-        output.append({**region.model_dump(), 'origin': 'explicit' if table else origin,
-                       'status': 'unverified' if region.uncertain or region.kind == 'unknown' else 'verified',
-                       'table_name': table['name'] if table else None,
-                       'totals_rows': table['totals_rows'] if table else 0})
+        validated = {**region.model_dump(), 'origin': 'explicit' if table else origin,
+                     'status': 'verified' if table or (origin == 'user' and not region.uncertain
+                                                       and region.kind != 'unknown') else 'unverified',
+                     'table_name': table['name'] if table else None,
+                     'totals_rows': table['totals_rows'] if table else 0}
+        output.append({**validated, 'verification': verification(validated)})
     if registered.keys() - set(seen) or set(excluded) != cells.keys() - claimed:
         raise ValueError('각 원본 셀을 한 영역에 포함하거나 제외 이유를 지정해 주세요')
     return sorted(output, key=lambda item: coordinate_to_tuple(item['start']))
@@ -144,8 +182,9 @@ def _local_regions(cells, merges):
                                            and not item.get('merged_range') for item in entries.values())]
     regions = []
     title_key = None
-    if starts and top < starts[0] <= top + 2 and len(by_row[top]) == 1:
-        column, cell = next(iter(by_row[top].items()))
+    head = by_row.get(top, {})
+    if starts and top < starts[0] <= top + 2 and len(head) == 1:
+        column, cell = next(iter(head.items()))
         if cell['bold'] and cell['type'] in {'s', 'inlineStr'} and all(row == top or row >= starts[0] for row in by_row):
             title_key = address(top, column)
     if starts and (starts[0] == top or title_key):
@@ -156,7 +195,6 @@ def _local_regions(cells, merges):
                         [address(start, col) for col in range(left, right + 1)], title=title_key if index == 0 else None)
                        for index, (start, end) in enumerate(bands)]
     # Adjacent tables can have distinct column-header style runs without a blank column.
-    head = by_row[top]
     run_starts = [left]
     if len(head) == right - left + 1 and all(item['bold'] and item['type'] in {'s', 'inlineStr'}
                                               and not item.get('merged_range') for item in head.values()):
@@ -227,21 +265,18 @@ def local_structure(sheet):
         try:
             return validate(sheet, SheetProposal(regions=declared + fallback, excluded={}), 'inferred'), candidates
         except ValueError:
-            if cells:
-                return [_region(sheet['bounds']).model_dump() |
-                        {'origin': 'inferred', 'status': 'unverified'}], candidates
-            return [], candidates
+            return fallback_structure(sheet), candidates
 
 
 def row_candidates(sheets):
     """Link only rows sharing an identifier and a name under verified headers."""
-    aliases = {'id': 'id', '번호': 'id', '코드': 'id', '학번': 'id',
+    aliases = {'id': 'id', 'code': 'id', 'identifier': 'id', '번호': 'id', '코드': 'id', '학번': 'id',
                'name': 'name', '이름': 'name', '명칭': 'name', '성명': 'name'}
     index = defaultdict(lambda: defaultdict(list))
     for sheet in sheets:
         cells = {key: cell for key, cell in occupied(sheet).items() if key not in sheet['excluded']}
         for region in sheet['regions']:
-            if region['status'] != 'verified' or not region['headers']:
+            if not confirmed(region) or not region['headers']:
                 continue
             labels = defaultdict(list)
             for key in region['headers']:
