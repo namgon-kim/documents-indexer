@@ -1,17 +1,82 @@
 """게시된 청크를 검색과 대화가 공유하는 근거 계약으로 변환한다."""
 
 import json
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 
 import httpx
+from openpyxl.utils import get_column_letter
 from qdrant_client.http.exceptions import ApiException
 
 from indexer.contracts import IndexerError
+from indexer.visual_relations import xlsx_anchor_matches
+from indexer.xlsx_access import CANDIDATE_LIMIT, open_workbook
+from indexer.xlsx_query import execute, preview_mapping, unavailable
+from indexer.xlsx_structure import confirmed
 
 
 class PublishedRetrieval:
     def __init__(self, publisher, storage):
         self.publisher, self.storage = publisher, storage
+
+    @contextmanager
+    def _xlsx_snapshot(self, document_id, version):
+        with ExitStack() as stack:
+            try:
+                manifest = self.publisher.get_version(version)
+                if not manifest or document_id in self.publisher.deleted_documents():
+                    raise unavailable()
+                source = self.publisher.xlsx_source(document_id, manifest)
+                if not source:
+                    raise unavailable()
+                job_id = source['job_id']
+                workbook = stack.enter_context(open_workbook(self.storage, document_id, job_id))
+            except (OSError, KeyError, ValueError) as error:
+                raise unavailable() from error
+            yield manifest['version'], job_id, workbook, source['regions']
+
+    def xlsx_catalog(self, document_id, version=None):
+        guard = getattr(self.publisher, 'search_lock', None)
+        with guard if guard is not None else nullcontext(), self._xlsx_snapshot(document_id, version) as snapshot:
+            pinned, job_id, workbook, _ = snapshot
+            return {'index_version': pinned, 'job_id': job_id, 'tables': workbook.catalog()}
+
+    def xlsx_join_candidates(self, document_id, version, sheet, start, right_sheet, right_start, offset):
+        guard = getattr(self.publisher, 'search_lock', None)
+        with guard if guard is not None else nullcontext(), self._xlsx_snapshot(document_id, version) as snapshot:
+            pinned, job_id, workbook, _ = snapshot
+            tables = {(r['sheet'], r['start']) for r in workbook.catalog()}
+            if sheet == right_sheet or not {(sheet, start), (right_sheet, right_start)} <= tables:
+                raise IndexerError('XLSX_QUERY_INVALID', '서로 다른 시트에서 확인된 표를 지정해 주세요.')
+            candidates, total = workbook.candidate_page(sheet, start, right_sheet, right_start, offset, 100)
+            return {'index_version': pinned, 'job_id': job_id, 'complete': total <= CANDIDATE_LIMIT,
+                    'total': min(total, CANDIDATE_LIMIT), 'offset': offset, 'candidates': candidates}
+
+    def xlsx_join_preview(self, document_id, version, plan):
+        guard = getattr(self.publisher, 'search_lock', None)
+        with guard if guard is not None else nullcontext(), self._xlsx_snapshot(document_id, version) as snapshot:
+            pinned, job_id, workbook, _ = snapshot
+            try:
+                return {**preview_mapping(workbook, plan), 'index_version': pinned, 'job_id': job_id}
+            except ValueError as error:
+                raise IndexerError('XLSX_QUERY_INVALID', str(error)) from error
+
+    def xlsx_query(self, document_id, version, plan):
+        guard = getattr(self.publisher, 'search_lock', None)
+        with guard if guard is not None else nullcontext(), self._xlsx_snapshot(document_id, version) as snapshot:
+            pinned, job_id, workbook, regions = snapshot
+            if not workbook.catalog():
+                raise unavailable()
+            try:
+                result = execute(workbook, plan)
+            except ValueError as error:
+                raise IndexerError('XLSX_QUERY_INVALID', str(error)) from error
+            sources = {(sheet, start): eid for sheet, start, eid in regions}
+            scopes = [result['scope']]
+            if result['join']:
+                scopes.append(result['join']['right_scope'])
+            refs = [{**scope, 'element_id': sources.get((scope['sheet'], scope['start']))} for scope in scopes]
+            return {**result, 'document_id': document_id, 'job_id': job_id, 'index_version': pinned,
+                    'element_id': refs[0]['element_id'], 'source_ranges': refs}
 
     @staticmethod
     def _expand_table(results, indexed):
@@ -73,6 +138,7 @@ class PublishedRetrieval:
                                            request.rerank, str(request.index_version) if request.index_version else None)
             documents = {}
             elements_by_job = {}
+            xlsx_relations_by_job = {}
             hits = []
             chunk_path = self.publisher.root / result["index_version"] / "chunks.json"
             indexed = {item["chunk_id"]: item for item in json.loads(chunk_path.read_text(encoding="utf-8"))}
@@ -121,9 +187,7 @@ class PublishedRetrieval:
                             if link.get('type') == 'cell_anchor':
                                 anchor = image.get('layout') or {}
                                 cells = chunk.get('table_cells', [])
-                                if not cells or not any(abs(cell['row'] - anchor.get('start_row', -100)) <= 1
-                                                        and abs(cell['column'] - anchor.get('start_column', -100)) <= 1
-                                                        for cell in cells):
+                                if not xlsx_anchor_matches(anchor, cells):
                                     continue
                             image_ids.add(image['element_id'])
                             related_images.append({**link, 'url': f'/v1/ingest/{document_id}/jobs/{job_id}/elements/{image["element_id"]}/image',
@@ -157,9 +221,28 @@ class PublishedRetrieval:
                             source = elements_by_job[key].get(eid)
                             if source is None:
                                 raise IndexerError("SEARCH_UNAVAILABLE", "검색 결과의 원문 근거를 확인할 수 없습니다.", 409)
+                            xlsx_region = source.get('xlsx_region')
                             location = source.get("office_location")
+                            if xlsx_region and location and not confirmed(xlsx_region):
+                                location = {**location, 'status': 'unverified'}
                             if location:
                                 ref = {**location, "role": role}
+                                exact = next((item['office_location'] for item in chunk.get('element_refs', [])
+                                              if item['element_id'] == eid and (item.get('office_location') or {}).get('cells')), None)
+                                if role == 'evidence' and exact:
+                                    ref = {**exact, 'status': location.get('status', 'unverified'), 'role': role}
+                                    for address in chunk.get('xlsx_context_cells', []):
+                                        if address not in exact['cells']:
+                                            context_ref = {'kind': 'xlsx_cell', 'sheet': exact['sheet'], 'cell': address,
+                                                           'role': 'context', 'origin': exact.get('origin'),
+                                                           'status': exact.get('status', 'unverified')}
+                                            if context_ref not in refs:
+                                                refs.append(context_ref)
+                                elif role == 'evidence' and location.get('kind') == 'xlsx_range' and chunk.get('table_cells'):
+                                    cells = chunk['table_cells']
+                                    ref['start'] = f"{get_column_letter(min(c['column'] for c in cells))}{min(c['row'] for c in cells)}"
+                                    ref['end'] = f"{get_column_letter(max(c['column'] for c in cells))}{max(c['row'] for c in cells)}"
+                                    ref['status'] = 'unverified'
                                 if ref not in refs:
                                     refs.append(ref)
                             source_page = source.get("page")
@@ -174,15 +257,38 @@ class PublishedRetrieval:
                         for element_id in evidence_ids] if job_id else []
                 context_urls = [f"/v1/ingest/{document_id}/jobs/{job_id}/elements/{element_id}"
                                 for element_id in context_ids] if job_id else []
+                if chunk.get('xlsx_region_start') and urls:
+                    cells = list(dict.fromkeys(cell['address'] for cell in chunk['table_cells']))
+                    base_url = urls[0]
+                    urls = [base_url + '?cells=' + ','.join(cells[start:start + 100])
+                            for start in range(0, len(cells), 100)]
+                    xlsx_context = [address for address in chunk.get('xlsx_context_cells', []) if address not in cells]
+                    context_urls.extend(base_url + '?cells=' + ','.join(xlsx_context[start:start + 100])
+                                        for start in range(0, len(xlsx_context), 100))
                 before_text = (before.get("body_text") or before["text"])[-600:] if before else ""
                 after_text = (after.get("body_text") or after["text"])[:600] if after else ""
                 context_text = "\n".join(filter(None, [chunk.get("heading_text"), before_text,
                     chunk.get("body_text") or chunk["text"], after_text])) if before or after else chunk["text"]
+                row_relations = []
+                if chunk.get('xlsx_region_start'):
+                    if key not in xlsx_relations_by_job:
+                        try:
+                            raw = self.storage.load_job(document_id, job_id, 'parser_result')
+                            xlsx_relations_by_job[key] = raw.get('xlsx_row_relations', [])
+                        except FileNotFoundError:
+                            xlsx_relations_by_job[key] = []
+                    rows = {cell['row'] for cell in chunk['table_cells']}
+                    row_relations = [link for link in xlsx_relations_by_job[key] if any(
+                        point['sheet'] == chunk['xlsx_sheet'] and point['region_start'] == chunk['xlsx_region_start']
+                        and point['row'] in rows for point in (link['left'], link['right']))]
                 hits.append({**chunk, "unit_id": chunk["chunk_id"], "filename": documents[document_id]["filename"],
                              "search_text": chunk["text"], "context_text": context_text,
+                             **({"quality": "unverified"} if chunk.get('xlsx_region_start') and any(
+                                 ref.get('role') == 'evidence' and ref.get('status') == 'unverified' for ref in refs) else {}),
                              "context_before": before_text, "context_after": after_text,
                              "context_element_ids": context_ids,
                              "related_images": related_images,
+                             **({"xlsx_row_relations": row_relations} if row_relations else {}),
                              "source_refs": refs, "evidence_urls": urls, "context_urls": context_urls})
             return {**result, "results": hits}
         except ApiException as error:

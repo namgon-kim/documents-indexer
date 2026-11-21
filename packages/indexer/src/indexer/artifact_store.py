@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -11,6 +12,8 @@ from uuid import UUID, uuid4
 
 from indexer.review_status import normalize_review_status
 
+LOG = logging.getLogger(__name__)
+
 
 def atomic_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -18,7 +21,9 @@ def atomic_json(path: Path, value):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(value, stream, ensure_ascii=False, allow_nan=False)
+        status = Path(name).stat()
         os.replace(name, path)
+        return status
     finally:
         Path(name).unlink(missing_ok=True)
 
@@ -111,7 +116,15 @@ class ArtifactStore:
         if name not in {"parser_result", "parser_elements", "parser_initial_elements", "parse_attempts", "source_details", "elements", "chunks", "processing", "parser_config"}:
             raise ValueError("알 수 없는 산출물 유형입니다")
         path = self.document_dir(document_id) / "jobs" / str(UUID(job_id)) / (name + ".json")
-        atomic_json(path, value)
+        source_stat = atomic_json(path, value)
+        if name == 'parser_result' and isinstance(value, dict) and value.get('xlsx_structure_version'):
+            from indexer.xlsx_access import open_workbook
+
+            try:
+                with open_workbook(self, document_id, job_id, parsed=value, source_stat=source_stat):
+                    pass
+            except (OSError, ValueError) as error:
+                LOG.warning('XLSX 조회 색인을 준비하지 못했습니다. 다음 조회에서 재시도합니다 (%s).', type(error).__name__)
 
     def load_job(self, document_id: str, job_id: str, name: str):
         if name not in {"parser_result", "parser_elements", "parser_initial_elements", "parse_attempts", "source_details", "elements", "chunks", "processing", "parser_config"}:

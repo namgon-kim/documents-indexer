@@ -104,7 +104,7 @@ export function DocumentChat(props: Props) {
                 {!!hit.related_images?.length && <VisualAssets items={hit.related_images} session={props.session}/>}
                 {(hit.context_before || hit.context_after) && <details><summary>앞뒤 문맥 보기</summary>
                   {hit.context_before && <p className="result-text">앞 · {hit.context_before}</p>}{hit.context_after && <p className="result-text">뒤 · {hit.context_after}</p>}</details>}
-                <button type="button" className="link-button" onClick={() => onEvidence(hit)}>{expanded?.id === hit.unit_id ? "파싱 원문 닫기" : "파싱 원문 보기"}</button>
+                {!!hit.evidence_urls.length && <button type="button" className="link-button" onClick={() => onEvidence(hit)}>{expanded?.id === hit.unit_id ? "파싱 원문 닫기" : "파싱 원문 보기"}</button>}
                 {!!hit.context_urls?.length && <button type="button" className="link-button" onClick={() => onContext(hit)}>문맥 원문 보기</button>}
                 {expanded?.id === hit.unit_id + ":context" && <p className="evidence result-text">문맥 · {expanded.text}</p>}
                 {expanded?.id === hit.unit_id && <p className="evidence result-text">{expanded.text}</p>}

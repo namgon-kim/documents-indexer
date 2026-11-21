@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, api, remove, uploadIngestion } from "./api";
 import type { EmbeddingProfile, Options, Session, Settings } from "./api";
+import { XlsxJoin } from "./XlsxJoin";
+import { XlsxStructure } from "./XlsxStructure";
 import { ProcessProgress } from "./ProcessProgress";
 import { ImageThumbnail, analysisLabels } from "./VisualAssets";
 import type { VisualItem } from "./api";
@@ -193,6 +195,12 @@ function DocumentCard({item, busy, modelEnabled, embeddingProfile, supportsDpi, 
         finally { setReviewBusy(false); }
       }}>확인한 새 내용 적용</button></>}
       </>}{reviewError && <p role="alert">{reviewError}</p>}</div>}
+    {item.format === "xlsx" && job.parsed_available && job.provider === "native_xlsx" &&
+      <XlsxStructure key={job.job_id} session={session} documentId={item.document_id} jobId={job.job_id}
+        disabled={busy || running || !modelEnabled} onChanged={newJob => {setSelected(newJob); onChanged();}}/>}
+    {item.format === "xlsx" && job.index_version && job.provider === "native_xlsx" &&
+      <XlsxJoin key={job.index_version} session={session} documentId={item.document_id}
+        version={job.index_version} profile={job.embedding_profile_id || embeddingProfile}/>}
     {job.source_summary && <details className="hint"><summary>원본 문서 정보</summary>
       {job.source_summary.sheets && <><p>시트 {job.source_summary.sheets.length}개</p>
         {job.source_summary.sheets.map((sheet, index) => <p key={index}>{sheet.name} · {sheet.visibility === "visible" ? "표시" : ["hidden", "veryHidden"].includes(sheet.visibility) ? "숨김" : "상태 미확인"} · 수식 {sheet.formula_count}개{!sheet.formula_scan_complete ? " 이상 · 일부 확인 불가" : ""}{sheet.missing_cached_values ? ` · 저장된 계산값 없음 ${sheet.missing_cached_values}개` : ""}</p>)}</>}

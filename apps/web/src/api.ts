@@ -92,7 +92,7 @@ export interface Hit {
   search_text: string;
   context_before?: string;
   context_after?: string;
-  source_refs: { page?: number; kind: string; role?: "evidence" | "context"; table_rows?: [number, number]; sheet?: string; cell?: string; start?: string; end?: string; slide?: number; section?: string | number; block?: number; paragraph?: number }[];
+  source_refs: { page?: number; kind: string; role?: "evidence" | "context"; table_rows?: [number, number]; status?: string; cells?: string[]; sheet?: string; cell?: string; start?: string; end?: string; slide?: number; section?: string | number; block?: number; paragraph?: number }[];
   evidence_urls: string[];
   context_urls?: string[];
   related_images?: VisualItem[];

@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from unicodedata import normalize
 
 from bs4 import BeautifulSoup
+from openpyxl.utils.cell import coordinate_to_tuple
 
 from indexer.parsing.normalization import cells_from
 
@@ -15,10 +16,25 @@ def normalized(value):
 
 def inventory(elements):
     words, cells, rows = defaultdict(Counter), defaultdict(Counter), defaultdict(Counter)
+    xlsx_rows = defaultdict(dict)
     for element in elements:
         page = element.get("page")
         table = BeautifulSoup(element.get("html") or "", "html.parser").find("table")
         table_cells = cells_from(table) if table and not table.find("table") else []
+        location = element.get('office_location') or {}
+        if location.get('kind') == 'xlsx_range' and (table_cells or element.get('xlsx_region')):
+            region = element.get('xlsx_region')
+            if region:
+                parts = [(cell['row'], cell['column'], cell['text']) for cell in region['cells']]
+            else:
+                top, left = coordinate_to_tuple(location['start'])
+                parts = [(cell.row + top, cell.column + left, cell.text) for cell in table_cells]
+            for row, column, text in parts:
+                if value := normalized(text):
+                    key = location['sheet'], row, column
+                    cells[page][(*key, value)] += 1
+                    xlsx_rows[page, location['sheet'], row][column] = value
+            continue
         if table_cells:
             caption = table.find("caption")
             if caption:
@@ -35,6 +51,8 @@ def inventory(elements):
                     rows[page][signature] += 1
         else:
             words[page].update(re.findall(r"[^\W_]+", normalized(element.get("text") or ""), re.UNICODE))
+    for (page, sheet, row), values in xlsx_rows.items():
+        rows[page][(sheet, row, tuple(sorted(values.items())))] += 1
     return words, cells, rows
 
 

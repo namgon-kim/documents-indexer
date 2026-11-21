@@ -7,14 +7,17 @@ from itertools import groupby, pairwise
 from uuid import NAMESPACE_URL, uuid5
 
 from bs4 import BeautifulSoup
+from openpyxl.utils.cell import coordinate_to_tuple
 
 from indexer.element_scope import same_scope, source_scope
 from indexer.embedding_input import MAX_INPUT_BYTES, byte_size, context_prefix, embedding_text, split_text
 from indexer.heading_hierarchy import apply_flat_hierarchy
 from indexer.inspection import is_page_label
+from indexer.office_locations import set_xlsx_chunk_evidence
 from indexer.parsing.normalization import PAGE_FURNITURE, cells_from, list_items_from
 from indexer.representation import table_groups, table_parts
 from indexer.structure_relations import figure_relationships, table_relationships
+from indexer.xlsx_structure import confirmed
 
 
 def normalize_elements(raw_elements: list[dict]) -> list[dict]:
@@ -68,6 +71,7 @@ def normalize_elements(raw_elements: list[dict]) -> list[dict]:
                          **({'previous_element_id': raw['_merge_from']} if raw.get('_merge_from') else {}),
                          **({'search_exclusion': 'image_policy'} if raw.get('_image_suppressed') else {}),
                          **({'layout': raw['_layout']} if raw.get('_layout') else {}),
+                         **({'xlsx_region': raw['_xlsx_region']} if '_xlsx_region' in raw else {}),
                          **({'container_id': raw['_container']} if raw.get('_container') else {}),
                          **({"coordinate_space": {"provider": raw["_provider"], "width": raw.get("_page_width"),
                                                    "height": raw.get("_page_height"), "unit": "pixels"}}
@@ -90,6 +94,34 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
         raise ValueError("임베딩 입력 바이트 제한을 확인해 주세요")
     chunks = []
     pending = []
+    linked_titles = {}
+    title_context = set()
+    for index, current in enumerate(elements):
+        title = current.get('xlsx_region')
+        if not title or title['kind'] != 'title' or not confirmed(title):
+            continue
+        _, left = coordinate_to_tuple(title['start'])
+        bottom, right = coordinate_to_tuple(title['end'])
+        matches = []
+        for distance, following in enumerate(elements[index + 1:index + 5], 1):
+            body = following.get('xlsx_region')
+            if not body or body['sheet'] != title['sheet'] or body['kind'] == 'title':
+                break
+            row, start_col = coordinate_to_tuple(body['start'])
+            _, end_col = coordinate_to_tuple(body['end'])
+            if row > bottom + 5:
+                break
+            if not (bottom < row and max(left, start_col) <= min(right, end_col)):
+                continue
+            if (body['kind'] == 'text' and len(body['cells']) == 1
+                    and len(body['cells'][0]['text']) <= 240 and distance <= 2):
+                continue
+            if not body['title_text'] and any(cell['text'].strip() for cell in body['cells']):
+                matches.append((following['element_id'], distance == 1 and row <= bottom + 2))
+        for element_id, direct in matches:
+            linked_titles[element_id] = (current, direct and len(matches) == 1)
+        if len(matches) == 1 and matches[0][1]:
+            title_context.add(current['element_id'])
     relationships = table_relationships(elements)
     figures = figure_relationships(elements)
     furniture_pages = defaultdict(set)
@@ -145,7 +177,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             element["search_exclusion"] = "repeated_page_furniture"
             flush()
             continue
-        if not text:
+        if not text and not element.get("xlsx_region"):
             flush()
             continue
         heading = context_prefix(" > ".join(element["heading_path"]), min(600, target_chars // 2, max_bytes // 3))
@@ -158,12 +190,58 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             if following and following['kind'] == 'heading' and element['element_id'] in following.get('heading_element_ids', []):
                 continue
             if (following and following["kind"] != "heading" and following["heading_path"] == element["heading_path"]
-                and following["text"] and not (
+                and (following["text"] or any(cell['text'].strip() for cell in
+                                             (following.get("xlsx_region") or {}).get('cells', []))) and not (
                     following["kind"] in PAGE_FURNITURE and (
                         len(furniture_pages[(following["kind"], embedding_text(following["text"]))]) > 1
                         or (following["kind"] == "page_number" and is_page_label(following["text"]))))):
                 continue
             append_chunk(heading or text, [element], 0, "heading", element["heading_path"])
+            continue
+        if region := element.get('xlsx_region'):
+            flush()
+            if element['element_id'] in title_context:
+                continue
+            linked_title, direct_title = linked_titles.get(element['element_id'], (None, False))
+            cells = {item['address']: item for item in region['cells']}
+            header_keys = region['headers'] if confirmed(region) else []
+            labels = {cells[key]['column']: cells[key]['text'] for key in header_keys}
+            header_row = max((cells[key]['row'] for key in header_keys), default=0)
+            title = region['title_text'] if confirmed(region) else None
+            if linked_title:
+                title = linked_title['xlsx_region']['title_text']
+            prefix = context_prefix(' > '.join(dict.fromkeys(filter(None, [heading, title]))),
+                                    min(800, target_chars // 2, max_bytes // 3))
+            parts, row_labels = [], {}
+            for item in sorted(cells.values(), key=lambda cell: (cell['row'], cell['column'])):
+                if not item['text'].strip():
+                    continue
+                label = ''
+                if item['row'] > header_row and not item['hidden_merged']:
+                    label = labels.get(item['column'], '')
+                    if (region['kind'] == 'key_value' and confirmed(region)
+                            and item['address'] != region['title']):
+                        label = row_labels.get(item['row'], '')
+                        row_labels.setdefault(item['row'], item['text'])
+                parts.append({**item, 'label': label, 'label_origin': region['origin'] if label else 'source'})
+            rows = (list(row) for _, row in groupby(parts, key=lambda item: item['row'])) if profile == 'spreadsheet' else [parts]
+            groups = (group for row in rows for group in table_groups(prefix, row, target_chars, max_bytes))
+            for number, group in enumerate(groups):
+                segments = [{**part, 'value': part['text'],
+                             'text': ' / '.join(filter(None, [part['label'], part['text']]))} for part in group]
+                kind = region['kind'] if region['kind'] in {'title', 'code', 'key_value'} else 'table'
+                append_chunk('\n'.join(filter(None, [prefix, *(item['text'] for item in segments)])),
+                             [element], number, kind, element['heading_path'], {
+                                 'representation_version': 'xlsx-structure-v2', 'xlsx_region_start': region['start'],
+                                 'xlsx_region_kind': region['kind'], 'xlsx_sheet': region['sheet'],
+                                 'xlsx_context_cells': [key for key in [region['title'] if title else None, *header_keys] if key],
+                                 'context_element_ids': [linked_title['element_id']] if linked_title else [],
+                                 'relations': [{'type': 'xlsx_title', 'origin': 'inferred',
+                                                'status': 'unverified', 'element_id': linked_title['element_id'],
+                                                'adjacent': direct_title}] if linked_title else [],
+                                 'quality': 'extracted' if confirmed(region) else 'unverified',
+                             }, body_prefix=prefix)
+                set_xlsx_chunk_evidence(chunks[-1], segments)
             continue
         if table:
             flush()
@@ -188,6 +266,12 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                     if cell.text and (cell.row + 1, cell.column + 1) not in represented:
                         parts.append({"text": cell.text, "label": "", "row": cell.row + 1, "column": cell.column + 1})
                         uncertain = True
+                layout = element.get('layout') or {}
+                if layout.get('space') == 'xlsx_region':
+                    for part in parts:
+                        part['row'] += layout.get('row_offset', 0)
+                        part['column'] += layout.get('column_offset', 0)
+                    uncertain = True
                 parts.sort(key=lambda item: (item["row"], item["column"]))
                 table_parts_by_policy = (list(row) for _, row in groupby(parts, key=lambda part: part["row"])) if profile == "spreadsheet" else [parts]
                 groups = (group for row in table_parts_by_policy for group in table_groups(table_heading, row, target_chars, max_bytes))
@@ -203,6 +287,11 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                                       "label_origin": part.get("label_origin", "parser")}
                                                      for part, line in zip(group, lines, strict=True)],
                                   "quality": "unverified" if uncertain or context_ids else "extracted"}, body_prefix=table_heading)
+                    if layout.get('space') == 'xlsx_region':
+                        # Retain only this chunk's cells instead of copying the
+                        # entire region into every source segment.
+                        chunks[-1]['source_segments'][0]['text'] = '\n'.join(part['text'] for part in group)
+                        chunks[-1]['source_range_quality'] = 'unverified'
                 continue
         if kind in {"figure", "chart", "image"} and element["element_id"] in figures:
             flush()

@@ -36,3 +36,14 @@
 `POST /v1/ingest/{document_id}/jobs/{job_id}/images/actions`는 이미지 요소 ID를 `analyze`, `original`, `both`, `exclude`, `reuse`, `describe`에 매핑한 `actions`, `describe`에 필요한 요소별 `descriptions` 및 선택적 `embedding_profile_id`를 받는다. 최대 100개를 선택할 수 있다. `reuse`는 저장된 이미지 분석 결과가 있을 때만 허용하며 외부 분석을 재호출하지 않는다. 미게시 검토 작업이면 같은 작업에 병합하고, 이미 게시된 작업이면 미게시 새 작업으로 분기한다. `describe`는 1~2,000자의 사용자 설명과 원본을 직접 연결한다. 본문 연결이 없는 원본은 설명을 입력해야 한다. 모든 확인 필요 이미지의 처리를 선택한 뒤 명시적으로 게시한다. 검색에서 제외된 분석 결과·관계·원본은 산출물로 유지한다.
 
 세션의 변경 요청은 Origin과 CSRF 토큰을 검증한다. iframe bearer 인증은 서버 설정 변경을 허용하지 않는다. 오류는 `error.code`, `message`, `request_id`를 제공한다. [인증과 iframe](../user-guide/03-integration.md)
+
+
+## XLSX 구조 계약
+
+- `GET /v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure`는 시트 목록을 반환한다. `sheet`를 지정하면 해당 시트의 영역, 검증 상태, 병합 범위와 제외 이유를 반환한다. `GET .../xlsx-cells`는 시트의 셀 격자 일부를 반환한다. 창은 최대 25행 × 20열이며 셀 미리보기는 200자로 제한한다. `address`로 개별 셀의 전체 값과 다른 시트의 정적 A1 참조를 본다. 외부 통합 문서, 이름 범위, 동적 참조는 해석 범위에서 제외한다.
+- 구조 조회 경로에 `POST`로 시트 이름을 키로 하는 수정안을 보낸다. 시트마다 `regions`와 `excluded`를 지정한다. 영역에는 `start`, `end`, `kind`, `headers`, `title`, `uncertain`이 있고, 제외 목록은 셀 주소에서 이유 문자열로 매핑한다. 서버는 좌표, 병합, 선언된 Excel 표, 헤더와 셀 할당을 검증한 뒤 새 작업을 등록한다.
+- 영역의 `verification` 값은 `explicit` (Excel 등록), `user_verified` (사용자 확인), `llm_validated` (모델 제안의 구조 검사 통과), `inferred` (로컬 추정)이다. 앞의 두 상태가 전체 표 조회 대상이다. 이 규칙은 이미 게시된 v2 결과에도 적용된다.
+- `GET /v1/ingest/{document_id}/xlsx-tables`로 게시된 버전에서 조회할 수 있는 표와 열을 확인한다. `POST /v1/xlsx-query`는 `document_id`, 시트 `sheet`, 표 시작 주소 `start` 및 `operation`을 받는다. 연산은 `count`, `distribution`, `date_range`, `rows`, `sum`, `average`, `min`, `max`다. 분포·날짜 범위·수치 집계는 `column`을 사용한다. 개수와 수치 집계에 `group_by`를 지정할 수 있다. 헤더와 선언된 합계 행은 집계 대상에서 빠지며 누락된 계산값과 제외 셀은 결과에 표시한다.
+- `GET /v1/ingest/{document_id}/xlsx-join-candidates`는 고정된 `index_version`과 `sheet`, `start`, `right_sheet`, `right_start`를 받는다. 조회에 승인한 후보는 `POST /v1/xlsx-query`의 `join`에 `sheet`, `start`, `approved_pairs`로 지정한다. 각 쌍은 `left_row`와 `right_row`를 담는다. 한 요청에서 승인한 쌍만 내부 결합한다. 중복 식별자, 이름 충돌 및 원본과 다른 연결은 거부한다. 필터의 `side`와 집계 열의 `column_side`, 그룹 열의 `group_side`로 좌우 표를 지정한다. 응답에는 미결합·미승인 건수, 조건에 맞은 행 쌍 및 양쪽 원문 범위가 포함된다.
+- 열 기반 조인은 `POST /v1/xlsx-join-preview`에서 확인한다. `document_id`, 고정된 `index_version`, 왼쪽 표의 `sheet`·`start`, 오른쪽 표의 `join.sheet`·`join.start`를 지정한다. `join.keys`는 최대 네 개의 `{left, right, type}`으로 구성되며, 타입은 `text`, `number`, `date`, `datetime`, `boolean`이다. 같은 `join`을 `POST /v1/xlsx-query`에 쓰면 일치하는 모든 행을 내부 결합한다. 관계 `cardinality`는 `one_to_one`, `one_to_many`, `many_to_one` 중 하나이며 고유해야 하는 쪽에 중복 키가 있으면 조회를 거부한다. 텍스트에는 숫자 변환이나 공백 제거를 적용하지 않는다. 빈 키, 타입 불일치, 누락된 계산값과 제외 셀은 결합할 수 없는 이유와 행 수를 응답에 기록한다. 미결합 행 수와 양쪽 원본 행 주소도 반환한다.
+- `xlsx_structure_version=2`, 청크 `xlsx-structure-v2` 구조는 직접 추출 또는 같은 버전의 구조 수정 작업에 적용된다. 이전 게시 색인은 기존 검색과 복구를 지원한다. 이전 파싱 산출물에 새 구조를 적용할 때는 직접 추출로 새 작업을 만든다.

@@ -22,6 +22,7 @@ from indexer.parsing.contracts import Parser
 from indexer.parsing.normalization import cells_from
 from indexer.representation_audit import audit_representation
 from indexer.review_status import normalize_review_status
+from indexer.visual_relations import xlsx_anchor_matches
 
 LOG = logging.getLogger(__name__)
 
@@ -77,11 +78,12 @@ class IngestionFailure(Exception):
 
 
 class IngestionService:
-    def __init__(self, storage: ArtifactStore, parser: Parser, publisher=None, *, max_pages=2000, retry_pages=200, parser_factory=None):
+    def __init__(self, storage: ArtifactStore, parser: Parser, publisher=None, *, max_pages=2000, retry_pages=200, parser_factory=None, xlsx_analyzer=None):
         self.storage = storage
         self.parser = parser
         self.max_pages, self.retry_pages = max_pages, retry_pages
         self.parser_factory = parser_factory
+        self.xlsx_analyzer = xlsx_analyzer
         self.graph = self._graph(parser)
         self.publisher = publisher
         self.embedding_profiles = None
@@ -89,7 +91,7 @@ class IngestionService:
     def _graph(self, parser):
         return make_graph(parser, self._parsed, self._represented, self._quality, self.max_pages, self.retry_pages,
                           self._provider_event, self._progress, self._inspected, self._embed_node, self._index_node,
-                          self._image)
+                          self._image, self.xlsx_analyzer)
 
     def _image(self, state, image_id, data):
         self.storage.save_image(state['document_id'], state['job_id'], image_id, data)
@@ -143,7 +145,9 @@ class IngestionService:
             "provider_failed": sorted(result.failed), "provider_unavailable": sorted(result.unavailable),
             "provider_incomplete": result.incomplete,
             "provider_terminal_unavailable": sorted(result.terminal_unavailable), "progress": None,
-            "profile": state.get("profile"), "profile_origin": state.get("profile_origin")})
+            "profile": state.get("profile"), "profile_origin": state.get("profile_origin"),
+            **({'xlsx_structure_version': result.raw['xlsx_structure_version']}
+               if 'xlsx_structure_version' in result.raw else {})})
 
     def _provider_event(self, state, attempt, event, data):
         self.storage.save_provider_event(state["document_id"], state["job_id"], attempt, event, data)
@@ -231,7 +235,8 @@ class IngestionService:
         fields["adapter"] = type(parser).__module__ + "." + type(parser).__qualname__
         return hashlib.sha256(json.dumps(fields, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
-    def enqueue_reprocess(self, document_id: str, base_job_id: str, mode: str, settings: dict, embedding_profile_id=None):
+    def enqueue_reprocess(self, document_id: str, base_job_id: str, mode: str, settings: dict, embedding_profile_id=None,
+                          *, xlsx_review=None):
         if mode not in {"reparse", "rechunk", "complete_images"}:
             raise ValueError("다시 처리할 단계를 확인해 주세요")
         self.storage.load_document(document_id)
@@ -241,6 +246,21 @@ class IngestionService:
         if any(job["status"] in {"queued", "processing"} for job in jobs):
             raise ValueError("이 문서의 다른 작업이 진행 중입니다")
         base = self.storage.load_job(document_id, base_job_id, "processing")
+        reviews = base.get('xlsx_review', {})
+        if xlsx_review:
+            from indexer.xlsx_structure import STRUCTURE_VERSION, validate
+
+            if mode != 'rechunk' or settings.get('extraction_mode') not in {'native_text', 'native_visual'}:
+                raise ValueError('XLSX 직접 추출 작업에서 구조를 검토할 수 있습니다')
+            raw = self.storage.load_job(document_id, base_job_id, 'parser_result')
+            if raw.get('xlsx_structure_version') != STRUCTURE_VERSION:
+                raise ValueError('문서를 다시 읽은 뒤 구조를 검토해 주세요')
+            sheets = {sheet['name']: sheet for sheet in raw['xlsx_sheets']}
+            if xlsx_review.keys() - sheets.keys():
+                raise ValueError('검토할 시트를 찾을 수 없습니다')
+            for name, proposal in xlsx_review.items():
+                validate(sheets[name], proposal, 'user')
+            reviews = {**reviews, **{name: proposal.model_dump() for name, proposal in xlsx_review.items()}}
         if mode == 'complete_images' and base.get('pending_review'):
             raise ValueError('검토 중인 작업은 이미지 목록에서 처리할 항목을 선택해 주세요')
         selected_id = embedding_profile_id or base.get("embedding_profile_id")
@@ -271,6 +291,7 @@ class IngestionService:
         status = {"status": "queued", "stage": "queued", "mode": mode, "base_job_id": base_job_id,
                   "settings": settings, "profile": base.get("profile"), "parser_contract": self.parser_contract(job_parser),
                   'force_review': mode == 'complete_images',
+                  **({'xlsx_review_edit': True} if xlsx_review else {}),
                   'image_policies_present': base.get('image_policies_present', False) if mode == 'rechunk' else False,
                   "created_at": datetime.now(UTC).isoformat()}
         if publisher and self.embedding_policy(publisher):
@@ -278,6 +299,8 @@ class IngestionService:
         if self.embedding_profiles:
             status["embedding_profile_id"] = publisher.embedder.profile.profile_id
             status["embedding_contract"] = publisher.embedding_contract()
+        if reviews and settings.get('extraction_mode') in {'native_text', 'native_visual'}:
+            status['xlsx_review'] = reviews
         self._save_parser(document_id, job_id, job_parser)
         if mode == 'complete_images':
             for item in image_checkpoints:
@@ -324,9 +347,7 @@ class IngestionService:
                 image = images.get(link.get('element_id'), {})
                 if link.get('type') == 'cell_anchor':
                     anchor = image.get('layout') or {}
-                    if not any(abs(cell['row'] - anchor.get('start_row', -100)) <= 1
-                               and abs(cell['column'] - anchor.get('start_column', -100)) <= 1
-                               for chunk in related_chunks for cell in chunk.get('table_cells', [])):
+                    if not xlsx_anchor_matches(anchor, (cell for chunk in related_chunks for cell in chunk.get('table_cells', []))):
                         continue
                 if related_chunks:
                     linked.add(link.get('element_id'))
@@ -387,6 +408,7 @@ class IngestionService:
         status = {'status': 'queued', 'stage': 'queued', 'mode': 'image_actions', 'base_job_id': base_job_id,
                   'settings': base.get('settings', {}), 'profile': base.get('profile'),
                   'image_policies_present': True, 'force_review': True,
+                  **({'xlsx_review': base['xlsx_review']} if base.get('xlsx_review') else {}),
                   'parser_contract': self.parser_contract(self.parser), 'image_actions': selected, 'image_descriptions': selected_descriptions,
                   'created_at': datetime.now(UTC).isoformat()}
         if publisher and self.embedding_policy(publisher):
@@ -511,6 +533,7 @@ class IngestionService:
                       "document_id": document_id, "job_id": job_id, "settings": settings or {},
                       "embedding_max_input_bytes": (self.embedding_policy(publisher) or {}).get("max_input_bytes", 3800),
                       "recovery_mode": status.get("recovery_mode"),
+                      "xlsx_review": status.get("xlsx_review", {}),
                       'provider_attempt': image_attempt or 'initial',
                       "provider_checkpoints": {'initial': initial_checkpoint,
                                                'retry': self.storage.provider_checkpoint(document_id, job_id, 'retry')}}
@@ -542,7 +565,14 @@ class IngestionService:
                                           "elements": self.storage.load_job(document_id, base_id, "parser_elements"),
                                           "raw": self.storage.load_job(document_id, base_id, "parser_result"),
                                           'previous_elements': previous_elements,
-                                          "coverage": base.get("coverage")}
+                                          "coverage": base.get("coverage"),
+                                          "incomplete": base.get("provider_incomplete", False)}
+                if status.get('xlsx_review_edit'):
+                    from indexer.parsing.native_documents import apply_xlsx_review
+
+                    reused = inputs['reused_parse']
+                    reused['raw'], reused['elements'] = apply_xlsx_review(reused['raw'], reused['elements'], status['xlsx_review'])
+                    reused['previous_elements'] = []
             if status.get('mode') == 'image_actions':
                 base_id = status['base_job_id']
                 base = self.storage.load_job(document_id, base_id, 'processing')

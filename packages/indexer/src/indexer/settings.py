@@ -45,6 +45,12 @@ class ServerSettings(BaseModel):
     llm_base_url: str
     llm_model: str = Field(min_length=1, max_length=128)
     llm_models: list[str] = Field(max_length=100)
+    xlsx_structure_enabled: bool
+    xlsx_structure_model: str = Field(max_length=128)
+    xlsx_structure_max_input_bytes: int = Field(ge=1024, le=256000)
+    xlsx_structure_max_output_tokens: int = Field(ge=256, le=16000)
+    xlsx_structure_max_sheets: int = Field(ge=1, le=20)
+    xlsx_structure_timeout: int = Field(ge=1, le=90)
     qdrant_url: str
     qdrant_key: str = Field(max_length=4096)
     external_processing: bool

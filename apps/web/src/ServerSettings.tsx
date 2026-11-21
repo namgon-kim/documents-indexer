@@ -44,6 +44,14 @@ const groups: Group[] = [
   { id: "chat", title: "대화 모델", description: "대화에 사용할 모델을 선택하고 서버에서 제공할 모델 목록을 관리합니다.", fields: [
     ["llm_base_url", "LLM 기본 주소", "text"], ["llm_api_key", "LLM API 키", "secret"],
   ] },
+  { id: "xlsx", title: "Excel 구조 분석", description: "직접 추출에서 미확정 시트의 셀 값을 LLM으로 전송합니다. 외부 처리 허용과 LLM 연결이 필요하며, 실패 시 로컬 구조를 사용합니다.", fields: [
+    ["xlsx_structure_enabled", "Excel 구조 모델 사용", "bool"],
+    ["xlsx_structure_model", "구조 분석 모델 (비우면 기본 대화 모델)", "text"],
+    ["xlsx_structure_max_sheets", "통합 문서당 최대 요청 수", "number"],
+    ["xlsx_structure_max_input_bytes", "시트당 셀 입력 바이트 한도", "number"],
+    ["xlsx_structure_max_output_tokens", "시트당 최대 생성 토큰", "number"],
+    ["xlsx_structure_timeout", "시트당 요청 시간 한도 (초)", "number"],
+  ] },
   { id: "access", title: "접근과 iframe 연동", description: "로그인 방법과 다른 사이트에 iframe으로 넣을 때 필요한 설정입니다.", fields: [
     ["access_key", "접근 키", "secret"], ["dev_auth", "로컬 개발 인증 허용", "bool", "127.0.0.1에서 접속할 때만"],
     ["public_origin", "공개 출처", "text"], ["frame_origins", "iframe 허용 HTTPS 출처 (공백으로 구분)", "origins"],

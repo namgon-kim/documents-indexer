@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import traceback
 import warnings
 import zlib
 from html import escape
@@ -62,11 +63,15 @@ def image_for_analysis(data, suffix):
 
 
 class NativeExtractor:
-    def __init__(self, parser, mode, checkpoint=None, persist=None, progress=None, save_image=None):
+    def __init__(self, parser, mode, checkpoint=None, persist=None, progress=None, save_image=None, *, xlsx_analyzer=None, xlsx_review=None):
         self.parser, self.mode = parser, mode
         self.checkpoint, self.persist, self.progress = checkpoint or {}, persist, progress
         self.save_image = save_image
         self.elements, self.warnings, self.limitations, self.visuals = [], [], [], []
+        self.xlsx_sheets = []
+        self.xlsx_metadata = {}
+        self.xlsx_notices = []
+        self.xlsx_analyzer, self.xlsx_review = xlsx_analyzer, xlsx_review or {}
 
     def add(self, kind, text='', html='', location=None, layout=None, container=None):
         if text or html:
@@ -252,8 +257,9 @@ class NativeExtractor:
         self.visuals.clear()
         return ParseResult('native_' + kind, self.elements,
                            {'provider': 'native_' + kind, 'mode': self.mode,
-                            'warnings': self.warnings, 'limitations': self.limitations, 'visual_count': visual_count},
-                           incomplete=bool(self.warnings))
+                            'warnings': self.warnings, 'limitations': self.limitations, 'visual_count': visual_count,
+                            **({'xlsx_sheets': self.xlsx_sheets, 'xlsx_notices': self.xlsx_notices, **self.xlsx_metadata} if kind == 'xlsx' else {})},
+                           incomplete=any(message not in self.xlsx_notices for message in self.warnings))
 
     def _docx(self, path):
         self.limitation('DOCX 직접 추출은 페이지 배치, 머리글·바닥글과 도형 연결을 보장하지 않습니다.')
@@ -405,80 +411,172 @@ class NativeExtractor:
 
     def _xlsx(self, path):
         try:
-            with warnings.catch_warnings(record=True) as detected:
-                warnings.simplefilter('always')
-                book = load_workbook(path, data_only=False, read_only=False, keep_links=False)
-                values = load_workbook(path, data_only=True, read_only=False, keep_links=False)
-            if detected:
-                self.warning('Excel의 일부 확장 기능 또는 시각 요소를 읽지 못했을 수 있습니다.')
-            for sheet in book.worksheets:
-                value_sheet = values[sheet.title]
-                if sheet.sheet_state != 'visible':
-                    self.warning('숨겨진 시트가 포함되어 있습니다.')
-                self.add('heading', sheet.title, '<h1>' + escape(sheet.title) + '</h1>')
-                cells = [cell for cell in sheet._cells.values() if cell.value is not None]
-                merged = list(sheet.merged_cells.ranges)
-                if cells or merged:
-                    max_row = max([c.row for c in cells] + [m.max_row for m in merged] + [0])
-                    max_col = max([c.column for c in cells] + [m.max_col for m in merged] + [0])
+            from contextlib import ExitStack
+
+            from indexer.office_inspection import inspect_office
+            from indexer.parsing.xlsx_source import sheet_record, workbook_styles
+            from indexer.xlsx_structure import (
+                STRUCTURE_VERSION,
+                SheetProposal,
+                occupied,
+                row_candidates,
+                safe_local_structure,
+                validate,
+            )
+            source = inspect_office(path, native_cells=True)
+            inspected = {item['name']: item for item in source['sheets']}
+            if any(not item['formula_scan_complete'] for item in inspected.values()):
+                raise IndexerError('NATIVE_TABLE_LIMIT', '시트 원본 구조가 직접 추출 크기 한도를 넘습니다.', 413)
+            review = {name: SheetProposal.model_validate(item) for name, item in self.xlsx_review.items()}
+            requested = 0
+            with ExitStack() as workbooks:
+                with warnings.catch_warnings(record=True) as detected:
+                    warnings.simplefilter('always')
+                    book = load_workbook(path, data_only=False, read_only=False, keep_links=False)
+                    workbooks.callback(book.close)
+                    values = load_workbook(path, data_only=True, read_only=False, keep_links=False)
+                    workbooks.callback(values.close)
+                if detected:
+                    self.warning('Excel의 일부 확장 기능 또는 시각 요소를 읽지 못했을 수 있습니다.')
+                if review.keys() - set(book.sheetnames):
+                    raise IndexerError('XLSX_REVIEW_INVALID', '검토할 시트를 찾을 수 없습니다.')
+                for sheet in book:
+                    source_sheet = inspected[sheet.title]
+                    worksheet = source_sheet.get('sheet_kind') != 'chart'
+                    sheet_data = sheet_record(book, sheet, source_sheet, values[sheet.title] if worksheet else None)
+                    _, _, max_col, max_row = sheet_data['bounds']
                     if max_row > 5000 or max_col > 100 or max_row * max_col > 25000:
                         raise IndexerError('NATIVE_TABLE_LIMIT', '시트 크기가 직접 추출 범위를 넘습니다. 다른 파서를 사용해 주세요.', 413)
-                    spans = {(m.min_row, m.min_col): m for m in merged}
-                    covered = {(r, c) for m in merged for r in range(m.min_row, m.max_row + 1)
-                               for c in range(m.min_col, m.max_col + 1) if (r, c) != (m.min_row, m.min_col)}
-                    rows = []
-                    for row in range(1, max_row + 1):
-                        parts = []
-                        for col in range(1, max_col + 1):
-                            if (row, col) in covered:
-                                continue
-                            cell = sheet.cell(row, col)
-                            value = cell.value
-                            if cell.data_type == 'f':
-                                cached = value_sheet.cell(row, col).value
-                                value = f'수식 {value}' + (f' / 저장된 결과 {cached}' if cached is not None else ' / 저장된 결과 없음')
-                                if cached is None:
-                                    self.warning('저장된 계산 결과가 없는 수식이 있습니다.')
-                            text = '' if value is None else str(value)
-                            span = spans.get((row, col))
-                            attrs = (f' rowspan="{span.max_row - span.min_row + 1}" colspan="{span.max_col - span.min_col + 1}"' if span else '')
-                            parts.append(f'<td{attrs}>{escape(text)}</td>')
-                        rows.append('<tr>' + ''.join(parts) + '</tr>')
-                    location = {'kind': 'xlsx_range', 'sheet': sheet.title, 'start': 'A1',
-                                'end': f'{get_column_letter(max_col)}{max_row}'}
-                    self.add('table', html='<table>' + ''.join(rows) + '</table>', location=location)
-                if sheet._charts:
-                    from indexer.parsing.xlsx_chart_preview import chart_preview, renderer_status
-                    for chart_index, chart in enumerate(sheet._charts):
-                        anchor = getattr(chart.anchor, '_from', None)
+                    regions, candidates = safe_local_structure(sheet_data)
+                    sheet_data.update(regions=regions, boundary_candidates=candidates, excluded={})
+                    if sheet.title in review:
+                        try:
+                            sheet_data['regions'] = validate(sheet_data, review[sheet.title], 'user')
+                        except ValueError as error:
+                            raise IndexerError('XLSX_REVIEW_INVALID', str(error)) from error
+                        sheet_data['excluded'] = review[sheet.title].excluded
+                        sheet_data['analysis_status'] = 'reviewed'
+                    elif self.xlsx_analyzer and any(region['status'] == 'unverified' for region in regions):
+                        if requested < self.xlsx_analyzer.config.xlsx_structure_max_sheets:
+                            try:
+                                analyzed, status = self.xlsx_analyzer.analyze(sheet_data)
+                            except OSError:
+                                analyzed, status = None, 'cache_unavailable'
+                            if status in {'analyzed', 'analyzed_uncached', 'provider_error', 'invalid_response', 'incomplete'}:
+                                requested += 1
+                            sheet_data['analysis_status'] = status
+                            if analyzed is not None:
+                                proposals, excluded = analyzed
+                                if excluded:
+                                    # A model can point out cells to review. Keep their search evidence
+                                    # until a user accepts the exclusions.
+                                    sheet_data.update(analysis_status='review_required',
+                                                      suggested_review={'regions': proposals, 'excluded': excluded})
+                                else:
+                                    sheet_data['regions'] = proposals
+                        else:
+                            sheet_data['analysis_status'] = 'sheet_limit'
+                    self.xlsx_sheets.append(sheet_data)
+                    notices = []
+                    if sheet_data['hidden_merged_cells']:
+                        notices.append(f'{sheet.title} 시트의 병합 영역 안에 숨은 값이 있습니다. 원본을 확인해 주세요.')
+                    if any(cell['cache_status'] == 'missing' for cell in occupied(sheet_data).values()):
+                        notices.append('저장된 계산 결과가 없는 수식이 있습니다.')
+                    if sheet.sheet_state != 'visible':
+                        notices.append('숨겨진 시트가 포함되어 있습니다.')
+                    for message in notices:
+                        if message not in self.xlsx_notices:
+                            self.xlsx_notices.append(message)
+                            self.warning(message)
+                    self.add('heading', sheet.title, '<h1>' + escape(sheet.title) + '</h1>')
+                    self.elements[-1]['_xlsx_sheet'] = sheet.title
+                    self._xlsx_regions(sheet_data)
+                    if sheet._charts:
+                        from indexer.parsing.xlsx_chart_preview import chart_preview, renderer_status
+                        for chart_index, chart in enumerate(sheet._charts):
+                            anchor = getattr(chart.anchor, '_from', None)
+                            address = f'{get_column_letter(anchor.col + 1)}{anchor.row + 1}' if anchor else None
+                            location = {'kind': 'xlsx_cell', 'sheet': sheet.title, 'cell': address} if address else None
+                            layout = ({'space': 'xlsx_anchor', 'sheet': sheet.title, 'start_row': anchor.row + 1,
+                                       'start_column': anchor.col + 1} if anchor else None)
+                            chart_record = sheet_data['charts'][chart_index]
+                            if chart_record['title']:
+                                self.add('chart', chart_record['title'], location=location, layout=layout)
+                            preview = chart_preview(path, sheet.title, chart_index)
+                            if preview:
+                                self.image(preview, 'png', location, layout, preview=True)
+                                self.limitation('Excel 차트는 원본 시트에서 생성한 대략적인 미리보기로, 실제 표시와 다를 수 있습니다.')
+                            else:
+                                office, rasterizer = renderer_status()
+                                missing = ', '.join(name for name, command in [('LibreOffice', office), ('Poppler(pdftoppm)', rasterizer)] if not command)
+                                reason = f'서버에 {missing} 설치 또는 실행 경로 설정이 필요합니다.' if missing else '서버 로그에서 렌더링 실패 원인을 확인해 주세요.'
+                                self.warning(f'Excel 차트 미리보기를 만들지 못했습니다: {sheet.title} {address or "위치 미확인"}. {reason}')
+                    for image in getattr(sheet, '_images', []):
+                        anchor = getattr(image.anchor, '_from', None)
+                        end = getattr(image.anchor, 'to', None)
                         address = f'{get_column_letter(anchor.col + 1)}{anchor.row + 1}' if anchor else None
                         location = {'kind': 'xlsx_cell', 'sheet': sheet.title, 'cell': address} if address else None
-                        layout = ({'space': 'xlsx_anchor', 'sheet': sheet.title, 'start_row': anchor.row + 1,
-                                   'start_column': anchor.col + 1} if anchor else None)
-                        preview = chart_preview(path, sheet.title, chart_index)
-                        if preview:
-                            self.image(preview, 'png', location, layout, preview=True)
-                            self.limitation('Excel 차트는 원본 시트에서 생성한 대략적인 미리보기로, 실제 표시와 다를 수 있습니다.')
-                        else:
-                            office, rasterizer = renderer_status()
-                            missing = ', '.join(name for name, command in [('LibreOffice', office), ('Poppler(pdftoppm)', rasterizer)] if not command)
-                            reason = f'서버에 {missing} 설치 또는 실행 경로 설정이 필요합니다.' if missing else '서버 로그에서 렌더링 실패 원인을 확인해 주세요.'
-                            self.warning(f'Excel 차트 미리보기를 만들지 못했습니다: {sheet.title} {address or "위치 미확인"}. {reason}')
-                for image in sheet._images:
-                    anchor = getattr(image.anchor, '_from', None)
-                    end = getattr(image.anchor, 'to', None)
-                    address = f'{get_column_letter(anchor.col + 1)}{anchor.row + 1}' if anchor else None
-                    location = {'kind': 'xlsx_cell', 'sheet': sheet.title, 'cell': address} if address else None
-                    layout = ({'space': 'xlsx_anchor', 'sheet': sheet.title,
-                               'start_row': anchor.row + 1, 'start_column': anchor.col + 1,
-                               **({'end_row': end.row + 1, 'end_column': end.col + 1} if end else {})} if anchor else None)
-                    self.image(image._data(), image.format, location, layout)
-            book.close()
-            values.close()
+                        layout = ({'space': 'xlsx_anchor', 'sheet': sheet.title,
+                                   'start_row': anchor.row + 1, 'start_column': anchor.col + 1,
+                                   **({'end_row': end.row + 1, 'end_column': end.col + 1} if end else {})} if anchor else None)
+                        self.image(image._data(), image.format, location, layout)
+                relations, complete = row_candidates(self.xlsx_sheets)
+                self.xlsx_metadata = {'xlsx_structure_version': STRUCTURE_VERSION,
+                                      'xlsx_style_model': workbook_styles(book, self.xlsx_sheets),
+                                      'xlsx_row_relations': relations, 'xlsx_row_relations_complete': complete}
         except IndexerError:
             raise
         except Exception as error:
+            LOG.error('XLSX native extraction failed (%s)\n%s', type(error).__name__,
+                      ''.join(traceback.format_tb(error.__traceback__)))
             raise IndexerError('NATIVE_EXTRACTION_FAILED', 'Excel 내용 또는 삽입 이미지를 읽을 수 없습니다.', 422) from error
+
+    def _xlsx_regions(self, sheet):
+        from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
+
+        from indexer.parsing.xlsx_source import search_value
+        from indexer.xlsx_structure import address, contains, occupied
+
+        cells = occupied(sheet)
+        positions = {key: coordinate_to_tuple(key) for key in cells}
+        merge_boxes = [range_boundaries(ref) for ref in sheet['merged_ranges']]
+        for region in sheet['regions']:
+            area = range_boundaries(f"{region['start']}:{region['end']}")
+            left, top, right, bottom = area
+            selected = [cell for key, cell in cells.items() if key not in sheet['excluded'] and contains(area, positions[key])]
+            by_address = {cell['address']: cell for cell in selected}
+            local_merges = {(y, x): (w, h) for x, y, w, h in merge_boxes
+                            if contains(area, (y, x)) and contains(area, (h, w))}
+            covered = {(row, col) for (y, x), (w, h) in local_merges.items()
+                       for row in range(y, h + 1) for col in range(x, w + 1) if (row, col) != (y, x)}
+            rows = []
+            for row in range(top, bottom + 1):
+                parts = []
+                for col in range(left, right + 1):
+                    if (row, col) in covered:
+                        continue
+                    key = address(row, col)
+                    cell = by_address.get(key)
+                    text = search_value(cell) if cell else ''
+                    span = local_merges.get((row, col))
+                    attrs = f' rowspan="{span[1] - row + 1}" colspan="{span[0] - col + 1}"' if span else ''
+                    tag = 'th' if key in region['headers'] else 'td'
+                    if tag == 'th':
+                        attrs += ' scope="col"'
+                    parts.append(f'<{tag}{attrs}>{escape(text)}</{tag}>')
+                rows.append('<tr>' + ''.join(parts) + '</tr>')
+            location = {'kind': 'xlsx_range', 'sheet': sheet['name'], 'start': region['start'], 'end': region['end']}
+            fragments = [{'row': positions[cell['address']][0], 'column': positions[cell['address']][1],
+                          'text': search_value(cell), 'address': cell['address'],
+                          'hidden_merged': cell['hidden_merged']} for cell in selected]
+            title = cells[region['title']]['display_text'] if region['title'] else None
+            self.add('table' if region['kind'] in {'table', 'unknown'} else region['kind'],
+                     text='\n'.join(part['text'] for part in fragments),
+                     html='<table>' + ''.join(rows) + '</table>', location=location,
+                     layout={'space': 'xlsx_region', 'row_offset': top - 1, 'column_offset': left - 1,
+                             'boundary_origin': region['origin'], 'boundary_status': region['status']})
+            self.elements[-1]['_xlsx_region'] = {**region, 'sheet': sheet['name'], 'title_text': title,
+                                                 'cells': fragments}
 
     def _hwpx(self, path):
         self.limitation('HWPX 직접 추출은 쪽 배치, 일부 스타일과 도형 관계를 확인하지 못합니다.')
@@ -619,3 +717,30 @@ class NativeExtractor:
             for child in node:
                 walk(child, container)
         walk(root)
+
+
+def apply_xlsx_review(raw, elements, reviews):
+    """Replace structure elements while retaining the base job's visual analysis."""
+    from indexer.xlsx_structure import SheetProposal, row_candidates, validate
+
+    sheets = []
+    for original in raw['xlsx_sheets']:
+        sheet = dict(original)
+        if sheet['name'] in reviews:
+            proposal = SheetProposal.model_validate(reviews[sheet['name']])
+            sheet.update(regions=validate(sheet, proposal, 'user'), excluded=proposal.excluded,
+                         analysis_status='reviewed')
+            sheet.pop('suggested_review', None)
+        sheets.append(sheet)
+    by_name = {sheet['name']: sheet for sheet in sheets}
+    extractor = NativeExtractor(None, 'native_text')
+    for element in elements:
+        region = element.get('_xlsx_region')
+        if region and region['sheet'] in reviews:
+            continue
+        extractor.elements.append(element)
+        if element.get('_xlsx_sheet') in reviews:
+            extractor._xlsx_regions(by_name[element['_xlsx_sheet']])
+    relations, complete = row_candidates(sheets)
+    return ({**raw, 'xlsx_sheets': sheets, 'xlsx_row_relations': relations, 'xlsx_row_relations_complete': complete},
+            extractor.elements)
