@@ -886,10 +886,13 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
     @app.get("/v1/parser-profiles", dependencies=[Depends(auth.require_settings)])
     def list_parser_profiles():
         with parser_profiles_lock:
-            return {"profiles": ParserProfiles(config.data_dir).list(config),
+            registry = ParserProfiles(config.data_dir)
+            selected_id = registry.active_id()
+            return {"profiles": registry.list(config),
                     "environment": ({**{key: getattr(base_config, key) for key in PARSER_PROFILE_FIELDS if key != 'parser_api_key'},
                                      'api_key_configured': bool(base_config.parser_api_key),
-                                     'active': all(getattr(base_config, key) == getattr(config, key) for key in PARSER_PROFILE_FIELDS)}
+                                     'active': selected_id == 'environment' if selected_id is not None else all(getattr(base_config, key) == getattr(config, key) for key in PARSER_PROFILE_FIELDS),
+                                     'applied': all(getattr(base_config, key) == getattr(config, key) for key in PARSER_PROFILE_FIELDS)}
                                     if base_config.parser_provider else None),
                     "current": {**{key: getattr(config, key) for key in PARSER_PROFILE_FIELDS if key != "parser_api_key"},
                                 "api_key_configured": bool(config.parser_api_key)}}
@@ -927,15 +930,12 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                          "llm_models": tuple(checked["llm_models"]), "frame_origins": tuple(checked["frame_origins"])}
             candidate = replace(base_config, **converted)
             pipeline = install_pipeline(request.app, candidate, recover=old_service is None) if ingestion_service is None else None
-            with parser_profiles_lock:
-                registry = ParserProfiles(config.data_dir)
-                if config.parser_provider and not any(row['active'] for row in registry.list(config)):
-                    from uuid import uuid4
-                    registry.save('parser-' + uuid4().hex, {'name': config.parser_provider + ' (이전 설정)'}, config)
             saved = save_overrides(base_config, changes)
             if pipeline:
                 publish_pipeline(request.app, candidate, pipeline)
             config = candidate
+            with parser_profiles_lock:
+                ParserProfiles(config.data_dir).set_active(profile_id)
             auth.config = candidate
             request.app.state.chat.config = candidate
             if hasattr(request.app.state, "published_chat"):

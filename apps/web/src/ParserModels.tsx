@@ -4,8 +4,8 @@ import type { Session } from "./api";
 
 type Connection = {name: string; parser_provider: string; parser_base_url: string; parser_model: string;
   parser_mode: string; parser_options: string; parser_sync_timeout: number; api_key_configured?: boolean};
-type Profile = Connection & {profile_id: string; active: boolean};
-type Result = {profiles: Profile[]; current: Connection; environment?: (Connection & {active: boolean}) | null};
+type Profile = Connection & {profile_id: string; active: boolean; applied: boolean};
+type Result = {profiles: Profile[]; current: Connection; environment?: (Connection & {active: boolean; applied: boolean}) | null};
 const empty: Connection = {name: "", parser_provider: "upstage", parser_base_url: "", parser_model: "document-parse-260930", parser_mode: "enhanced", parser_options: "", parser_sync_timeout: 900};
 
 export function ParserModels({session, disabled, onActivated}: {session: Session; disabled: boolean; onActivated: () => Promise<void>}) {
@@ -45,9 +45,11 @@ export function ParserModels({session, disabled, onActivated}: {session: Session
   }
   async function saveCurrent() {
     if (!data?.current.parser_provider) return;
+    const existing = data.profiles.find(profile => profile.applied);
+    if (existing) { await useProfile(existing); return; }
     setBusy(true); setMessage("");
     try {
-      const id = `parser-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      const id = `current-${data.current.parser_provider}`;
       await put(`/v1/parser-profiles/${id}`, session, {name: data.current.parser_provider === "paddle_vl" ? "PaddleOCR-VL" : data.current.parser_provider});
       await refresh(); setMessage("현재 파서를 목록에 저장했습니다.");
     } catch (error) { setMessage(error instanceof Error ? error.message : "현재 파서를 저장하지 못했습니다."); }
@@ -55,7 +57,7 @@ export function ParserModels({session, disabled, onActivated}: {session: Session
   }
   return <div className="embedding-models"><fieldset><legend>파서 목록</legend>
     <p className="hint">파서별 주소와 키를 등록하고 사용할 파서를 선택합니다. 파서를 바꾸면 이후 새 작업에 적용됩니다.</p>
-    {data && <p className="hint">현재 사용: {data.profiles.find(item => item.active)?.name || data.current.parser_provider || "설정되지 않음"}</p>}
+    {data && <p className="hint">현재 사용: {data.profiles.find(item => item.active)?.name || (data.environment?.active ? "환경 기본 파서" : data.current.parser_provider) || "설정되지 않음"}</p>}
     {data && <label className="stacked-label">사용할 파서<select disabled={busy || disabled} value={data.profiles.find(item => item.active)?.profile_id || (data.environment?.active ? 'environment' : 'current')} onChange={event => {
       const id = event.target.value;
       const profile = id === 'environment' ? {profile_id: id, name: '환경 기본 파서'} : data.profiles.find(item => item.profile_id === id);
@@ -68,7 +70,7 @@ export function ParserModels({session, disabled, onActivated}: {session: Session
     {data?.current.parser_provider && !data.profiles.some(item => item.active) && <button type="button" className="secondary" disabled={busy || disabled} onClick={() => void saveCurrent()}>현재 파서를 목록에 저장</button>}
     {data?.profiles.map(profile => <div className="model-row" key={profile.profile_id}>
       <div><strong>{profile.name}</strong><p className="hint">{profile.parser_provider === "paddle_vl" ? "PaddleOCR-VL" : profile.parser_provider} · {profile.parser_base_url}</p></div>
-      {profile.active ? <span>사용 중</span> : <button type="button" className="secondary" disabled={busy || disabled} onClick={() => void useProfile(profile)}>선택</button>}
+      {profile.active ? <span>{profile.applied ? "사용 중" : "적용 필요"}</span> : <button type="button" className="secondary" disabled={busy || disabled} onClick={() => void useProfile(profile)}>선택</button>}
       <button type="button" className="secondary" disabled={busy} onClick={() => { setEditing(profile.profile_id); setDraft({name: profile.name, parser_provider: profile.parser_provider, parser_base_url: profile.parser_base_url, parser_model: profile.parser_model, parser_mode: profile.parser_mode, parser_options: profile.parser_options, parser_sync_timeout: profile.parser_sync_timeout, api_key_configured: profile.api_key_configured}); setKey(""); setClearKey(false); setMessage(""); }}>수정</button>
       <button type="button" className="secondary" disabled={busy} onClick={() => void erase(profile)}>삭제</button>
     </div>)}

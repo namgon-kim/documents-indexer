@@ -13,6 +13,16 @@ FIELDS = ("parser_provider", "parser_base_url", "parser_api_key", "parser_model"
 class ParserProfiles:
     def __init__(self, root: Path):
         self.path = root / "parser-profiles.json"
+        self.state_path = root / "parser-profile-state.json"
+
+    def active_id(self):
+        if not self.state_path.exists():
+            return None
+        data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        return data.get("active_profile_id") if isinstance(data, dict) else None
+
+    def set_active(self, profile_id):
+        atomic_json(self.state_path, {"active_profile_id": profile_id})
 
     def read(self):
         if not self.path.exists():
@@ -24,9 +34,11 @@ class ParserProfiles:
 
     def list(self, config):
         current = values(config)
+        active_id = self.active_id()
         return [{**{k: v for k, v in row.items() if k != "parser_api_key"},
                  "profile_id": profile_id, "api_key_configured": bool(row["parser_api_key"]),
-                 "active": all(row.get(k) == current[k] for k in FIELDS)}
+                 "active": profile_id == active_id if active_id is not None else all(row.get(k) == current[k] for k in FIELDS),
+                 "applied": all(row.get(k) == current[k] for k in FIELDS)}
                 for profile_id, row in self.read().items()]
 
     def save(self, profile_id, data, config):
@@ -53,3 +65,5 @@ class ParserProfiles:
             raise ValueError("파서를 찾을 수 없습니다")
         del profiles[profile_id]
         atomic_json(self.path, profiles)
+        if self.active_id() == profile_id:
+            self.set_active(None)

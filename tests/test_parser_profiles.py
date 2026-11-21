@@ -40,6 +40,24 @@ def test_parser_profiles_require_session(tmp_path):
         assert client.get("/v1/parser-profiles").status_code == 401
 
 
+def test_editing_selected_parser_keeps_selection_and_reactivation_does_not_duplicate(tmp_path):
+    config = Config(tmp_path, access_key="example", parser_provider="upstage", parser_api_key="env-key")
+    with TestClient(create_app(config), base_url="https://testserver") as client:
+        login = client.post("/v1/auth/login", json={"access_key": "example"}, headers={"Origin": "https://testserver"})
+        client.headers.update({"Origin": "https://testserver", "X-CSRF-Token": login.json()["csrf_token"]})
+        assert client.put("/v1/parser-profiles/a", json={"name": "A"}).status_code == 200
+        assert client.post("/v1/parser-profiles/a/activate", json={}).status_code == 200
+        edited = client.put("/v1/parser-profiles/a", json={"name": "A", "parser_options": "timeout=120"})
+        assert edited.status_code == 200
+        assert edited.json()["active"] and not edited.json()["applied"]
+        listing = client.get("/v1/parser-profiles").json()
+        assert next(row for row in listing["profiles"] if row["profile_id"] == "a")["active"]
+        assert client.post("/v1/parser-profiles/a/activate", json={}).status_code == 200
+        profiles = client.get("/v1/parser-profiles").json()["profiles"]
+        assert len(profiles) == 1 and profiles[0]["active"] and profiles[0]["applied"]
+        assert client.app.state.ingestion.parser.config.options == {"timeout": "120"}
+
+
 def test_environment_parser_can_be_reselected_and_current_connection_is_preserved(tmp_path):
     from indexer.settings import save_overrides
     config = Config(tmp_path, access_key='example', parser_provider='upstage', parser_api_key='env-secret',
@@ -53,6 +71,7 @@ def test_environment_parser_can_be_reselected_and_current_connection_is_preserve
         assert listing.json()['environment']['parser_provider'] == 'upstage'
         assert not listing.json()['environment']['active']
         assert 'env-secret' not in listing.text and 'paddle-secret' not in listing.text
+        assert client.put('/v1/parser-profiles/paddle', json={'name': 'Paddle 현재 연결'}).status_code == 200
         assert client.post('/v1/parser-profiles/environment/activate', json={}).status_code == 200
         assert client.app.state.ingestion.parser.config.api_key == 'env-secret'
         profiles = client.get('/v1/parser-profiles').json()['profiles']
