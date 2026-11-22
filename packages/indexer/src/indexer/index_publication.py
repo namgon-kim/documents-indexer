@@ -77,6 +77,7 @@ class IndexPublisher:
 
     def versions(self):
         active = self.active()
+        published = self._published_versions()
         rows = []
         for path in self.root.glob("*/manifest.json"):
             try:
@@ -84,10 +85,37 @@ class IndexPublisher:
                 if str(UUID(manifest["version"])) != path.parent.name:
                     continue
                 rows.append({"index_version": manifest["version"], "created_at": manifest.get("created_at"),
-                             "status": "active" if active and active["version"] == manifest["version"] else "retired"})
+                             "status": ("active" if active and active["version"] == manifest["version"] else
+                                        "retired" if manifest["version"] in published else
+                                        "unpublished" if manifest.get("publication_schema") else "legacy_unknown")})
             except (ValueError, KeyError, OSError):
                 continue
         return sorted(rows, key=lambda row: row["created_at"] or "", reverse=True)
+
+    def _published_versions(self):
+        # Only an active pointer and its recorded predecessors prove publication.
+        # Older snapshots have no predecessor link, so their status is unknown.
+        published = set()
+        for path in [self.root / 'active.json', *self.root.glob('active-*.json')]:
+            if not path.exists():
+                continue
+            manifest = json.loads(path.read_text(encoding='utf-8'))
+            while manifest and manifest.get('version') not in published:
+                version = str(UUID(manifest['version']))
+                published.add(version)
+                previous = manifest.get('previous_version')
+                if not previous:
+                    break
+                previous_path = self.root / str(UUID(previous)) / 'manifest.json'
+                manifest = json.loads(previous_path.read_text(encoding='utf-8')) if previous_path.exists() else None
+        return published
+
+    def find_publication(self, publication_id):
+        for version in self._published_versions():
+            manifest = json.loads((self.root / version / 'manifest.json').read_text(encoding='utf-8'))
+            if manifest.get('publication_id') == publication_id:
+                return manifest
+        return None
 
     def get_version(self, version):
         if version is None:
@@ -95,7 +123,12 @@ class IndexPublisher:
         try:
             version = str(UUID(str(version)))
             path = self.root / version / "manifest.json"
-            return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+            if not path.exists():
+                return None
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            if manifest.get('publication_schema') and version not in self._published_versions():
+                return None
+            return manifest
         except (ValueError, TypeError):
             return None
 
@@ -153,10 +186,13 @@ class IndexPublisher:
                 raise ValueError("임베딩 프로필이 변경되었습니다")
             if any(item["document_id"] in self.deleted_documents() for item in prepared["chunks"]):
                 raise ValueError("삭제된 문서가 포함되어 있습니다")
-            return self._build(prepared["chunks"], prepared["contract"], prepared["vectors"])
+            return self._build(prepared["chunks"], prepared["contract"], prepared["vectors"],
+                               previous_version=prepared['previous_version'], publication_id=prepared.get('publication_id'))
 
-    def publish(self, document_id: str, new_chunks: list[dict]):
-        return self.commit(self.prepare(document_id, new_chunks))
+    def publish(self, document_id: str, new_chunks: list[dict], *, publication_id=None):
+        prepared = self.prepare(document_id, new_chunks)
+        prepared['publication_id'] = publication_id
+        return self.commit(prepared)
 
     def rebuild_with_current_profile(self):
         """저장된 청크를 현재 모델로 다시 색인하고 성공할 때만 새 버전을 게시한다."""
@@ -177,7 +213,7 @@ class IndexPublisher:
         return self.commit({"chunks": chunks, "vectors": vectors, "contract": contract,
                             "previous_version": previous_version})
 
-    def _build(self, chunks, contract, vectors=None):
+    def _build(self, chunks, contract, vectors=None, *, previous_version=None, publication_id=None):
         version = str(uuid4())
         folder = self.root / version
         folder.mkdir()
@@ -204,11 +240,15 @@ class IndexPublisher:
                                          if any(item.get('xlsx_region_start') for item in rows)
                                          and (source := _office_source(rows))},
                         "representation_versions": sorted({item.get("representation_version", "unknown") for item in chunks}),
-                        "created_at": datetime.now(UTC).isoformat()}
+                        "created_at": datetime.now(UTC).isoformat(), 'publication_schema': 1,
+                        'previous_version': previous_version, 'publication_id': publication_id}
             atomic_json(folder / "manifest.json", manifest)
             atomic_json(self.root / self.active_name, manifest)
             return manifest
         except Exception:
+            active = self.active()
+            if active and active.get('version') == version:
+                raise
             if dense_built:
                 self.qdrant.delete_collection(collection)
             shutil.rmtree(folder, ignore_errors=True)
@@ -276,13 +316,30 @@ class IndexPublisher:
                 for pointer, active in active_pointers.items():
                     if active["version"] == manifest["version"]:
                         atomic_json(pointer, manifest)
-            (self.root / "embedding-cache.sqlite3").unlink(missing_ok=True)
+            # Vectors are keyed by embedding contract and text, and can be
+            # shared by other documents. Deletion cannot identify exclusive keys.
 
     def job_is_indexed(self, document_id: str, job_id: str):
         with self.lock:
-            for path in self.root.glob("*/chunks.json"):
+            for version in self._published_versions():
+                path = self.root / version / 'chunks.json'
                 chunks = json.loads(path.read_text(encoding="utf-8"))
                 if any(item.get("document_id") == document_id and
-                       (not item.get("job_id") or item.get("job_id") == job_id) for item in chunks):
+                       item.get("job_id") == job_id for item in chunks):
                     return True
             return False
+
+    def job_may_be_referenced(self, document_id, job_id, *, include_unattributed=True):
+        if self.job_is_indexed(document_id, job_id):
+            return True
+        # Pre-ledger historical versions cannot be distinguished from old
+        # abandoned builds. Protect their possible source jobs from deletion.
+        for path in self.root.glob('*/manifest.json'):
+            manifest = json.loads(path.read_text(encoding='utf-8'))
+            if manifest.get('publication_schema'):
+                continue
+            chunks = json.loads((path.parent / 'chunks.json').read_text(encoding='utf-8'))
+            if any(item.get('document_id') == document_id and
+                   (item.get('job_id') == job_id or (include_unattributed and not item.get('job_id'))) for item in chunks):
+                return True
+        return False

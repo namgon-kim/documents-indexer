@@ -21,8 +21,15 @@ def atomic_json(path: Path, value):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(value, stream, ensure_ascii=False, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
         status = Path(name).stat()
         os.replace(name, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         return status
     finally:
         Path(name).unlink(missing_ok=True)
@@ -108,7 +115,8 @@ class ArtifactStore:
                              "parsed_available": bool(item.get("provider") and
                                  (path.parent / "parser_elements.json").is_file() and
                                  (path.parent / "parser_result.json").is_file())})
-            except (ValueError, OSError):
+            except (ValueError, OSError) as error:
+                LOG.warning('Cannot read ingestion job metadata %s (%s)', path, type(error).__name__)
                 continue
         return sorted(jobs, key=lambda job: job.get("created_at", ""), reverse=True)
 

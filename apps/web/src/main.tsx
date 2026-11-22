@@ -308,7 +308,7 @@ function App() {
             onChange={event => setResultLimit(event.target.value)}/><small>서버 후보 수와 리랭킹 결과 수 이내에서 표시합니다.</small></label>
           <label>검색 버전 <select value={version} onChange={event => setVersion(event.target.value)}>
             <option value="">현재 검색 버전</option>
-            {versions.map(item => <option key={item.index_version} value={item.index_version}>{new Date(item.created_at).toLocaleString("ko-KR")} · {item.status === "active" ? "현재" : "이전"} · {item.index_version.slice(0, 8)}{item.dense_available === false ? " · BM25만 가능" : ""}</option>)}
+            {versions.map(item => <option key={item.index_version} value={item.index_version}>{new Date(item.created_at).toLocaleString("ko-KR")} · {item.status === "active" ? "현재" : item.status === "legacy_unknown" ? "게시 이력 미확인" : "이전"} · {item.index_version.slice(0, 8)}{item.dense_available === false ? " · BM25만 가능" : ""}</option>)}
           </select></label>
           <label>문서 <select value={scope} onChange={event => setScope(event.target.value)}>
             <option value="">모든 문서</option>
@@ -318,7 +318,7 @@ function App() {
         </form>
         {options?.ingestion_enabled && versions.length === 0 && <p className="hint">선택한 모델에 검색 가능한 색인이 없습니다. 문서를 처리한 뒤 검색해 주세요.</p>}
         {selectedVersion?.dense_available === false && <p className="hint">이 검색 버전은 임베딩 계약이 달라 BM25만 사용할 수 있습니다. Dense·Hybrid 검색은 설정에서 색인을 다시 준비해 주세요.</p>}
-        {results && <p className="hint">검색 인덱스 · {searchedVersion.slice(0, 8)}{versions.find(item => item.index_version === searchedVersion)?.status === "retired" ? " · 이전 버전" : " · 현재 버전"}</p>}
+        {results && <p className="hint">검색 인덱스 · {searchedVersion.slice(0, 8)}{versions.find(item => item.index_version === searchedVersion)?.status === "retired" ? " · 이전 버전" : versions.find(item => item.index_version === searchedVersion)?.status === "legacy_unknown" ? " · 게시 이력 미확인" : " · 현재 버전"}</p>}
         {searchPageScope && <p className="hint" role="status">PDF 물리쪽 {searchPageScope.requested_pages.join(", ")} · 페이지 내 BM25 조회 · 인쇄 쪽 번호와 다를 수 있으며 원문 추출 완전성은 미확인입니다.{!searchPageScope.all_page_chunks_selected ? " 일부 청크만 표시됩니다." : ""}{searchPageScope.pages_without_chunks.length ? ` 검색 가능한 청크 없음: ${searchPageScope.pages_without_chunks.join(", ")}쪽 (원본·추출 상태 확인 필요).` : ""}</p>}
         {results?.length === 0 && <p className="hint">검색 가능한 결과가 없습니다. 지정한 쪽에 내용이 없다는 뜻은 아닙니다.</p>}
         {results?.map(hit => <article className="hit" key={hit.unit_id}>

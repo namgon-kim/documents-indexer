@@ -1,5 +1,6 @@
 import fcntl
 import json
+import logging
 import tempfile
 import threading
 import zipfile
@@ -56,6 +57,7 @@ from apps.api.auth import Auth, EmbedExchange, Login
 from apps.api.base_path import StripBasePath, with_base_tag
 
 SUFFIXES = {"pdf", "hwp", "hwpx"}
+LOG = logging.getLogger(__name__)
 
 
 class SettingsUpdate(BaseModel):
@@ -243,16 +245,35 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             elif config.parser_provider:
                 publish_pipeline(app, config, install_pipeline(app, config, recover=True))
             stop.clear()
+            app.state.worker_health = {'status': 'starting', 'consecutive_errors': 0}
 
             def worker():
+                recovery_needed = False
                 try:
                     while not stop.is_set():
-                        with operation_lock:
-                            processed = (app.state.ingestion.process_next() if hasattr(app.state, "ingestion") else False)
+                        try:
+                            with operation_lock:
+                                if recovery_needed and hasattr(app.state, 'ingestion'):
+                                    app.state.ingestion.recover()
+                                    recovery_needed = False
+                                processed = (app.state.ingestion.process_next() if hasattr(app.state, "ingestion") else False)
+                            app.state.worker_health = {'status': 'ok', 'consecutive_errors': 0}
+                        except Exception as error:
+                            failures = app.state.worker_health['consecutive_errors'] + 1
+                            app.state.worker_health = {'status': 'degraded', 'consecutive_errors': failures,
+                                                       'error_type': type(error).__name__}
+                            recovery_needed = True
+                            LOG.exception('Ingestion worker failed; retrying with backoff')
+                            if stop.wait(min(30, 2 ** min(failures - 1, 5))):
+                                break
+                            continue
                         if not processed:
                             wake.wait(0.5)
                             wake.clear()
                 finally:
+                    if not stop.is_set():
+                        app.state.worker_health = {**app.state.worker_health, 'status': 'stopped'}
+                        LOG.error('Ingestion worker stopped unexpectedly')
                     if stop.is_set():
                         cleanup()
 
@@ -317,7 +338,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
 
     @app.get("/health")
     def health():
-        return {"status": "ok"}
+        return {"status": "ok", "worker": getattr(app.state, 'worker_health', {'status': 'not_started'})}
 
     @app.get("/v1/auth/config")
     def auth_config(request: Request):
@@ -389,6 +410,12 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         if not config.external_processing:
             raise IndexerError("EXTERNAL_PROCESSING_DISABLED", "외부 문서 처리가 비활성화되어 있습니다.", 403)
         filename = (file.filename or "").replace("\\", "/").split("/")[-1]
+        try:
+            filename_bytes = filename.encode('utf-8')
+        except UnicodeEncodeError as error:
+            raise IndexerError("INVALID_FILENAME", "파일 이름을 읽을 수 없습니다.", 422) from error
+        if '\x00' in filename or len(filename_bytes) > 255:
+            raise IndexerError("INVALID_FILENAME", "파일 이름이 너무 길거나 사용할 수 없는 문자를 포함합니다.", 422)
         extension = Path(filename).suffix.lower()
         if extension not in {".pdf", ".hwp", ".hwpx", ".xlsx", ".pptx", ".docx"}:
             raise IndexerError("INVALID_FORMAT", "지원하지 않는 문서 형식입니다.", 415)
@@ -917,13 +944,12 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError("INDEX_NOT_READY", "검색 색인이 설정되지 않았습니다.", 503)
         try:
             publisher = request.app.state.ingestion.publisher_for(profile_id)
-            active = publisher.active()
             items = []
             for row in publisher.versions():
                 manifest = publisher.get_version(row["index_version"])
                 if manifest and manifest["embedding_profile"]["profile_id"] == publisher.embedder.profile.profile_id:
                     available = manifest["embedding_profile"] == publisher.embedding_contract()
-                    items.append({**row, "status": "active" if active and active["version"] == row["index_version"] else "retired",
+                    items.append({**row,
                                   "dense_available": available,
                                   "unavailable_reason": None if available else "임베딩 모델 계약이 달라 BM25만 사용할 수 있습니다."})
             return {"versions": items}

@@ -63,6 +63,7 @@ class UpstageParser:
         return ParseResult(provider="upstage", elements=result["elements"], raw=result)
 
     def _parse_long(self, request, data):
+        deadline = time.monotonic() + self.job_timeout
         checkpoint = request.checkpoint or {}
         request_id = checkpoint.get("request_id")
         save = request.persist or (lambda *_: None)
@@ -74,7 +75,7 @@ class UpstageParser:
                 with request.path.open("rb") as stream:
                     response = self.client.post(self.config.base_url + "/document-digitization/async",
                         headers={"Authorization": f"Bearer {self.config.api_key}"}, data=data,
-                        files={"document": (request.path.name, stream)}, timeout=self.remote_timeout)
+                        files={"document": (request.path.name, stream)}, timeout=min(self.remote_timeout, max(0.001, deadline - time.monotonic())))
                 response.raise_for_status()
                 request_id = response.json().get("request_id")
             except httpx.HTTPStatusError as error:
@@ -109,13 +110,12 @@ class UpstageParser:
                 or any(start <= old_end and old_start <= end for old_start, old_end in batches)):
                 raise IndexerError("PARSE_RESPONSE_INVALID", "저장된 문서 처리 결과를 확인할 수 없습니다.", 503)
             batches[start, end] = payload
-        deadline = time.monotonic() + self.job_timeout
         download_errors = {}
         poll_errors = 0
         while time.monotonic() < deadline:
             try:
                 response = self.client.get(self.config.base_url + "/document-digitization/requests/" + request_id,
-                    headers={"Authorization": f"Bearer {self.config.api_key}"}, timeout=self.remote_timeout)
+                    headers={"Authorization": f"Bearer {self.config.api_key}"}, timeout=min(self.remote_timeout, max(0.001, deadline - time.monotonic())))
                 response.raise_for_status()
                 state = response.json()
             except httpx.HTTPError as error:
@@ -178,7 +178,10 @@ class UpstageParser:
                     if not trusted_proxy and address is not None and not address.is_global:
                         raise ValueError("invalid result URL")
                     headers = {"Authorization": f"Bearer {self.config.api_key}"} if same_origin else {}
-                    downloaded = self.client.get(url, headers=headers, timeout=self.remote_timeout, follow_redirects=False)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise IndexerError("PROVIDER_TIMEOUT", "문서 읽기가 오래 걸리고 있습니다. 이어서 확인할 수 있습니다.", 503)
+                    downloaded = self.client.get(url, headers=headers, timeout=min(self.remote_timeout, remaining), follow_redirects=False)
                     downloaded.raise_for_status()
                     payload = downloaded.json()
                     rows = payload.get("elements") if isinstance(payload, dict) else None

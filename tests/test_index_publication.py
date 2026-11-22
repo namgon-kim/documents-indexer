@@ -86,7 +86,7 @@ def test_failed_delete_hides_document_until_cleanup_is_retried(tmp_path, monkeyp
         monkeypatch.setattr(qdrant, "delete", original)
         publisher.delete_document("one")
         assert publisher.active()["document_ids"] == ["two"]
-        assert not (publisher.root / "embedding-cache.sqlite3").exists()
+        assert (publisher.root / "embedding-cache.sqlite3").exists()
         qdrant.close()
 
 
