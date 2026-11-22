@@ -127,7 +127,7 @@ def test_chat_passes_inferred_table_relations_and_accepts_legacy_hits(tmp_path):
         items = json.loads(body['messages'][-1]['content'])['검색된 문서']
         assert items[0]['표_라벨_관계'][0]['relations'][0] == relation
         assert items[1]['표_라벨_관계'][0]['relations'] is None
-        assert '관계를 확정하지 마세요' in body['messages'][0]['content']
+        assert '정보가 없거나 생략된 사실만으로 관계가 틀렸다고 판단하지 마세요' in body['messages'][0]['content']
         return httpx.Response(200, json={'choices': [{'message': {'content': '답변 [1]'}}]})
     with httpx.Client(transport=httpx.MockTransport(provider)) as client:
         RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
@@ -162,3 +162,20 @@ def test_table_relation_metadata_does_not_displace_later_evidence():
     assert [item['text'] for item in context] == [table['search_text'], later['search_text']]
     assert context[0]['표_라벨_관계_일부_생략'] is True
     assert counts['evidence_omitted_count'] == counts['evidence_truncated_count'] == 0
+
+
+def test_interpretation_context_fits_before_table_relationship_metadata():
+    from indexer.chat import _chat_evidence
+
+    relation = {'kind': 'column', 'text': '제목' * 30, 'element_id': 'e1', 'row': 1, 'column': 1,
+                'origin': 'inferred', 'status': 'unverified'}
+    hit = {'filename': 'doc', 'source_refs': [], 'search_text': 'A' * 1000,
+           'context_text': '필요한 앞뒤 문맥 ' * 50,
+           'table_segments': [{'row': i, 'column': 1, 'label': '제목', 'label_relations': [relation]}
+                              for i in range(12)]}
+    _, context, counts = _chat_evidence([hit], 20, 4096)
+    assert context[0]['text'] == hit['search_text']
+    assert context[0]['context'] == hit['context_text']
+    assert context[0]['표_라벨_관계_일부_생략'] is True
+    assert counts['context_omitted_count'] == 0
+    assert counts['evidence_bytes'] <= 4096
