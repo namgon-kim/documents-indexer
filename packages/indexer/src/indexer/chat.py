@@ -4,6 +4,7 @@ import re
 import httpx
 from langchain_core.runnables import RunnableLambda
 
+from indexer.answer_audit import audit_answer
 from indexer.contracts import IndexerError, SearchRequest
 from indexer.embedding_input import byte_size, embedding_text
 from indexer.pdf_pages import physical_pdf_pages
@@ -372,6 +373,13 @@ class RagChat:
                             "XLSX 전체 표를 조회하지 않은 경우에는 문서 전체의 개수, 분포, 날짜 범위를 확정하지 마세요. "
                             "XLSX의 시트 간 행 연결 후보는 추정이며 다른 행의 값을 합쳐 사실로 인용하지 마세요. "
                             "이미지의 위치나 같은 구역이라는 정보만으로 의미상 관계를 확정하지 마세요. "
+                            "검색에서 찾지 못한 사실과 확인된 셀의 공란을 구분하고, 계산 캐시가 없는 수식은 계산값 미확인으로 설명하세요. "
+                            "답변하기 전에 질문이 지정한 대상, 조건, 비교 방향과 요구 범위를 파악하세요. "
+                            "각 근거에서 대상별 속성, 수치, 단위, 시점과 조건을 함께 확인하고 다른 대상이나 다른 시트의 값을 섞지 마세요. "
+                            "변화는 시작값과 종료값의 순서 및 증가·감소 서술을 함께 대조하세요. 질문의 전제가 근거와 다르면 차이를 설명하세요. "
+                            "전체 목록을 요구받으면 확인된 대상 범위의 항목을 빠짐없이 검토하고, 범위나 일부 항목이 미확인이면 확인된 부분과 한계를 구분하세요. "
+                            "각 핵심 주장에는 해당 대상과 내용을 실제로 뒷받침하는 근거를 인용하고, 종합이나 계산은 근거와 추론을 구분해 설명하세요. "
+                            "근거가 서로 충돌하면 그 사실과 범위를 밝히고 근거 없는 결론을 선택하지 마세요. "
                             "이전 대화는 질문의 맥락이며 사실의 근거로 사용하지 마세요.")
         payload = {"model": request.model or self.config.llm_model,
                    "messages": [{"role": "system", "content": instructions}, *messages]}
@@ -395,7 +403,9 @@ class RagChat:
                 raise ValueError("empty response")
         except (httpx.HTTPError, ValueError, TypeError, KeyError) as error:
             raise IndexerError("LLM_UNAVAILABLE", "답변 생성에 실패했습니다. 모델 연결 설정을 확인해 주세요.", 503) from error
-        answer = content
-        answer = re.sub(r"\[(\d+)\]", lambda match: match.group(0) if 1 <= int(match.group(1)) <= len(sources) else "[근거 확인 불가]", answer)
+        verification = audit_answer(content, context)
+        answer = re.sub(r"\[(\d+)\]", lambda match: match.group(0) if 1 <= int(match.group(1)) <= len(sources) else "[근거 확인 불가]", content)
+        if verification["warnings"]:
+            answer += "\n\n※ 일부 주장과 인용 근거의 관계를 원문에서 확인해 주세요."
         return {"answer": answer, "sources": sources, "index_version": result["index_version"],
-                "search_counts": diagnostics, "coverage": coverage, **({'page_scope': page_scope} if page_scope else {})}
+                "answer_verification": verification, "search_counts": diagnostics, "coverage": coverage, **({'page_scope': page_scope} if page_scope else {})}

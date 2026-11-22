@@ -205,11 +205,11 @@ function App() {
         ...(role === "assistant" && sources ? {citation_numbers: sources.map((_, index) => index + 1)} : {})})).slice(-10);
       setMessages(items => [...items, {role: "user", content: question}]);
       setQuery("");
-      const response = await api<{ answer: string; sources: Hit[]; index_version: string; search_counts?: ChatMessage["search_counts"]; coverage?: ChatMessage["coverage"]; page_scope?: ChatMessage["page_scope"] }>("/v1/ingest-chat", session, {
+      const response = await api<{ answer: string; sources: Hit[]; index_version: string; search_counts?: ChatMessage["search_counts"]; answer_verification?: ChatMessage["answer_verification"]; coverage?: ChatMessage["coverage"]; page_scope?: ChatMessage["page_scope"] }>("/v1/ingest-chat", session, {
         message: question, history: previous, ...(xlsxScope && xlsxFullTable ? {xlsx_full_table: true} : {}), ...(chatModel ? { model: chatModel } : {}), ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}), ...(scope ? { document_id: scope } : {}), ...(version ? { index_version: version } : {}),
         ...(options?.ingestion_enabled ? {method: searchMethod, rerank: rerank && Boolean(options.rerank_available), profile_id: embeddingProfile} : {}),
       });
-      setMessages(items => [...items, {role: "assistant", content: response.answer, sources: response.sources, index_version: response.index_version, search_counts: response.search_counts, coverage: response.coverage, page_scope: response.page_scope}]);
+      setMessages(items => [...items, {role: "assistant", content: response.answer, sources: response.sources, index_version: response.index_version, search_counts: response.search_counts, answer_verification: response.answer_verification, coverage: response.coverage, page_scope: response.page_scope}]);
     } catch (reason) { setQuery(query); setMessages(items => items.slice(0, -1)); showError(reason); }
     finally { setSearching(false); }
   }

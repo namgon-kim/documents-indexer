@@ -335,3 +335,40 @@ def test_small_text_expansion_uses_spare_evidence_budget():
     assert [hit['chunk_id'] for hit in sources] == ['ranked', 'expanded']
     assert context[0]['context'] == 'surrounding context'
     assert counts['evidence_omitted_count'] == 0
+
+
+def test_chat_flags_invalid_citation_before_redacting_it(tmp_path):
+    hit = {'filename': 'doc', 'source_refs': [], 'search_text': '인원 7명'}
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
+    def provider(_):
+        return httpx.Response(200, json={'choices': [{'message': {'content': '인원은 7명입니다. [5]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
+            ChatRequest(message='인원은?'))
+    assert '[근거 확인 불가]' in result['answer']
+    assert 'invalid_citation' in {warning['code'] for warning in result['answer_verification']['warnings']}
+
+
+
+
+def test_answer_model_receives_evidence_relationship_and_scope_contract(tmp_path):
+    hit = {'filename': 'doc', 'source_refs': [], 'search_text': '근거 텍스트'}
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
+    calls = []
+    def provider(request):
+        calls.append(request)
+        payload = json.loads(request.content)
+        instructions = payload['messages'][0]['content']
+        for condition in ('대상별 속성, 수치, 단위, 시점과 조건', '시작값과 종료값', '질문의 전제가 근거와 다르면',
+                          '전체 목록을 요구받으면', '확인된 셀의 공란', '각 핵심 주장', '근거가 서로 충돌'):
+            assert condition in instructions
+        context = json.loads(payload['messages'][-1]['content'])
+        assert context['질문'] == '대상을 비교해 주세요'
+        assert context['검색된 문서'][0]['text'] == hit['search_text']
+        assert context['조회_범위']['scope_verification'] == 'unknown'
+        return httpx.Response(200, json={'choices': [{'message': {'content': '요약 결과입니다. [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
+            ChatRequest(message='대상을 비교해 주세요'))
+    assert len(calls) == 1 and result['answer'] == '요약 결과입니다. [1]'
+    assert result['answer_verification']['status'] == 'not_verified'
