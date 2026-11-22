@@ -15,9 +15,17 @@ def _chat_evidence(hits, limit, budget=32768):
     """Fit ranked evidence in a serialized UTF-8 byte budget."""
     sources, context = [], []
     # A completeness flag can grow from true to false when a later item is omitted.
-    fit_budget = max(0, budget - min(limit, len(hits)))
+    fit_budget = max(0, budget - limit)
     truncated = context_omitted = 0
-    for hit in hits[:limit]:
+    encoded = lambda items: byte_size(json.dumps(items, ensure_ascii=False))
+    ordered = [hit for hit in hits if hit.get('expansion_reason') != 'same_source_element']
+    ordered += [hit for hit in hits if hit.get('expansion_reason') == 'same_source_element']
+    chosen = ordered[:limit]
+    primary = [hit for hit in chosen if hit.get('expansion_reason') != 'same_source_element']
+    supplementary = [hit for hit in chosen if hit.get('expansion_reason') == 'same_source_element']
+
+    def add(hit, *, allow_truncation):
+        nonlocal truncated
         refs = hit["source_refs"]
         item = {"id": len(sources) + 1, "filename": hit["filename"],
                 "evidence_pages": sorted({ref["page"] for ref in refs if ref.get("page") is not None and ref.get("role", "evidence") == "evidence"}),
@@ -35,9 +43,9 @@ def _chat_evidence(hits, limit, budget=32768):
             # Reserve only a small marker until all ranked evidence is fitted.
             item['표_라벨_관계'] = None
             item['표_라벨_관계_일부_생략'] = True
-        encoded = lambda items: byte_size(json.dumps(items, ensure_ascii=False))
         if encoded([*context, item]) > fit_budget:
-            # Fit a prefix measured in JSON-encoded UTF-8 bytes, including escaping.
+            if not allow_truncation:
+                return
             full_text = item["text"]
             low, high = 1, len(full_text)
             best = ""
@@ -50,15 +58,17 @@ def _chat_evidence(hits, limit, budget=32768):
                 else:
                     high = middle - 1
             if not best.strip():
-                continue
+                return
             item["text"] = best
             truncated += 1
             sources.append({**hit, "search_text": best, "evidence_truncated": True})
         else:
             sources.append(dict(hit))
         context.append(item)
-    omitted = len(hits) - len(sources)
-    # Fill spare capacity with interpretation context after fitting the ranked evidence.
+
+    for hit in primary:
+        add(hit, allow_truncation=True)
+    # Interpretation context of ranked and previously supported evidence has priority.
     for hit, item in zip(sources, context, strict=True):
         extra = hit.get("context_text") or ""
         if hit.get("evidence_truncated"):
@@ -68,7 +78,7 @@ def _chat_evidence(hits, limit, budget=32768):
         if not extra or extra == hit["search_text"]:
             continue
         item["context"] = extra
-        if byte_size(json.dumps(context, ensure_ascii=False)) > fit_budget:
+        if encoded(context) > fit_budget:
             item["context"] = ""
             context_omitted += 1
     # Add whole relationships only after evidence and interpretation context fit.
@@ -89,6 +99,18 @@ def _chat_evidence(hits, limit, budget=32768):
             selected.append(entry)
         item['표_라벨_관계_일부_생략'] = (len(selected) < len(labeled) or any(
             len(part.get('label_relations') or []) > 8 for part in labeled[:len(selected)]))
+    primary_count = len(sources)
+    for hit in supplementary:
+        add(hit, allow_truncation=False)
+    for hit, item in zip(sources[primary_count:], context[primary_count:], strict=True):
+        extra = hit.get('context_text') or ''
+        if not extra or extra == hit['search_text']:
+            continue
+        item['context'] = extra
+        if encoded(context) > fit_budget:
+            item['context'] = ''
+            context_omitted += 1
+    omitted = len(hits) - len(sources)
     limited = bool(omitted or truncated or context_omitted)
     for hit, item in zip(sources, context, strict=True):
         if not hit.get('table_expansion_complete'):

@@ -303,3 +303,35 @@ def test_model_scope_markers_remain_within_tight_evidence_budget(tmp_path):
         result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake', chat_evidence_bytes=4096),
                          retrieval, client).invoke(ChatRequest(message='정리'))
     assert result['search_counts']['evidence_bytes'] <= 4096
+
+
+def test_text_expansion_does_not_displace_ranked_visual_or_interpretation_context():
+    from indexer.chat import _chat_evidence
+
+    ranked = {'chunk_id': 'ranked', 'filename': 'doc', 'source_refs': [], 'search_text': 'A' * 700,
+              'context_text': 'context ' * 70,
+              'table_segments': [{'row': 1, 'column': 1, 'label': 'header',
+                                  'label_relations': [{'kind': 'column', 'text': 'header'}]}]}
+    visual = {'chunk_id': 'visual', 'filename': 'doc', 'source_refs': [], 'search_text': 'V' * 500,
+              'expansion_reason': 'related_image_analysis'}
+    expanded = {'chunk_id': 'expanded', 'filename': 'doc', 'source_refs': [], 'search_text': 'X' * 3000,
+                'expansion_reason': 'same_source_element'}
+    base_sources, base_context, _ = _chat_evidence([ranked, visual], 25, 4096)
+    sources, context, counts = _chat_evidence([ranked, expanded, visual], 25, 4096)
+    assert [hit['chunk_id'] for hit in sources] == [hit['chunk_id'] for hit in base_sources]
+    assert context == base_context
+    assert counts['evidence_omitted_count'] == 1
+    assert counts['evidence_bytes'] <= 4096
+
+
+def test_small_text_expansion_uses_spare_evidence_budget():
+    from indexer.chat import _chat_evidence
+
+    ranked = {'chunk_id': 'ranked', 'filename': 'doc', 'source_refs': [], 'search_text': 'A',
+              'context_text': 'surrounding context'}
+    expanded = {'chunk_id': 'expanded', 'filename': 'doc', 'source_refs': [], 'search_text': 'additional',
+                'expansion_reason': 'same_source_element'}
+    sources, context, counts = _chat_evidence([ranked, expanded], 25, 4096)
+    assert [hit['chunk_id'] for hit in sources] == ['ranked', 'expanded']
+    assert context[0]['context'] == 'surrounding context'
+    assert counts['evidence_omitted_count'] == 0

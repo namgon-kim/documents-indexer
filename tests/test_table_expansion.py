@@ -185,6 +185,8 @@ def test_external_q13_evidence_reaches_model_without_copying_source_into_reposit
 
     archive = os.environ.get('POC_Q13_EVIDENCE_ZIP')
     if not archive:
+        if os.environ.get('REQUIRE_POC_Q13_EVIDENCE') == '1':
+            pytest.fail('POC_Q13_EVIDENCE_ZIP is required for this evidence validation run')
         pytest.skip('set POC_Q13_EVIDENCE_ZIP to run against the original evidence archive')
     with ZipFile(Path(archive)) as data:
         chunks = [chunk for chunk in json.loads(data.read('03_job_chunks_selected_pages.json'))
@@ -201,3 +203,17 @@ def test_external_q13_evidence_reaches_model_without_copying_source_into_reposit
     assert {item['text'] for item in context} == {chunk['text'] for chunk in chunks}
     dates = re.findall(r"'\d{2}\.\d{2}-'\d{2}\.\d{2}", '\n'.join(item['text'] for item in context))
     assert len(dates) == 6
+
+
+def test_six_synthetic_items_reach_model_across_three_table_fragments():
+    from indexer.chat import _chat_evidence
+
+    items = [f'entry-{index}' for index in range(6)]
+    chunks = [{**table(str(index), part=index), 'text': ' '.join(items[index * 2:index * 2 + 2])}
+              for index in range(3)]
+    expanded = PublishedRetrieval._expand_table([chunks[1]], {c['chunk_id']: c for c in chunks})
+    hits = [{**chunk, 'filename': 'synthetic', 'source_refs': [], 'search_text': chunk['text']}
+            for chunk in expanded]
+    sources, context, counts = _chat_evidence(hits, 25, 32768)
+    assert len(sources) == 3 and counts['evidence_omitted_count'] == 0
+    assert set(' '.join(item['text'] for item in context).split()) == set(items)
