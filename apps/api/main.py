@@ -106,6 +106,11 @@ class ReprocessRequest(BaseModel):
     embedding_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
+class XlsxReviewReset(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    sheets: list[Annotated[str, Field(min_length=1, max_length=31)]] = Field(min_length=1, max_length=255)
+
+
 class ImageActionsRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     actions: dict[str, Literal['analyze', 'original', 'both', 'exclude', 'reuse', 'describe']] = Field(min_length=1, max_length=100)
@@ -588,6 +593,25 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                 base = service.storage.load_job(str(document_id), str(job_id), 'processing')
                 result = service.enqueue_reprocess(str(document_id), str(job_id), 'rechunk', base['settings'],
                                                    xlsx_review=body)
+                wake.set()
+                return result
+        except (FileNotFoundError, AttributeError) as error:
+            raise IndexerError('JOB_NOT_FOUND', '기준 작업을 찾을 수 없습니다.', 404) from error
+        except ValueError as error:
+            raise IndexerError('XLSX_REVIEW_INVALID', str(error)) from error
+
+    @app.post("/v1/ingest/{document_id}/jobs/{job_id}/xlsx-structure/reset", status_code=202,
+              dependencies=[Depends(auth.require)])
+    def reset_xlsx_review(request: Request, document_id: UUID, job_id: UUID, body: XlsxReviewReset):
+        """Discard sheet reviews and use a fresh structure analysis in a new job."""
+        if not config.external_processing:
+            raise IndexerError('EXTERNAL_PROCESSING_DISABLED', '외부 문서 처리가 비활성화되어 있습니다.', 403)
+        try:
+            with operation_lock:
+                service = request.app.state.ingestion
+                base = service.storage.load_job(str(document_id), str(job_id), 'processing')
+                result = service.enqueue_reprocess(str(document_id), str(job_id), 'rechunk', base['settings'],
+                                                   xlsx_review_reset=list(dict.fromkeys(body.sheets)))
                 wake.set()
                 return result
         except (FileNotFoundError, AttributeError) as error:

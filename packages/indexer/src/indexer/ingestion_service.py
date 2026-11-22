@@ -146,7 +146,28 @@ class IngestionService:
             "provider_terminal_unavailable": sorted(result.terminal_unavailable), "progress": None,
             "profile": state.get("profile"), "profile_origin": state.get("profile_origin"),
             **({'xlsx_structure_version': result.raw['xlsx_structure_version']}
-               if 'xlsx_structure_version' in result.raw else {})})
+               if 'xlsx_structure_version' in result.raw else {}),
+            **self._xlsx_review_status(status, result.raw)})
+
+    @staticmethod
+    def _xlsx_review_status(status, raw):
+        """Keep only reviews that still match the new parse; record the others as stale."""
+        state = raw.get('xlsx_review_state') if isinstance(raw, dict) else None
+        reviews = status.get('xlsx_review') or {}
+        if not state or not reviews:
+            return {}
+        stale = {name: {'review': reviews[name], 'reason': item.get('reason')}
+                 for name, item in state.items() if item['status'] == 'stale' and name in reviews}
+        updates = {'xlsx_review_basis': {**(status.get('xlsx_review_basis') or {}),
+                                         **{name: item['basis'] for name, item in state.items()
+                                            if item['status'] == 'applied' and name in reviews}}}
+        if stale:
+            # The base job keeps its review history; this job asks for a new review.
+            updates['xlsx_review'] = {name: review for name, review in reviews.items() if name not in stale}
+            updates['xlsx_review_stale'] = {**(status.get('xlsx_review_stale') or {}), **stale}
+            updates['xlsx_review_basis'] = {name: basis for name, basis in updates['xlsx_review_basis'].items()
+                                            if name not in stale}
+        return updates
 
     def _provider_event(self, state, attempt, event, data):
         self.storage.save_provider_event(state["document_id"], state["job_id"], attempt, event, data)
@@ -235,7 +256,7 @@ class IngestionService:
         return hashlib.sha256(json.dumps(fields, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
     def enqueue_reprocess(self, document_id: str, base_job_id: str, mode: str, settings: dict, embedding_profile_id=None,
-                          *, xlsx_review=None):
+                          *, xlsx_review=None, xlsx_review_reset=None):
         if mode not in {"reparse", "rechunk", "complete_images"}:
             raise ValueError("다시 처리할 단계를 확인해 주세요")
         self.storage.load_document(document_id)
@@ -245,9 +266,13 @@ class IngestionService:
         if any(job["status"] in {"queued", "processing"} for job in jobs):
             raise ValueError("이 문서의 다른 작업이 진행 중입니다")
         base = self.storage.load_job(document_id, base_job_id, "processing")
-        reviews = base.get('xlsx_review', {})
-        if xlsx_review:
-            from indexer.xlsx_structure import STRUCTURE_VERSION, validate
+        reviews = dict(base.get('xlsx_review') or {})
+        basis = dict(base.get('xlsx_review_basis') or {})
+        stale = dict(base.get('xlsx_review_stale') or {})
+        if xlsx_review and xlsx_review_reset:
+            raise ValueError('구조 검토와 초기화를 함께 요청할 수 없습니다')
+        if xlsx_review or xlsx_review_reset:
+            from indexer.xlsx_structure import STRUCTURE_VERSION, review_basis, validate
 
             if mode != 'rechunk' or settings.get('extraction_mode') not in {'native_text', 'native_visual'}:
                 raise ValueError('XLSX 직접 추출 작업에서 구조를 검토할 수 있습니다')
@@ -255,11 +280,18 @@ class IngestionService:
             if raw.get('xlsx_structure_version') != STRUCTURE_VERSION:
                 raise ValueError('문서를 다시 읽은 뒤 구조를 검토해 주세요')
             sheets = {sheet['name']: sheet for sheet in raw['xlsx_sheets']}
-            if xlsx_review.keys() - sheets.keys():
+            requested = set(xlsx_review or xlsx_review_reset)
+            if requested - sheets.keys():
                 raise ValueError('검토할 시트를 찾을 수 없습니다')
-            for name, proposal in xlsx_review.items():
+            for name, proposal in (xlsx_review or {}).items():
                 validate(sheets[name], proposal, 'user')
-            reviews = {**reviews, **{name: proposal.model_dump() for name, proposal in xlsx_review.items()}}
+                basis[name] = review_basis(sheets[name])
+            if xlsx_review:
+                reviews.update({name: proposal.model_dump() for name, proposal in xlsx_review.items()})
+            else:
+                reviews = {name: review for name, review in reviews.items() if name not in requested}
+                basis = {name: value for name, value in basis.items() if name not in requested}
+            stale = {name: value for name, value in stale.items() if name not in requested}
         if mode == 'complete_images' and base.get('pending_review'):
             raise ValueError('검토 중인 작업은 이미지 목록에서 처리할 항목을 선택해 주세요')
         selected_id = embedding_profile_id or base.get("embedding_profile_id")
@@ -291,6 +323,7 @@ class IngestionService:
                   "settings": settings, "profile": base.get("profile"), "parser_contract": self.parser_contract(job_parser),
                   'force_review': mode == 'complete_images',
                   **({'xlsx_review_edit': True} if xlsx_review else {}),
+                  **({'xlsx_review_reset': sorted(xlsx_review_reset)} if xlsx_review_reset else {}),
                   'image_policies_present': base.get('image_policies_present', False) if mode == 'rechunk' else False,
                   "created_at": datetime.now(UTC).isoformat()}
         if publisher and self.embedding_policy(publisher):
@@ -298,8 +331,11 @@ class IngestionService:
         if self.embedding_profiles:
             status["embedding_profile_id"] = publisher.embedder.profile.profile_id
             status["embedding_contract"] = publisher.embedding_contract()
-        if reviews and settings.get('extraction_mode') in {'native_text', 'native_visual'}:
-            status['xlsx_review'] = reviews
+        if settings.get('extraction_mode') in {'native_text', 'native_visual'}:
+            # A reparse revalidates inherited reviews against the new source; reviews
+            # that no longer match are recorded as stale instead of failing the job.
+            status.update({key: value for key, value in (('xlsx_review', reviews), ('xlsx_review_basis', basis),
+                                                         ('xlsx_review_stale', stale)) if value})
         self._save_parser(document_id, job_id, job_parser)
         if mode == 'complete_images':
             for item in image_checkpoints:
@@ -407,7 +443,7 @@ class IngestionService:
         status = {'status': 'queued', 'stage': 'queued', 'mode': 'image_actions', 'base_job_id': base_job_id,
                   'settings': base.get('settings', {}), 'profile': base.get('profile'),
                   'image_policies_present': True, 'force_review': True,
-                  **({'xlsx_review': base['xlsx_review']} if base.get('xlsx_review') else {}),
+                  **{key: base[key] for key in ('xlsx_review', 'xlsx_review_basis', 'xlsx_review_stale') if base.get(key)},
                   'parser_contract': self.parser_contract(self.parser), 'image_actions': selected, 'image_descriptions': selected_descriptions,
                   'created_at': datetime.now(UTC).isoformat()}
         if publisher and self.embedding_policy(publisher):
@@ -571,6 +607,13 @@ class IngestionService:
 
                     reused = inputs['reused_parse']
                     reused['raw'], reused['elements'] = apply_xlsx_review(reused['raw'], reused['elements'], status['xlsx_review'])
+                    reused['previous_elements'] = []
+                elif status.get('xlsx_review_reset'):
+                    from indexer.parsing.native_documents import reset_xlsx_review
+
+                    reused = inputs['reused_parse']
+                    reused['raw'], reused['elements'] = reset_xlsx_review(reused['raw'], reused['elements'],
+                                                                          status['xlsx_review_reset'])
                     reused['previous_elements'] = []
             if status.get('mode') == 'image_actions':
                 base_id = status['base_job_id']

@@ -8,7 +8,7 @@ import httpx
 from indexer.contracts import IndexerError
 from indexer.embedding_input import byte_size, embedding_text, heading_prefix, split_text
 from indexer.office_locations import set_xlsx_chunk_evidence
-from indexer.representation import table_groups
+from indexer.representation import compose_row_labels, full_label, table_groups
 from indexer.table_evidence import HTML_CELL_RANGE, set_html_table_evidence
 
 
@@ -42,7 +42,8 @@ def split_chunk(chunk, max_bytes):
         original_prefix = text.removesuffix(body).rstrip()
         prefix = heading_prefix(original_prefix.split(' > '), max_bytes // 3)
         source_parts = [{**segment, "row": segment["row"], "column": segment["column"],
-                         "label": segment.get("label", ""), "text": segment.get("value", segment["text"]),
+                         # A split can separate cells of one row, so restore each row context.
+                         "label": full_label(segment), "text": segment.get("value", segment["text"]),
                          "label_origin": segment.get("label_origin", "parser")}
                         for segment in segments]
         if chunk.get("source_range_quality") == HTML_CELL_RANGE:
@@ -53,7 +54,7 @@ def split_chunk(chunk, max_bytes):
             converted = [{**item, "row": item["row"], "column": item["column"], "label": item["label"],
                           "value": item["text"], "label_origin": item.get("label_origin", "parser"),
                           "text": " / ".join(filter(None, [item["label"], item["text"]]))}
-                         for item in group]
+                         for item in compose_row_labels(group, max_bytes)]
             parts.append(("\n".join(filter(None, [prefix, *(item["text"] for item in converted)])), converted))
     else:
         body = embedding_text(chunk.get("body_text") or text)

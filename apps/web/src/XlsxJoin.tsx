@@ -13,10 +13,15 @@ type Joined = {joined_rows: number; ambiguous_pairs: number; unapproved_pairs: n
   unmatched_right_rows: number; left_key_issues?: Record<string, number>; right_key_issues?: Record<string, number>};
 type Candidates = {candidates: Candidate[]; complete?: boolean; total: number; offset: number; join?: Joined};
 type Result = {
-  complete: boolean; result: {matched_rows: number; value?: number | string | null; numeric_values?: number};
+  complete: boolean; issues: Record<string, number>;
+  result: {matched_rows: number; value?: number | string | null; numeric_values?: number; aggregate_unit?: string;
+    aggregate_unit_required?: boolean; pair_based_value?: number | string | null};
   join: Joined;
 };
 const operations: Record<string, string> = {count: "행 개수", sum: "합계", average: "평균", min: "최솟값", max: "최댓값"};
+const units: Record<string, string> = {
+  auto: "자동 · 중복 반영 시 기준 선택 요청", pairs: "연결된 행 쌍마다", left_rows: "왼쪽 표 행마다 한 번", right_rows: "오른쪽 표 행마다 한 번",
+};
 
 export function XlsxJoin({session, documentId, version, profile}: {
   session: Session; documentId: string; version: string; profile: string;
@@ -33,6 +38,7 @@ export function XlsxJoin({session, documentId, version, profile}: {
   const [operation, setOperation] = useState("count");
   const [column, setColumn] = useState("");
   const [side, setSide] = useState<"left" | "right">("right");
+  const [unit, setUnit] = useState("auto");
   const [result, setResult] = useState<Result>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -86,7 +92,7 @@ export function XlsxJoin({session, documentId, version, profile}: {
     setError(""); setBusy(true);
     try {
       setResult(await api<Result>("/v1/xlsx-query", session, {document_id: documentId, ...query,
-        sheet: lhs.sheet, start: lhs.start, operation,
+        sheet: lhs.sheet, start: lhs.start, operation, aggregate_unit: unit,
         ...(operation === "count" ? {} : {column, column_side: side}),
         join: {sheet: rhs.sheet, start: rhs.start, ...(mapped ? {keys, cardinality}
           : {approved_pairs: Object.values(approved)})}}));
@@ -169,6 +175,9 @@ export function XlsxJoin({session, documentId, version, profile}: {
       <label>집계 <select value={operation} disabled={busy} onChange={event => {setOperation(event.target.value); setResult(undefined);}}>
         {Object.entries(operations).map(([key, label]) => <option value={key} key={key}>{label}</option>)}
       </select></label>
+      <label>집계 기준 <select value={unit} disabled={busy} onChange={event => {setUnit(event.target.value); setResult(undefined);}}>
+        {Object.entries(units).map(([key, label]) => <option value={key} key={key}>{label}</option>)}
+      </select></label>
       {operation !== "count" && <>
         <label>집계할 쪽 <select value={side} disabled={busy} onChange={event => {
           setSide(event.target.value === "left" ? "left" : "right"); setColumn(""); setResult(undefined);
@@ -183,7 +192,13 @@ export function XlsxJoin({session, documentId, version, profile}: {
         onClick={() => void run()}>{mapped ? "열 매핑으로 조회" : "선택한 연결로 조회"}</button>
     </>}
     {result && <div role="status">
-      <p>{operations[operation]} · {operation === "count" ? result.result.matched_rows : result.result.value ?? "숫자 없음"}</p>
+      {result.result.aggregate_unit_required ? <>
+        <p role="alert">{operations[operation]} · 집계 기준 선택 필요</p>
+        <p>같은 원본 값 {result.issues.duplicated_join_values}개가 여러 연결 쌍으로 반복 반영되어 결과를 확정하지 않았습니다.
+          집계 기준에서 행 쌍마다 또는 한쪽 표의 행마다를 선택해 다시 조회해 주세요.</p>
+        <p>참고 · 연결된 행 쌍마다 집계한 값 {result.result.pair_based_value ?? "숫자 없음"} (확정 결과 아님)</p>
+      </> : <p>{operations[operation]} · {operation === "count" ? result.result.matched_rows : result.result.value ?? "숫자 없음"}
+        {result.result.aggregate_unit && ` · 기준 ${units[result.result.aggregate_unit] ?? result.result.aggregate_unit}`}</p>}
       <p>결합 {result.join.joined_rows}행{mapped
         ? ` · 키 확인 불가 왼쪽 ${skipped(result.join.left_key_issues)}행, 오른쪽 ${skipped(result.join.right_key_issues)}행`
         : ` · 충돌 또는 중복 후보 ${result.join.ambiguous_pairs}쌍 · 미승인 후보 ${result.join.unapproved_pairs}쌍`}</p>

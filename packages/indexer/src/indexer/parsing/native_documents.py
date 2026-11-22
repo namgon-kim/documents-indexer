@@ -413,50 +413,65 @@ class NativeExtractor:
         try:
             from contextlib import ExitStack
 
-            from indexer.office_inspection import inspect_office
+            from indexer.office_inspection import NATIVE_SHEET_LIMITS, inspect_office, table_limit_error
             from indexer.parsing.xlsx_source import sheet_record, workbook_styles
             from indexer.xlsx_structure import (
                 STRUCTURE_VERSION,
                 SheetProposal,
                 occupied,
+                review_basis,
                 row_candidates,
                 safe_local_structure,
                 validate,
             )
-            source = inspect_office(path, native_cells=True)
+            # Check sizes while streaming the package, before the workbook is loaded.
+            source = inspect_office(path, native_cells=True, limits=NATIVE_SHEET_LIMITS)
             inspected = {item['name']: item for item in source['sheets']}
             if any(not item['formula_scan_complete'] for item in inspected.values()):
                 raise IndexerError('NATIVE_TABLE_LIMIT', '시트 원본 구조가 직접 추출 크기 한도를 넘습니다.', 413)
             review = {name: SheetProposal.model_validate(item) for name, item in self.xlsx_review.items()}
+            review_state = {}
             requested = 0
             with ExitStack() as workbooks:
                 with warnings.catch_warnings(record=True) as detected:
                     warnings.simplefilter('always')
+                    # Formula results come from the worksheet XML, so one workbook load is enough.
                     book = load_workbook(path, data_only=False, read_only=False, keep_links=False)
                     workbooks.callback(book.close)
-                    values = load_workbook(path, data_only=True, read_only=False, keep_links=False)
-                    workbooks.callback(values.close)
                 if detected:
                     self.warning('Excel의 일부 확장 기능 또는 시각 요소를 읽지 못했을 수 있습니다.')
-                if review.keys() - set(book.sheetnames):
-                    raise IndexerError('XLSX_REVIEW_INVALID', '검토할 시트를 찾을 수 없습니다.')
+                for name in review.keys() - set(book.sheetnames):
+                    review_state[name] = {'status': 'stale', 'reason': '검토한 시트를 새 원본에서 찾을 수 없습니다.',
+                                          'basis': None}
                 for sheet in book:
                     source_sheet = inspected[sheet.title]
                     worksheet = source_sheet.get('sheet_kind') != 'chart'
-                    sheet_data = sheet_record(book, sheet, source_sheet, values[sheet.title] if worksheet else None)
+                    sheet_data = sheet_record(book, sheet, source_sheet, worksheet)
                     _, _, max_col, max_row = sheet_data['bounds']
-                    if max_row > 5000 or max_col > 100 or max_row * max_col > 25000:
-                        raise IndexerError('NATIVE_TABLE_LIMIT', '시트 크기가 직접 추출 범위를 넘습니다. 다른 파서를 사용해 주세요.', 413)
+                    if NATIVE_SHEET_LIMITS.exceeds(max_row, max_col):
+                        raise table_limit_error()
                     regions, candidates = safe_local_structure(sheet_data)
                     sheet_data.update(regions=regions, boundary_candidates=candidates, excluded={})
+                    applied = False
                     if sheet.title in review:
+                        basis = review_basis(sheet_data)
                         try:
                             sheet_data['regions'] = validate(sheet_data, review[sheet.title], 'user')
                         except ValueError as error:
-                            raise IndexerError('XLSX_REVIEW_INVALID', str(error)) from error
-                        sheet_data['excluded'] = review[sheet.title].excluded
-                        sheet_data['analysis_status'] = 'reviewed'
-                    elif self.xlsx_analyzer and any(region['status'] == 'unverified' for region in regions):
+                            # A changed source can invalidate an earlier review. Keep the
+                            # inferred structure and ask for a new review instead of failing.
+                            review_state[sheet.title] = {'status': 'stale', 'reason': str(error), 'basis': basis}
+                            sheet_data['stale_review'] = {**review[sheet.title].model_dump(), 'reason': str(error)}
+                            message = f'{sheet.title} 시트의 이전 구조 검토가 새 원본과 맞지 않아 적용하지 않았습니다. 구조를 다시 검토해 주세요.'
+                            if message not in self.xlsx_notices:
+                                self.xlsx_notices.append(message)
+                                self.warning(message)
+                        else:
+                            applied = True
+                            review_state[sheet.title] = {'status': 'applied', 'basis': basis}
+                            sheet_data['excluded'] = review[sheet.title].excluded
+                            sheet_data['analysis_status'] = 'reviewed'
+                    if not applied and self.xlsx_analyzer and any(region['status'] == 'unverified' for region in regions):
                         if requested < self.xlsx_analyzer.config.xlsx_structure_max_sheets:
                             try:
                                 analyzed, status = self.xlsx_analyzer.analyze(sheet_data)
@@ -523,7 +538,8 @@ class NativeExtractor:
                 relations, complete = row_candidates(self.xlsx_sheets)
                 self.xlsx_metadata = {'xlsx_structure_version': STRUCTURE_VERSION,
                                       'xlsx_style_model': workbook_styles(book, self.xlsx_sheets),
-                                      'xlsx_row_relations': relations, 'xlsx_row_relations_complete': complete}
+                                      'xlsx_row_relations': relations, 'xlsx_row_relations_complete': complete,
+                                      **({'xlsx_review_state': review_state} if review_state else {})}
         except IndexerError:
             raise
         except Exception as error:
@@ -720,28 +736,57 @@ class NativeExtractor:
         walk(root)
 
 
-def apply_xlsx_review(raw, elements, reviews):
-    """Replace structure elements while retaining the base job's visual analysis."""
-    from indexer.xlsx_structure import SheetProposal, row_candidates, validate
+def _rebuild_xlsx_sheets(raw, elements, names, update):
+    """Replace structure elements of selected sheets while retaining other elements."""
+    from indexer.xlsx_structure import row_candidates
 
     sheets = []
     for original in raw['xlsx_sheets']:
         sheet = dict(original)
-        if sheet['name'] in reviews:
-            proposal = SheetProposal.model_validate(reviews[sheet['name']])
-            sheet.update(regions=validate(sheet, proposal, 'user'), excluded=proposal.excluded,
-                         analysis_status='reviewed')
-            sheet.pop('suggested_review', None)
+        if sheet['name'] in names:
+            update(sheet)
+            for key in ('suggested_review', 'stale_review'):
+                sheet.pop(key, None)
         sheets.append(sheet)
     by_name = {sheet['name']: sheet for sheet in sheets}
     extractor = NativeExtractor(None, 'native_text')
     for element in elements:
         region = element.get('_xlsx_region')
-        if region and region['sheet'] in reviews:
+        if region and region['sheet'] in names:
             continue
         extractor.elements.append(element)
-        if element.get('_xlsx_sheet') in reviews:
+        if element.get('_xlsx_sheet') in names:
             extractor._xlsx_regions(by_name[element['_xlsx_sheet']])
     relations, complete = row_candidates(sheets)
-    return ({**raw, 'xlsx_sheets': sheets, 'xlsx_row_relations': relations, 'xlsx_row_relations_complete': complete},
-            extractor.elements)
+    return {**raw, 'xlsx_sheets': sheets, 'xlsx_row_relations': relations,
+            'xlsx_row_relations_complete': complete}, extractor.elements
+
+
+def apply_xlsx_review(raw, elements, reviews):
+    """Apply user reviews to an existing parse while retaining the base job's visual analysis."""
+    from indexer.xlsx_structure import SheetProposal, review_basis, validate
+
+    state = dict(raw.get('xlsx_review_state') or {})
+
+    def update(sheet):
+        proposal = SheetProposal.model_validate(reviews[sheet['name']])
+        sheet.update(regions=validate(sheet, proposal, 'user'), excluded=proposal.excluded,
+                     analysis_status='reviewed')
+        state[sheet['name']] = {'status': 'applied', 'basis': review_basis(sheet)}
+
+    raw, elements = _rebuild_xlsx_sheets(raw, elements, set(reviews), update)
+    return {**raw, 'xlsx_review_state': state}, elements
+
+
+def reset_xlsx_review(raw, elements, names):
+    """Discard reviews of selected sheets and use a fresh local structure analysis."""
+    from indexer.xlsx_structure import safe_local_structure
+
+    state = {name: value for name, value in (raw.get('xlsx_review_state') or {}).items() if name not in names}
+
+    def update(sheet):
+        regions, candidates = safe_local_structure(sheet)
+        sheet.update(regions=regions, boundary_candidates=candidates, excluded={}, analysis_status='review_reset')
+
+    raw, elements = _rebuild_xlsx_sheets(raw, elements, set(names), update)
+    return {**raw, 'xlsx_review_state': state}, elements
