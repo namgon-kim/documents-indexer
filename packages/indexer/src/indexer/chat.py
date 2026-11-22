@@ -6,6 +6,7 @@ from langchain_core.runnables import RunnableLambda
 
 from indexer.contracts import IndexerError, SearchRequest
 from indexer.embedding_input import byte_size, embedding_text
+from indexer.pdf_pages import physical_pdf_pages
 from indexer.search_engine import MAX_RESULT_LIMIT
 from indexer.xlsx_query import NUMERIC, QueryPlan
 
@@ -212,36 +213,51 @@ class RagChat:
         if not question:
             raise IndexerError("INVALID_REQUEST", "질문을 입력해 주세요.")
         question = embedding_text(question)
+        pages = physical_pdf_pages(question)
+        lexical_only = request.method == 'bm25' or bool(pages)
         publisher = getattr(self.retrieval, "publisher", None)
         profile = getattr(getattr(publisher, "embedder", None), "profile", None)
         limit = getattr(profile, "max_input_bytes", self.config.embedding_max_input_bytes)
-        if request.method != "bm25" and byte_size(question) > limit:
+        if not lexical_only and byte_size(question) > limit:
             raise IndexerError("QUERY_TOO_LONG", "현재 질문이 임베딩 입력 제한을 넘었습니다. 질문을 줄여 주세요.", 422)
         previous = [embedding_text(item.content) for item in request.history if item.role == "user"][-2:]
         query = question
         for item in reversed(previous):
             chars = 2000 - len(query) - 1
-            budget = limit - byte_size(query) - 1 if request.method != "bm25" else 8000
+            budget = limit - byte_size(query) - 1 if not lexical_only else 8000
             if chars <= 0 or budget <= 0:
                 break
             prefix = item[-chars:].encode("utf-8")[-budget:].decode("utf-8", "ignore").strip()
             if prefix:
                 query = prefix + "\n" + query
-        result = self.retrieval.search(SearchRequest(query=query, document_id=request.document_id,
-                                                     index_version=request.index_version, top_k=request.top_k,
-                                                     method=request.method, rerank=request.rerank,
-                                                     **({"profile_id": request.profile_id} if request.profile_id else {})))
+        search_request = SearchRequest(query=query, document_id=request.document_id,
+                                       index_version=request.index_version, top_k=request.top_k,
+                                       method=request.method, rerank=request.rerank,
+                                       **({"profile_id": request.profile_id} if request.profile_id else {}))
+        result = (self.retrieval.search_pdf_pages(search_request, pages) if pages
+                  else self.retrieval.search(search_request))
         return request, result
 
     def answer(self, inputs):
         request, result = inputs
         sources, context, counts = _chat_evidence(result["results"], MAX_RESULT_LIMIT + 5, self.config.chat_evidence_bytes)
         diagnostics = {**result.get("search_counts", {}), **counts}
+        page_scope = dict(result['page_scope']) if result.get('page_scope') else None
+        if page_scope is not None:
+            page_scope['pages_in_model_context'] = sorted({ref['page'] for source in sources
+                for ref in source.get('source_refs', []) if ref.get('role', 'evidence') == 'evidence'
+                and type(ref.get('page')) is int})
+            page_scope['evidence_budget_limited'] = bool(counts['evidence_omitted_count']
+                                                         or counts['evidence_truncated_count'])
+            if page_scope['evidence_budget_limited']:
+                page_scope['all_page_chunks_selected'] = False
         if not sources:
-            answer = ("검색 결과가 답변 근거 크기 한도를 초과했습니다." if result["results"]
+            answer = ("지정한 PDF 쪽의 검색 가능한 청크가 없습니다. 원본과 추출 상태를 확인해 주세요."
+                      if result.get('page_scope') and not result['results'] else
+                      "검색 결과가 답변 근거 크기 한도를 초과했습니다." if result["results"]
                       else "질문하신 정보를 찾을 수 없습니다.")
             return {"answer": answer, "sources": [], "index_version": result["index_version"],
-                    "search_counts": diagnostics}
+                    "search_counts": diagnostics, **({'page_scope': page_scope} if page_scope else {})}
         messages = []
         for item in request.history:
             content = item.content
@@ -252,7 +268,8 @@ class RagChat:
                 content = re.sub(r"\[(\d+)\]", lambda match, known=known: "" if int(match.group(1)) in known else match.group(0), content)
             if content.strip():
                 messages.append({"role": item.role, "content": content})
-        messages.append({"role": "user", "content": json.dumps({"질문": request.message, "근거_제한": counts, "검색된 문서": context}, ensure_ascii=False)})
+        messages.append({"role": "user", "content": json.dumps({"질문": request.message, "근거_제한": counts,
+                         "PDF_물리쪽_조회": page_scope, "검색된 문서": context}, ensure_ascii=False)})
         instructions = ("검색 근거를 바탕으로 사용자의 질문에 한국어로 친절하고 자연스러운 대화체로 안내하세요. "
                             "질문에 필요한 정보를 이해하기 쉽게 설명하고, 확인할 수 없는 내용은 정보를 찾을 수 없다고 알려주세요. "
                             "관련 근거가 있는 내용에는 해당 근거의 id를 [1]과 같은 인용 번호로 표시하세요. "
@@ -262,6 +279,9 @@ class RagChat:
                             "표 라벨 관계 정보가 추정이라고 표시하면 그 점을 고려하고, 정보가 없거나 생략된 사실만으로 관계가 틀렸다고 판단하지 마세요. 원문과 문맥을 함께 살펴 답변하세요. "
                             "근거 제한 정보에서 생략이나 문맥 제외가 있으면 이를 답변에 밝히고 전체 목록이나 완전한 집계라고 주장하지 마세요. "
                             "표의 분할내용이 모두 포함되지 않았다면 전체 내용을 확인했다고 주장하지 마세요. "
+                            "PDF 물리쪽 조회에서 검색 가능한 청크가 없거나 일부만 제공되면 그 쪽 전체에 정보가 없다고 단정하지 마세요. "
+                            "추출된 모든 청크를 보더라도 원문 페이지의 추출 완전성이 확인되지 않으면 원문에 정보가 없다고 단정하지 마세요. "
+                            "인쇄된 쪽 번호와 PDF 물리쪽 번호는 서로 다를 수 있으며 확인되지 않은 변환을 추측하지 마세요. "
                             "XLSX 전체 표를 조회하지 않은 경우에는 문서 전체의 개수, 분포, 날짜 범위를 확정하지 마세요. "
                             "XLSX의 시트 간 행 연결 후보는 추정이며 다른 행의 값을 합쳐 사실로 인용하지 마세요. "
                             "이미지의 위치나 같은 구역이라는 정보만으로 의미상 관계를 확정하지 마세요. "
@@ -291,4 +311,4 @@ class RagChat:
         answer = content
         answer = re.sub(r"\[(\d+)\]", lambda match: match.group(0) if 1 <= int(match.group(1)) <= len(sources) else "[근거 확인 불가]", answer)
         return {"answer": answer, "sources": sources, "index_version": result["index_version"],
-                "search_counts": diagnostics}
+                "search_counts": diagnostics, **({'page_scope': page_scope} if page_scope else {})}

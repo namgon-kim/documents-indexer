@@ -30,6 +30,7 @@ from indexer.parsing.contracts import ParserConfig
 from indexer.parsing.registry import build_registry
 from indexer.parsing.settings import parse_options
 from indexer.parsing.xlsx_analysis import StructureAnalyzer
+from indexer.pdf_pages import physical_pdf_pages
 from indexer.published_retrieval import PublishedRetrieval
 from indexer.reranker import CohereReranker
 from indexer.search_engine import MAX_RESULT_LIMIT, MAX_RETRIEVAL_TOP_N
@@ -654,15 +655,27 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
     def retrieve_new(request: Request, body: IngestionSearchRequest):
         if not hasattr(request.app.state, "index_publisher"):
             raise IndexerError("INDEX_NOT_READY", "검색 색인이 설정되지 않았습니다.", 503)
-        if not config.external_processing and (body.method != "bm25" or body.rerank):
+        pages = physical_pdf_pages(body.query)
+        if not config.external_processing and ((body.method != "bm25" and not pages) or body.rerank):
             raise IndexerError("EXTERNAL_PROCESSING_DISABLED", "외부 질의 처리가 비활성화되어 있습니다.", 403)
         if body.rerank and not rerank_available(request):
             raise IndexerError("RERANK_UNAVAILABLE", "재순위 서비스 설정을 확인해 주세요.", 503)
         retrieval = selected_retrieval(request, body.profile_id, body.index_version)
-        return retrieval.search(SearchRequest(
+        search_request = SearchRequest(
             query=body.query, method=body.method, top_k=body.limit, document_id=body.document_id,
             rerank=body.rerank, index_version=body.index_version,
-            **({"profile_id": body.profile_id} if body.profile_id else {})))
+            **({"profile_id": body.profile_id} if body.profile_id else {}))
+        return retrieval.search_pdf_pages(search_request, pages) if pages else retrieval.search(search_request)
+
+    @app.get('/v1/ingest/{document_id}/pdf-pages', dependencies=[Depends(auth.require)])
+    def pdf_pages(request: Request, document_id: UUID, pages: Annotated[list[int], Query(min_length=1, max_length=8)],
+                  query: Annotated[str, Query(min_length=1, max_length=2000)] = '내용',
+                  index_version: UUID | None = None, profile_id: str | None = None,
+                  limit: Annotated[int, Query(ge=1, le=MAX_RESULT_LIMIT)] = 5):
+        retrieval = selected_retrieval(request, profile_id, index_version)
+        body = SearchRequest(query=query, method='bm25', top_k=limit, document_id=document_id,
+                             index_version=index_version, profile_id=profile_id)
+        return retrieval.search_pdf_pages(body, list(dict.fromkeys(pages)))
 
     def selected_retrieval(request: Request, profile_id, version):
         service = getattr(request.app.state, 'ingestion', None)

@@ -684,3 +684,135 @@ def test_search_empty_table_uses_adjacent_caption_as_evidence(tmp_path):
                 assert context_url.endswith(f"/{table_id}")
                 assert client.get(context_url).json()["kind"] == "table"
         qdrant.close()
+
+
+def test_physical_pdf_pages_are_scoped_to_document_and_pinned_version(tmp_path):
+    import pytest
+    from indexer.chat import RagChat
+    from indexer.contracts import ChatRequest, IndexerError, SearchRequest
+    from indexer.pdf_pages import physical_pdf_pages
+    from indexer.published_retrieval import PublishedRetrieval
+
+    class Parser:
+        calls = 0
+
+        def parse(self, request):
+            self.calls += 1
+            rows = [{'page': 5, 'category': 'paragraph', 'content': {'text': '외부 환경과 학령인구 감소'}},
+                    {'page': 9, 'category': 'paragraph', 'content': {'text': '자율전공 추진 배경과 전공 선택'}},
+                    {'page': 8, 'category': 'paragraph', 'content': {'text': '다른 페이지 추진 배경'}}]
+            return ParseResult('fake', rows, {'elements': rows})
+
+    requests, embedding_calls = [], []
+    def provider(request):
+        body = json.loads(request.content)
+        if request.url.path.endswith('/chat/completions'):
+            requests.append(body)
+            return httpx.Response(200, json={'choices': [{'message': {'content': '확인한 내용입니다. [1]'}}]})
+        embedding_calls.append(body)
+        return httpx.Response(200, json={'model': body['model'], 'data': [
+            {'index': i, 'embedding': [1.0, 0.5]} for i in range(len(body['input']))]})
+
+    assert physical_pdf_pages('PDF 9쪽과 5쪽을 비교하고 본문 18쪽도 언급') == [9, 5]
+    assert physical_pdf_pages('인쇄된 PDF 9쪽과 2026년 예산') == []
+    source = tmp_path / 'report.pdf'
+    writer = PdfWriter()
+    for _ in range(9):
+        writer.add_blank_page(width=100, height=100)
+    with source.open('wb') as file:
+        writer.write(file)
+    with httpx.Client(transport=httpx.MockTransport(provider)) as http:
+        qdrant = QdrantClient(':memory:')
+        publisher = IndexPublisher(tmp_path, qdrant, EmbeddingClient(
+            http, 'https://example.test/v1', 'key', EmbeddingProfile('p', 'doc', 'query', 2)))
+        storage = ArtifactStore(tmp_path)
+        parser = Parser()
+        service = IngestionService(storage, parser, publisher)
+        first = service.ingest(source)
+        doc, version = first['document_id'], first['index_version']
+        retrieval = PublishedRetrieval(publisher, storage)
+        request = SearchRequest(query='추진 배경', method='bm25', document_id=doc, index_version=version, top_k=5)
+        calls_before_page_search = len(embedding_calls)
+        found = retrieval.search_pdf_pages(request, [9, 5])
+        assert len(embedding_calls) == calls_before_page_search
+        assert found['index_version'] == version and found['page_scope']['requested_pages'] == [9, 5]
+        assert {hit['page'] for hit in found['results']} == {9, 5}
+        assert all(hit['document_id'] == doc for hit in found['results'])
+        assert all(hit['evidence_urls'] for hit in found['results'])
+        missing = retrieval.search_pdf_pages(request, [7])
+        assert not missing['results'] and missing['page_scope']['pages_without_chunks'] == [7]
+        mixed = retrieval.search_pdf_pages(request, [9, 7])
+        assert mixed['page_scope']['pages_without_chunks'] == [7]
+        assert mixed['page_scope']['source_page_completeness'] == 'unknown'
+        rerank_calls = []
+
+        class Ranker:
+            def rerank(self, query, candidates, limit):
+                rerank_calls.append((query, len(candidates), limit))
+                return candidates[:limit]
+
+        publisher.reranker_factory = lambda _: Ranker()
+        reranked = retrieval.search_pdf_pages(request.model_copy(update={'rerank': True}), [9, 5])
+        assert reranked['reranked'] and len(rerank_calls) == 1
+        assert {hit['page'] for hit in reranked['results']} == {5, 9}
+        one = retrieval.search_pdf_pages(request.model_copy(update={'rerank': True, 'top_k': 1}), [9, 5])
+        assert len(one['results']) == 1 and rerank_calls[-1][2] == 2
+        assert one['search_counts']['reranked_count'] == 2 and one['search_counts']['result_limit'] == 1
+        publisher.reranker_factory = None
+        chat = RagChat(Config(tmp_path, external_processing=True, llm_api_key='key'), retrieval, http)
+        result = chat.invoke(ChatRequest(message='PDF 9쪽과 5쪽을 비교해 줘', method='bm25', document_id=doc,
+                                         index_version=version, top_k=5))
+        assert result['page_scope']['requested_pages'] == [9, 5]
+        payload = json.loads(requests[-1]['messages'][-1]['content'])
+        assert payload['PDF_물리쪽_조회']['requested_pages'] == [9, 5]
+        assert {ref['page'] for hit in result['sources'] for ref in hit['source_refs'] if ref['role'] == 'evidence'} == {5, 9}
+        config = Config(tmp_path, access_key='key', external_processing=True)
+        with TestClient(create_app(config, ingestion_service=service), base_url='https://testserver') as client:
+            login = client.post('/v1/auth/login', json={'access_key': 'key'}, headers={'Origin': 'https://testserver'})
+            client.headers.update({'Origin': 'https://testserver', 'X-CSRF-Token': login.json()['csrf_token']})
+            response = client.get(f'/v1/ingest/{doc}/pdf-pages', params=[('pages', 9), ('pages', 5),
+                                  ('query', '추진 배경'), ('index_version', version)])
+            assert response.status_code == 200, response.text
+            assert {hit['page'] for hit in response.json()['results']} == {5, 9}
+            response = client.post('/v1/retrieve', json={'query': 'PDF 9쪽과 5쪽의 배경', 'method': 'bm25',
+                                   'document_id': doc, 'index_version': version, 'limit': 5})
+            assert response.status_code == 200, response.text
+            assert response.json()['page_scope']['selection_method'] == 'bm25_within_pages'
+            assert {hit['page'] for hit in response.json()['results']} == {5, 9}
+        local_config = Config(tmp_path, access_key='key', external_processing=False)
+        with TestClient(create_app(local_config, ingestion_service=service), base_url='https://testserver') as client:
+            login = client.post('/v1/auth/login', json={'access_key': 'key'}, headers={'Origin': 'https://testserver'})
+            client.headers.update({'Origin': 'https://testserver', 'X-CSRF-Token': login.json()['csrf_token']})
+            response = client.post('/v1/retrieve', json={'query': 'PDF 9쪽', 'method': 'hybrid',
+                                   'document_id': doc, 'index_version': version})
+            assert response.status_code == 200, response.text
+            assert response.json()['method'] == 'pdf_page_bm25'
+        settings = storage.load_job(doc, first['job_id'], 'processing')['settings']
+        queued = service.enqueue_reprocess(doc, first['job_id'], 'rechunk', settings)
+        replay = service.run_job(doc, queued['job_id'])
+        assert replay['status'] == 'completed' and parser.calls == 1
+        assert retrieval.search_pdf_pages(request, [9, 5])['index_version'] == version
+        second_path = tmp_path / 'second.pdf'
+        writer.add_metadata({'/Title': '다른 문서'})
+        with second_path.open('wb') as file:
+            writer.write(file)
+        second = service.ingest(second_path)
+        assert second['document_id'] != doc
+        with pytest.raises(IndexerError, match='PDF 문서를 하나 선택'):
+            retrieval.search_pdf_pages(SearchRequest(query='배경', method='bm25'), [5])
+        with pytest.raises(IndexerError, match='검색 버전에 없습니다'):
+            retrieval.search_pdf_pages(SearchRequest(query='배경', method='bm25',
+                                       document_id=second['document_id'], index_version=version), [5])
+        old = retrieval.search_pdf_pages(request, [9, 5])
+        assert old['index_version'] == version and all(hit['document_id'] == doc for hit in old['results'])
+        qdrant.close()
+
+
+def test_pdf_page_references_do_not_assume_printed_page_numbers():
+    from indexer.pdf_pages import physical_pdf_pages
+
+    for query in ('PDF 9쪽', 'PDF의 9페이지', 'PDF 문서의 9쪽', 'PDF page 9', 'PDF p. 9', 'PDF 페이지 9'):
+        assert physical_pdf_pages(query) == [9]
+    assert physical_pdf_pages('PDF 9쪽과 5쪽 및 3페이지') == [9, 5, 3]
+    for query in ('본문 18쪽', '인쇄된 PDF 9쪽', '2026년 9월', 'PDF 문서 2026년'):
+        assert physical_pdf_pages(query) == []
