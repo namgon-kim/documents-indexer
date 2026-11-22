@@ -39,7 +39,7 @@ from indexer.xlsx_structure import confirmed
 
 TABLE_REPRESENTATION = "table-structure-v16"
 
-def normalize_elements(raw_elements: list[dict]) -> list[dict]:
+def normalize_elements(raw_elements: list[dict], *, source_format: str | None = None) -> list[dict]:
     elements = []
     headings: list[tuple[int, str, str]] = []
     for order, raw in enumerate(raw_elements):
@@ -96,7 +96,7 @@ def normalize_elements(raw_elements: list[dict]) -> list[dict]:
                             if raw.get("_provider") == "paddle_vl" else {}),
                          **({"heading_level": level, "heading_level_origin": raw.get('_heading_origin', 'parser')} if kind.startswith("heading") or heading else {})})
     # Preserve explicit multi-level parser output. Flat headings need conservative context.
-    promoted = promote_chapter_headers(elements)
+    promoted = promote_chapter_headers(elements) if source_format == 'pdf' else False
     if not any(item.get("heading_level", 1) > 1 or item.get('heading_level_explicit') for item in elements):
         apply_flat_hierarchy(elements)
     elif promoted:

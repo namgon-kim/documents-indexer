@@ -190,10 +190,11 @@ class PublishedRetrieval:
                                         'rerank_top_n': self.ranking.get('rerank_top_n', 5) if request.rerank else None,
                                         'retrieved_count': len(pool), 'rerank_input_count': len(pool) if request.rerank else 0,
                                         'reranked_count': reranked_count}}
-            return self._search(request, page_result=result)
+            return self._search(request, page_result=result,
+                                page_chunk_ids={item['chunk_id'] for item in chunks})
 
     @staticmethod
-    def _expand_table(results, indexed, limit=None):
+    def _expand_table(results, indexed, limit=None, *, allowed_pages=None):
         """Add bounded evidence from the same exact table, never an inferred continuation."""
         output = [dict(item) for item in results]
         seen = {item['chunk_id'] for item in output}
@@ -225,6 +226,8 @@ class PublishedRetrieval:
         budget = 9000
         added = 0
         for item in candidates:
+            if allowed_pages is not None and item.get('page') not in allowed_pages:
+                continue
             if limit is not None and len(output) >= limit:
                 break
             length = len(item.get('text', ''))
@@ -247,7 +250,7 @@ class PublishedRetrieval:
         with guard if guard is not None else nullcontext():
             return self._search(request)
 
-    def _search(self, request, *, page_result=None):
+    def _search(self, request, *, page_result=None, page_chunk_ids=None):
         try:
             result = page_result if page_result is not None else self.publisher.search(
                 request.query, request.method, request.top_k or MAX_RESULT_LIMIT,
@@ -261,7 +264,9 @@ class PublishedRetrieval:
             chunk_path = self.publisher.root / result["index_version"] / "chunks.json"
             indexed = {item["chunk_id"]: item for item in json.loads(chunk_path.read_text(encoding="utf-8"))}
             counts = result.get("search_counts")
-            pending = self._expand_table(result["results"], indexed)
+            scope = result.get('page_scope')
+            allowed_pages = set(scope['requested_pages']) if scope else None
+            pending = self._expand_table(result["results"], indexed, allowed_pages=allowed_pages)
             seen_chunks = {item['chunk_id'] for item in pending}
             expanded_visual_count, expanded_visual_chars = 0, 0
             for chunk in pending:
@@ -300,6 +305,7 @@ class PublishedRetrieval:
                         for link in source_elements.get(eid, {}).get('related_images', []):
                             image = source_elements.get(link.get('element_id'), {})
                             if (not image.get('asset_id') or image.get('element_id') in image_ids
+                                or (allowed_pages is not None and image.get('page') not in allowed_pages)
                                 or image.get('image_policy') == 'exclude'
                                 or (image.get('image_policy') == 'analyze' and link.get('type') != 'image_analysis')):
                                 continue
@@ -318,6 +324,7 @@ class PublishedRetrieval:
                                               and item.get('visual_id') == image.get('visual_id') and item.get('visual_id')}
                                 for candidate in indexed.values():
                                     if (candidate.get('document_id') != document_id or candidate.get('job_id') != job_id
+                                        or (allowed_pages is not None and candidate.get('page') not in allowed_pages)
                                         or candidate['chunk_id'] in seen_chunks or not visual_ids.intersection(candidate.get('element_ids', []))):
                                         continue
                                     length = len(candidate.get('text', ''))
@@ -430,6 +437,10 @@ class PublishedRetrieval:
                              "source_refs": refs, "evidence_urls": urls, "context_urls": context_urls})
             if counts is not None:
                 result["search_counts"] = {**counts, "ranked_count": len(result["results"]), "returned_count": len(hits)}
+            if scope is not None:
+                scope['selected_pages'] = sorted({hit['page'] for hit in hits})
+                scope['all_page_chunks_selected'] = (bool(page_chunk_ids) and not scope['pages_without_chunks']
+                                                     and page_chunk_ids <= {hit['chunk_id'] for hit in hits})
             return {**result, "results": hits}
         except ApiException as error:
             raise IndexerError("VECTOR_DB_UNAVAILABLE", "벡터 데이터베이스 연결 또는 설정을 확인해 주세요.", 503) from error

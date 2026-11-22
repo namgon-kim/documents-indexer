@@ -557,7 +557,7 @@ def test_saved_page_headers_reset_chapters_and_footers_do_not_index():
     rows = json.loads((Path(__file__).parent / 'fixtures' / 'poc_page_headings.json').read_text(encoding='utf8'))
     rows.insert(0, {'page': 1, 'category': 'heading1', 'content': {'text': 'I 대학 중장기 발전전략'}})
     original_rows = copy.deepcopy(rows)
-    elements = normalize_elements(rows)
+    elements = normalize_elements(rows, source_format='pdf')
     chunks = make_chunks('d', 'j', elements, 400, 0)
     assert rows == original_rows
     second = next(e for e in elements if e.get('provider_id') == 48)
@@ -578,7 +578,7 @@ def test_repeated_chapter_header_and_numeric_body_are_not_misclassified():
     rows.insert(1, {'category': 'heading2', 'page': 1, 'content': {'html': '<h2>세부 제목</h2>'}})
     rows.append({'category': 'heading2', 'page': 2, 'content': {'html': '<h2>다른 제목</h2>'}})
     rows.append({'category': 'paragraph', 'page': 2, 'content': {'text': '17'}})
-    elements = normalize_elements(rows)
+    elements = normalize_elements(rows, source_format='pdf')
     assert all(e['kind'] == 'header' for e in elements if e['text'] == 'II 보고서')
     assert all(e['heading_level'] == 2 and e['heading_level_origin'] == 'parser'
                for e in elements if e['kind'] == 'heading')
@@ -594,8 +594,21 @@ def test_promoted_chapter_and_mixed_explicit_heading_levels_coexist():
             {'page': 2, 'category': 'heading2', 'content': {'html': '<h2>명시적 세부 제목</h2>'}},
             {'page': 2, 'category': 'heading3', 'content': {'html': '<h3>명시적 하위 제목</h3>'}},
             {'page': 2, 'category': 'paragraph', 'content': {'text': '실제 본문'}}]
-    elements = normalize_elements(rows)
+    elements = normalize_elements(rows, source_format='pdf')
     assert elements[2]['heading_path'] == ['II 새 장', '1.4 실행 계획']
     assert elements[3]['heading_level'] == 2 and elements[3]['heading_level_origin'] == 'parser'
     assert elements[4]['heading_level'] == 3 and elements[4]['heading_level_origin'] == 'parser'
     assert elements[-1]['heading_path'] == ['II 새 장', '명시적 세부 제목', '명시적 하위 제목']
+
+
+def test_chapter_header_promotion_requires_pdf_source():
+    coords = [{'x': 0.1, 'y': 0.02}, {'x': 0.4, 'y': 0.05}]
+    rows = [{'page': 1, 'category': 'heading1', 'content': {'text': 'I 이전 장'}},
+            {'page': 2, 'category': 'header', 'coordinates': coords, 'content': {'text': 'II 새 장'}},
+            {'page': 2, 'category': 'heading2', 'content': {'text': '세부 제목'}},
+            {'page': 2, 'category': 'paragraph', 'content': {'text': '본문'}}]
+    assert normalize_elements(rows, source_format='pdf')[1]['kind'] == 'heading'
+    for source_format in (None, 'docx', 'pptx', 'hwpx'):
+        elements = normalize_elements(rows, source_format=source_format)
+        assert elements[1]['kind'] == 'header'
+        assert elements[-1]['heading_path'] == ['I 이전 장', '세부 제목']

@@ -270,7 +270,7 @@ def make_graph(parser: Parser, on_parsed=None, on_represented=None, on_quality=N
         return {"elements": report["elements"], "coverage": coverage}
 
     def represent(state: ProcessingState):
-        elements = normalize_elements(state["elements"])
+        elements = normalize_elements(state["elements"], source_format=Path(state["path"]).suffix.lower().lstrip('.'))
         from indexer.office_locations import apply_source_locations
         from indexer.visual_relations import apply_visual_relations, preserve_visual_relations
         apply_source_locations(elements, state["elements"], state.get("office_details", {}))
