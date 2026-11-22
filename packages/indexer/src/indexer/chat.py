@@ -28,6 +28,9 @@ def _chat_evidence(hits, limit, budget=32768):
                 "XLSX_출처": [ref for ref in refs if ref.get("kind") in {"xlsx_cell", "xlsx_range"}][:8],
                 "XLSX_행_연결_후보": hit.get("xlsx_row_relations", [])[:10],
                 "XLSX_전체_표_조회": False if hit.get("xlsx_sheet") else None}
+        if hit.get('element_scopes'):
+            # Reserve a compact per-evidence status without exceeding the byte budget.
+            item['원본_요소_색인_조각_전체_포함'] = False
         if hit.get('table_segments'):
             # Reserve only a small marker until all ranked evidence is fitted.
             item['표_라벨_관계'] = None
@@ -290,6 +293,17 @@ class RagChat:
         sources, context, counts = _chat_evidence(result["results"], MAX_RESULT_LIMIT + 5, self.config.chat_evidence_bytes)
         diagnostics = {**result.get("search_counts", {}), **counts}
         coverage = _coverage(result["results"], sources, result.get("method", "ranked_search"))
+        # The status belongs to each model evidence item, not only to API sources.
+        for source, item in zip(sources, context, strict=True):
+            scopes = source.get('model_element_scopes', [])
+            if scopes:
+                item['원본_요소_색인_조각_전체_포함'] = all(
+                    scope['all_indexed_chunks_in_model'] for scope in scopes)
+                item['원본_요소_범위'] = scopes
+                if byte_size(json.dumps(context, ensure_ascii=False)) > self.config.chat_evidence_bytes:
+                    del item['원본_요소_범위']
+        counts['evidence_bytes'] = byte_size(json.dumps(context, ensure_ascii=False))
+        diagnostics['evidence_bytes'] = counts['evidence_bytes']
         page_scope = dict(result['page_scope']) if result.get('page_scope') else None
         if page_scope is not None:
             page_scope['pages_in_model_context'] = sorted({ref['page'] for source in sources
@@ -326,6 +340,7 @@ class RagChat:
                             "각 항목의 text를 인용 근거로 쓰고 context는 해석용 문맥으로만 사용하세요. "
                             "표 라벨 관계 정보가 추정이라고 표시하면 그 점을 고려하고, 정보가 없거나 생략된 사실만으로 관계가 틀렸다고 판단하지 마세요. 원문과 문맥을 함께 살펴 답변하세요. "
                             "근거 제한 정보에서 생략이나 문맥 제외가 있으면 이를 답변에 밝히고 전체 목록이나 완전한 집계라고 주장하지 마세요. "
+                            "각 근거의 원본 요소 조각 포함 상태가 false면 해당 근거의 원본 요소는 일부만 전달되었습니다. "
                             "검색된 원본 요소의 색인 조각을 모두 보았더라도 질문 대상 표, 목록, 여러 페이지나 문서 전체의 완전성을 뜻하지 않습니다. "
                             "조회 범위가 확정되지 않은 전체 개수, 목록, 합계나 분포는 전체 결과라고 단정하지 말고 확인된 부분과 미확인 범위를 구별하세요. "
                             "표의 분할내용이 모두 포함되지 않았다면 전체 내용을 확인했다고 주장하지 마세요. "

@@ -252,6 +252,47 @@ class PublishedRetrieval:
                 item['table_expansion_complete'] = all(candidate['chunk_id'] in seen for candidate in grouped[key])
         return output
 
+    @staticmethod
+    def _expand_text_elements(results, indexed, *, allowed_pages=None):
+        """Expand exact single-element text fragments, retaining ranked hits and page scope."""
+        output = list(results)
+        seen = {item['chunk_id'] for item in output}
+        anchors = {}
+        for item in output:
+            ids = item.get('element_ids', [])
+            if item.get('kind') == 'text' and len(ids) == 1 and item.get('document_id') and item.get('job_id'):
+                anchors.setdefault((item['document_id'], item['job_id'], ids[0]), item)
+        queues = {key: [] for key in anchors}
+        for item in indexed.values():
+            ids = item.get('element_ids', [])
+            if item.get('kind') != 'text' or len(ids) != 1 or item['chunk_id'] in seen:
+                continue
+            key = (item.get('document_id'), item.get('job_id'), ids[0])
+            if key in queues and (allowed_pages is None or item.get('page') in allowed_pages):
+                queues[key].append(item)
+        for key, items in queues.items():
+            anchor = anchors[key]
+            items.sort(key=lambda item: (abs(item.get('part_number', 0) - anchor.get('part_number', 0)),
+                                         item.get('part_number', 0), item['chunk_id']))
+            queues[key] = deque(items)
+        added, budget = 0, 9000
+        while added < 3 and any(queues.values()):
+            for key, items in queues.items():
+                while items:
+                    candidate = items.popleft()
+                    length = len(candidate.get('text', ''))
+                    if not length or length > budget:
+                        continue
+                    output.append({**candidate, 'expanded_from': anchors[key]['chunk_id'],
+                                   'expansion_reason': 'same_source_element'})
+                    seen.add(candidate['chunk_id'])
+                    budget -= length
+                    added += 1
+                    break
+                if added >= 3:
+                    break
+        return output
+
     def search(self, request):
         guard = getattr(self.publisher, "search_lock", None)
         with guard if guard is not None else nullcontext():
@@ -274,6 +315,7 @@ class PublishedRetrieval:
             scope = result.get('page_scope')
             allowed_pages = set(scope['requested_pages']) if scope else None
             pending = self._expand_table(result["results"], indexed, allowed_pages=allowed_pages)
+            pending = self._expand_text_elements(pending, indexed, allowed_pages=allowed_pages)
             seen_chunks = {item['chunk_id'] for item in pending}
             expanded_visual_count, expanded_visual_chars = 0, 0
             for chunk in pending:

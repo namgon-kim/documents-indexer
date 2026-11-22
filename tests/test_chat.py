@@ -264,3 +264,42 @@ def test_unrelated_budget_omission_does_not_mark_complete_table_partial():
     assert context[0]['표의_분할내용_모두_포함'] is True
     assert sources[0]['model_element_scopes'][0]['all_indexed_chunks_in_model']
     assert coverage['scope_complete'] is None
+
+
+def test_model_evidence_identifies_each_partial_source_within_budget(tmp_path):
+    scopes = [{'element_id': 'complete', 'indexed_chunks': 1},
+              {'element_id': 'partial', 'indexed_chunks': 2}]
+    hits = [{'chunk_id': str(i), 'document_id': 'd', 'job_id': 'j', 'element_ids': [scope['element_id']],
+             'element_scopes': [scope], 'filename': 'doc', 'source_refs': [], 'search_text': f'목록 {i}'}
+            for i, scope in enumerate(scopes)]
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': hits})
+    def provider(request):
+        content = json.loads(json.loads(request.content)['messages'][-1]['content'])
+        items = content['검색된 문서']
+        assert items[0]['원본_요소_색인_조각_전체_포함'] is True
+        assert items[1]['원본_요소_색인_조각_전체_포함'] is False
+        assert items[1]['원본_요소_범위'][0]['indexed_chunks'] == 2
+        return httpx.Response(200, json={'choices': [{'message': {'content': '일부 근거 [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake', chat_evidence_bytes=4096),
+                         retrieval, client).invoke(ChatRequest(message='목록을 설명해 줘'))
+    assert result['search_counts']['evidence_bytes'] <= 4096
+    assert result['coverage']['partial_element_count'] == 1
+
+
+def test_model_scope_markers_remain_within_tight_evidence_budget(tmp_path):
+    scopes = [{'element_id': f'e{i}', 'indexed_chunks': 2} for i in range(3)]
+    hits = [{'chunk_id': str(i), 'document_id': 'd', 'job_id': 'j', 'element_ids': [scope['element_id']],
+             'element_scopes': [scope], 'filename': 'doc', 'source_refs': [], 'search_text': '가' * 800}
+            for i, scope in enumerate(scopes)]
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': hits})
+    def provider(request):
+        payload = json.loads(json.loads(request.content)['messages'][-1]['content'])
+        items = payload['검색된 문서']
+        assert items and all(item['원본_요소_색인_조각_전체_포함'] is False for item in items)
+        assert len(json.dumps(items, ensure_ascii=False).encode('utf-8')) <= 4096
+        return httpx.Response(200, json={'choices': [{'message': {'content': '일부 [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake', chat_evidence_bytes=4096),
+                         retrieval, client).invoke(ChatRequest(message='정리'))
+    assert result['search_counts']['evidence_bytes'] <= 4096
