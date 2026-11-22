@@ -496,7 +496,8 @@ def _join_key(value, kind, expected):
 
 
 def _mapped_key_groups(table, columns):
-    groups = defaultdict(list)
+    """Group certain data rows by key; possible totals rows are kept apart with their keys."""
+    groups, uncertain = defaultdict(list), []
     rejected = Counter()
     for row in sorted(table.populated - table.hidden):
         values = []
@@ -504,13 +505,17 @@ def _mapped_key_groups(table, columns):
             value, kind, issue = table.raw_cell(row, column)
             converted = _join_key(value, kind, expected) if issue is None and value is not None else None
             if converted is None:
-                rejected[issue or ('blank_key' if value is None or (kind == 'string' and not value.strip())
-                                   else 'key_type_mismatch')] += 1
+                if row not in table.uncertain_rows:
+                    rejected[issue or ('blank_key' if value is None or (kind == 'string' and not value.strip())
+                                       else 'key_type_mismatch')] += 1
+                values = None
                 break
             values.append(converted)
-        else:
+        if row in table.uncertain_rows:
+            uncertain.append((row, tuple(values) if values is not None else None))
+        elif values is not None:
             groups[tuple(values)].append(row)
-    return groups, dict(rejected)
+    return groups, dict(rejected), uncertain
 
 
 def mapped_rows(left, right, join):
@@ -518,20 +523,31 @@ def mapped_rows(left, right, join):
         raise ValueError('서로 다른 시트의 표 두 개를 지정해 주세요')
     left_columns = [(left.column(key.left), key.type) for key in join.keys]
     right_columns = [(right.column(key.right), key.type) for key in join.keys]
-    lhs, left_issues = _mapped_key_groups(left, left_columns)
-    rhs, right_issues = _mapped_key_groups(right, right_columns)
-    for groups, required, label in ((lhs, join.cardinality != 'many_to_one', '왼쪽'),
-                                     (rhs, join.cardinality != 'one_to_many', '오른쪽')):
+    lhs, left_issues, left_uncertain = _mapped_key_groups(left, left_columns)
+    rhs, right_issues, right_uncertain = _mapped_key_groups(right, right_columns)
+    conflicts = {}
+    for side, groups, uncertain, required, label in (
+            ('left', lhs, left_uncertain, join.cardinality != 'many_to_one', '왼쪽'),
+            ('right', rhs, right_uncertain, join.cardinality != 'one_to_many', '오른쪽')):
         duplicates = sum(len(rows) > 1 for rows in groups.values())
         if required and duplicates:
             raise ValueError(f'{label} 표의 고유 키가 중복됩니다 ({duplicates}개 키). 열 매핑과 관계 유형을 확인해 주세요')
+        # A possible totals row never joins. When its key would break uniqueness,
+        # report that the conflict comes from the unclear totals row.
+        keys = Counter(key for _, key in uncertain if key is not None)
+        conflicts[side] = sum(1 for _, key in uncertain if required and key is not None
+                              and (key in groups or keys[key] > 1))
     pairs = sorted((a, b) for key in lhs.keys() & rhs.keys() for a in lhs[key] for b in rhs[key])
+    left_out = {row for row, _ in left_uncertain}
+    right_out = {row for row, _ in right_uncertain}
     details = {'right_scope': right.scope, 'approval': 'column_mapping', 'cardinality': join.cardinality,
                'keys': [key.model_dump() for key in join.keys], 'candidate_pairs': len(pairs),
                'ambiguous_pairs': 0, 'unapproved_pairs': 0, 'joined_rows': len(pairs), 'matched_pairs': [],
                'left_key_issues': left_issues, 'right_key_issues': right_issues,
-               'unmatched_left_rows': len(left.populated - left.hidden - {a for a, _ in pairs}),
-               'unmatched_right_rows': len(right.populated - right.hidden - {b for _, b in pairs})}
+               'uncertain_totals_rows': {'left': sorted(left_out), 'right': sorted(right_out)},
+               'uncertain_key_conflicts': conflicts,
+               'unmatched_left_rows': len(left.populated - left.hidden - left_out - {a for a, _ in pairs}),
+               'unmatched_right_rows': len(right.populated - right.hidden - right_out - {b for _, b in pairs})}
     return pairs, details
 
 
@@ -745,6 +761,11 @@ def execute(raw, plan):
         issues['duplicated_join_values'] += duplicated
     for table in tables.values():
         issues.update(table.notes)
+    if join_details:
+        # Possible totals rows were kept out of the column-mapped join.
+        for rows in (join_details.get('uncertain_totals_rows') or {}).values():
+            if rows:
+                issues['totals_row_uncertain'] += len(rows)
     result = {'matched_rows': matched, 'aggregate_unit': resolved}
     if plan.operation == 'distribution':
         buckets = distribution.most_common(plan.limit)

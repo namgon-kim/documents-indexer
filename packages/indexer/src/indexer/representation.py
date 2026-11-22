@@ -180,7 +180,10 @@ def compose_row_labels(parts, max_bytes=MAX_INPUT_BYTES):
 
 def table_groups(context, parts, target, max_bytes=MAX_INPUT_BYTES):
     def fits(group):
-        text = render_embedding(context, group)
+        # Measure the labels as they will be written: a row's group context once
+        # per candidate chunk. A cell piece is sized with the full label because it
+        # may start a chunk.
+        text = render_embedding(context, compose_row_labels(group, max_bytes))
         return len(text) <= target and byte_size(text) <= max_bytes
 
     pending = []

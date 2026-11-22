@@ -214,6 +214,26 @@ def test_layered_headers_are_inferred_from_merges_and_rejected_when_columns_shar
                                                      'excluded': {}}), 'user')
 
 
+def test_a_long_group_context_is_counted_once_when_sizing_chunks(tmp_path):
+    path = tmp_path / 'long-group.xlsx'
+    group = '영업본부' * 20
+    book = Workbook()
+    sheet = book.active
+    sheet.append(['지역', *(f'Q{index}' for index in range(1, 9))])
+    sheet.append([group, *range(10, 18)])
+    sheet.append([None, *range(20, 28)])
+    sheet.merge_cells('A2:A3')
+    book.save(path)
+    chunks = [c for c in native(path)['chunks'] if any(s['row'] == 3 for s in c.get('table_segments', []))]
+    # Eight copies of the context would exceed the 400-character target; one copy fits.
+    assert len(chunks) == 1
+    segments = chunks[0]['table_segments']
+    assert [s['address'] for s in segments] == [f'{column}3' for column in 'BCDEFGHI']
+    assert segments[0]['label'] == f'지역 {group} / Q1'
+    assert [s['label'] for s in segments[1:]] == [f'Q{index}' for index in range(2, 9)]
+    assert chunks[0]['text'].count(group) == 1
+
+
 # X5 — display values
 
 
@@ -341,6 +361,40 @@ def test_join_aggregates_do_not_repeat_source_rows_silently(tmp_path):
     assert ambiguous['issues'] == {'multiple_join_values': 1}
     with pytest.raises(ValueError):
         execute(raw, QueryPlan(sheet='Departments', start='A1', operation='count', aggregate_unit='pairs'))
+
+
+def test_a_possible_totals_row_does_not_break_join_uniqueness_silently(tmp_path):
+    path = tmp_path / 'legacy-join.xlsx'
+    book = Workbook()
+    departments = book.active
+    departments.title = 'Departments'
+    departments.append(['부서', '예산'])
+    for row in [('D1', 100), ('D2', 200), ('D1', 300)]:
+        departments.append(row)
+    departments.add_table(Table(displayName='Departments', ref='A1:B4'))
+    employees = book.create_sheet('Employees')
+    employees.append(['부서', '이름'])
+    for row in [('D1', '가'), ('D1', '나'), ('D2', '다')]:
+        employees.append(row)
+    employees.add_table(Table(displayName='Employees', ref='A1:B4'))
+    book.save(path)
+    raw = native(path)['parser_result']
+    plan = PublishedTableQuery.model_validate({
+        'document_id': DOCUMENT, 'index_version': VERSION, 'sheet': 'Departments', 'start': 'A1', 'operation': 'count',
+        'join': {'sheet': 'Employees', 'start': 'A1', 'cardinality': 'one_to_many',
+                 'keys': [{'left': 'A', 'right': 'A', 'type': 'text'}]}})
+    # A duplicate key among certain rows is still rejected.
+    with pytest.raises(ValueError, match='고유 키가 중복'):
+        execute(raw, plan)
+    region_data = raw['xlsx_sheets'][0]['regions'][0]
+    region_data['totals_rows'] = 1
+    region_data.pop('totals_rows_basis')
+    result = execute(raw, plan)
+    assert result['join']['uncertain_totals_rows'] == {'left': [4], 'right': []}
+    assert result['join']['uncertain_key_conflicts'] == {'left': 1, 'right': 0}
+    assert result['join']['unmatched_left_rows'] == 0
+    assert result['result']['matched_rows'] == 3
+    assert result['issues'] == {'totals_row_uncertain': 1} and not result['complete']
 
 
 # X9-3 — totals rows
