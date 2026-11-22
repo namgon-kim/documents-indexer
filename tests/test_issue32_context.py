@@ -12,6 +12,7 @@ from indexer.search_engine import SearchHit, SearchService
 
 
 @pytest.mark.parametrize('question', [
+    '2025년 PoC에서는 민원정보 10,000건과 공공서비스정보 6,000건을 구축했습니다. 이 수치가 맞나요?',
     '업무 시스템의 접수 데이터는 30건이고 처리 데이터는 70건입니다. 이 수치의 차이는 무엇인가요?',
     '교육 시스템의 연간 예산은 100만원입니다. 그 금액은 어떻게 사용하나요?',
     '초록 서비스의 요금과 파랑 서비스의 요금을 비교하고 이 서비스의 장점을 알려줘',
@@ -22,6 +23,7 @@ def test_questions_with_a_local_referent_do_not_reuse_old_topics(question):
 
 @pytest.mark.parametrize('question', [
     '그 서비스는?', '두 번째는?', '앞의 것과 비교해줘', '가격 말고 그 서비스의 기능은?',
+    '그 서비스는 어떤 기능을 제공해?', '앞서 설명한 내용과 비교해줘',
     '2025년 새 정책에 적용된 그 서비스의 가격은?', '이전에 설명한 시스템은 어떤 장점이 있나요?',
     '2025년 새 정책에 적용된 그 결과는 무엇인가요?',
     '2025년 4분기 정책에 적용된 그 결과는 무엇인가요?',
@@ -171,3 +173,40 @@ def test_explicit_reported_target_stays_first_through_hybrid_and_reranking(tmp_p
     assert result['results'][0]['chunk_id'] == 'target'
     assert queries == [question, question]
     assert trace['stages']['reranked'][0]['chunk_id'] == 'target'
+
+
+@pytest.mark.parametrize('question', [
+    'A와 B의 차이는 5입니다. 이 차이 때문에 발생한 변화는 무엇인가요?',
+    '두 항목의 차이는 5입니다. 이 차이는 무엇을 의미하나요?',
+    '계획의 결과가 명확합니다. 그 결과 때문에 어떤 변화가 생겼나요?',
+    '지원 제도의 혜택이 충분합니다. 그 혜택은 무엇인가요?',
+    '평가 자료는 별도로 저장됩니다. 해당 자료를 확인해 주세요.',
+])
+def test_full_noun_or_particle_form_resolves_without_history(tmp_path, question):
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'index_version': 'v', 'results': []})
+    history = [ChatMessage(role='user', content='무관한 교통 경로')]
+    with capture_trace() as trace:
+        RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message=question, history=history, method='bm25'))
+    assert seen[0].query == question
+    assert trace['stages']['retrieval_query']['reference_states'] == ['local']
+
+
+def test_independent_question_does_not_require_noun_matching(tmp_path):
+    question = '첫째 차이점이 중요합니다. 이 차이는 어떤 의미인가요?'
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'index_version': 'v', 'results': []})
+    history = [ChatMessage(role='user', content='앞서 비교한 두 상품')]
+    with capture_trace() as trace:
+        RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message=question, history=history, method='bm25'))
+    assert seen[0].query == question
+    assert trace['stages']['retrieval_query']['reference_states'] == ['local']
+
+
+def test_particle_suffix_on_a_single_syllable_noun_does_not_override_context(tmp_path):
+    question = '앞에서 정한 색상이 중요합니다. 그 색은 무엇인가요?'
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'index_version': 'v', 'results': []})
+    history = [ChatMessage(role='user', content='이전에 정한 색')]
+    RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message=question, history=history, method='bm25'))
+    assert '이전에 정한 색' in seen[0].query

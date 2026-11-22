@@ -41,6 +41,7 @@ class ServerSettings(BaseModel):
     retrieval_top_n: int = Field(ge=1, le=MAX_RETRIEVAL_TOP_N)
     rerank_top_n: int = Field(ge=1, le=MAX_RESULT_LIMIT)
     chat_evidence_bytes: int = Field(ge=4096, le=262144)
+    chat_query_rewrite_enabled: bool
     reranker_provider: str
     reranker_base_url: str
     reranker_api_key: str = Field(max_length=4096)

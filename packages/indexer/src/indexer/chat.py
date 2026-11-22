@@ -11,6 +11,7 @@ from indexer.citations import citation_numbers, render_citations, sanitize_histo
 from indexer.contracts import IndexerError, SearchRequest
 from indexer.embedding_input import byte_size, context_prefix, embedding_text
 from indexer.pdf_pages import physical_pdf_pages
+from indexer.query_rewrite import rewrite_query
 from indexer.search_engine import MAX_RESULT_LIMIT
 from indexer.xlsx_query import NUMERIC, QueryPlan
 
@@ -222,51 +223,44 @@ _CONTEXT_REFERENCE = re.compile(
     # A determiner must be a separate word: 이스트, 그린, 저축 and 이익
     # are not references merely because they start with a demonstrative.
     r'(?:해당|그|이|저)\s+[가-힣A-Za-z]+(?=$|[^가-힣A-Za-z])|(?:첫|두|세|네)\s*번째|\b(?:it|they|them|those|these|previous|former|latter)\b)', re.IGNORECASE)
-_LOCAL_CLAUSE = re.compile(r'\d|(?:은|는|이|가|을|를|의|에서)(?=\s|[,.:;])|\b(?:is|are|was|were|has|have)\b', re.IGNORECASE)
-_NUMERIC_REFERENCE = frozenset({'수치', '값', '숫자', '비율', '금액', '인원', '건수', '합계'})
-_MEASURED_VALUE = re.compile(r'\d[\d,.]*\s*(?:%|명|건|개|원|회|억|만|배|점|시간|분|초|대|곳|항목)')
+# These signals identify whether the question itself supplies enough context;
+# they do not try to resolve Korean nouns or strip grammatical particles.
+_MEASURED_VALUE = re.compile(r'\d[\d,.]*\s*(?:%|명|건|개|원|회|억|만|배|점|시간|분(?!기)|초|대|곳|항목)')
 _COMPLETED_STATEMENT = re.compile(r'[.。!]\s*$')
 _PRIOR_CONVERSATION = re.compile(r'(?:다고|라고|라며|이라며)\s*(?:했|말씀|말했|설명했|전했|들었|알려)')
 _SUBJECT = re.compile(r'(?<![가-힣A-Za-z0-9])[가-힣A-Za-z0-9]+(?:은|는|이|가)(?=\s)')
 _TEMPORAL_WORD = re.compile(r'^(?:(?:작년|올해|내년|당시|이전|최근|현재|지난)(?:의|에|에는)?|\d+(?:년|월|일|분기)(?:의|에|에는|부터|까지)?)$')
+_COMPARISON_CLAUSE = re.compile(r'(?:비교|대조)(?:하고|하여|한|한 뒤|해서)\s*$')
 
 
-def _local_reference(question, match):
-    """Recognize a reference with a substantive antecedent in this question.
-
-    Keep ambiguous references contextual: a short preface such as '가격 말고'
-    does not establish what '그 서비스' denotes.
-    """
+def _reference_state(question, match):
+    """Assess the supplied context, retaining uncertainty and explicit callbacks."""
+    reference = match.group().strip()
+    if re.match(r'^(?:앞|이전|방금|위|같은|(?:첫|두|세|네)\s*번째|previous|former|latter)',
+                reference, flags=re.IGNORECASE):
+        return 'external'
     prefix = question[:match.start()].strip()
     words = re.findall(r'[가-힣A-Za-z0-9]+', prefix)
-    if not _LOCAL_CLAUSE.search(prefix):
-        return 'external'
-    reference = match.group().strip()
-    if nominal := re.fullmatch(r'(?:해당|그|이|저)\s+([가-힣A-Za-z]+)', reference):
-        name = re.sub(r'(?:에서|으로|은|는|이|가|의|을|를|에|와|과|도|만)$', '', nominal.group(1))
-        occurrences = len(re.findall(re.escape(name), prefix)) if len(name) >= 2 else 0
-        if occurrences > 1:
-            return 'ambiguous'
-        if occurrences == 1:
-            return 'local'
-        return 'local' if len(words) >= 3 and _MEASURED_VALUE.search(prefix) and name in _NUMERIC_REFERENCE else 'external'
-    if reference in {'이것', '그것', '이거', '그거'}:
-        subjects = list(_SUBJECT.finditer(prefix))
-        if len(subjects) > 1:
-            return 'ambiguous'
-        if len(subjects) == 1 and len(words) >= 2 and _COMPLETED_STATEMENT.search(prefix):
-            if _PRIOR_CONVERSATION.search(prefix):
-                subject_text = prefix[:subjects[0].end()].rsplit('.', 1)[-1]
-                subject_words = [word for word in re.findall(r'[가-힣A-Za-z0-9]+', subject_text)
-                                 if not _TEMPORAL_WORD.fullmatch(word)]
-                if len(subject_words) < 2:
-                    return 'external'
-            return 'local'
+    subjects = list(_SUBJECT.finditer(prefix))
+    if _PRIOR_CONVERSATION.search(prefix):
+        if len(subjects) != 1:
+            return 'external'
+        subject_text = prefix[:subjects[0].end()].rsplit('.', 1)[-1]
+        subject_words = [word for word in re.findall(r'[가-힣A-Za-z0-9]+', subject_text)
+                         if not _TEMPORAL_WORD.fullmatch(word)]
+        if len(subject_words) < 2:
+            return 'external'
+    if _COMPLETED_STATEMENT.search(prefix) and len(words) >= 2 and subjects:
+        return 'ambiguous' if len(subjects) > 1 and re.search(r'(?:이고|이며|반면|각각)', prefix) else 'local'
+    if len(words) >= 3 and _MEASURED_VALUE.search(prefix):
+        return 'local'
+    if len(words) >= 4 and _COMPARISON_CLAUSE.search(prefix):
+        return 'ambiguous'
     return 'external'
 
 
 def _reference_states(question):
-    return [_local_reference(question, match) for match in _CONTEXT_REFERENCE.finditer(question)]
+    return [_reference_state(question, match) for match in _CONTEXT_REFERENCE.finditer(question)]
 
 
 def _needs_retrieval_context(question):
@@ -427,30 +421,40 @@ class RagChat:
         limit = getattr(profile, "max_input_bytes", self.config.embedding_max_input_bytes)
         if not lexical_only and byte_size(question) > limit:
             raise IndexerError("QUERY_TOO_LONG", "현재 질문이 임베딩 입력 제한을 넘었습니다. 질문을 줄여 주세요.", 422)
-        needs_context = _needs_retrieval_context(question)
+        rewrite_enabled = getattr(self.config, 'chat_query_rewrite_enabled', False)
+        rewrite_status = 'disabled'
+        needs_context = _needs_retrieval_context(question) if not rewrite_enabled else False
         previous = _retrieval_history(request.history, question) if needs_context else []
+        history_selected_count = len(previous)
         query = question
         history_used_count = 0
-        for item in reversed(previous):
-            chars = 2000 - len(query) - 1
-            budget = limit - byte_size(query) - 1 if not lexical_only else 8000
-            if chars <= 0 or budget <= 0:
-                break
-            if len(item) > chars:
-                if chars < 5:
-                    item = item[:chars]
-                else:
-                    keep = (chars - 3) // 2
-                    item = item[:keep] + ' … ' + item[-keep:]
-            prefix = context_prefix(item, budget).strip()
-            if prefix:
-                query = prefix + "\n" + query
-                history_used_count += 1
+        if rewrite_enabled:
+            query, rewrite_status, history_selected_count = rewrite_query(
+                self.config, self.client, request, question, 8000 if lexical_only else limit)
+            needs_context = rewrite_status == 'rewritten'
+            history_used_count = None if query != question else 0
+        else:
+            for item in reversed(previous):
+                chars = 2000 - len(query) - 1
+                budget = limit - byte_size(query) - 1 if not lexical_only else 8000
+                if chars <= 0 or budget <= 0:
+                    break
+                if len(item) > chars:
+                    if chars < 5:
+                        item = item[:chars]
+                    else:
+                        keep = (chars - 3) // 2
+                        item = item[:keep] + ' … ' + item[-keep:]
+                prefix = context_prefix(item, budget).strip()
+                if prefix:
+                    query = prefix + "\n" + query
+                    history_used_count += 1
         diagnostics.record('retrieval_query', {
-            'history_messages_available': len(request.history), 'history_items_selected': len(previous),
+            'history_messages_available': len(request.history), 'history_items_selected': history_selected_count,
             'history_items_used': history_used_count,
             'history_used': query != question, 'context_dependency_detected': needs_context,
-            'reference_states': _reference_states(question),
+            'reference_states': _reference_states(question) if not rewrite_enabled else [],
+            'rewrite_status': rewrite_status,
             'question_bytes': byte_size(question), 'query_bytes': byte_size(query),
         })
         search_request = SearchRequest(query=query, document_id=request.document_id,
@@ -459,6 +463,9 @@ class RagChat:
                                        **({"profile_id": request.profile_id} if request.profile_id else {}))
         result = (self.retrieval.search_pdf_pages(search_request, pages) if pages
                   else self.retrieval.search(search_request))
+        if rewrite_enabled:
+            result = {**result, 'search_counts': {**result.get('search_counts', {}),
+                                                  'query_rewrite_status': rewrite_status}}
         return request, result
 
     def answer(self, inputs):
