@@ -15,7 +15,7 @@ from indexer.config import Config, qdrant_http_url
 from indexer.contracts import ProcessingSettings
 from indexer.parsing.registry import provider_names
 from indexer.parsing.settings import parse_options
-from indexer.search_engine import MAX_RETRIEVAL_TOP_N
+from indexer.search_engine import MAX_RESULT_LIMIT, MAX_RETRIEVAL_TOP_N
 
 RERANKER_PROVIDERS = ("disabled", "cohere")
 
@@ -39,7 +39,8 @@ class ServerSettings(BaseModel):
     embedding_max_input_bytes: int = Field(ge=256, le=1000000)
     embedding_batch_size: int = Field(ge=1, le=512)
     retrieval_top_n: int = Field(ge=1, le=MAX_RETRIEVAL_TOP_N)
-    rerank_top_n: int = Field(ge=1, le=MAX_RETRIEVAL_TOP_N)
+    rerank_top_n: int = Field(ge=1, le=MAX_RESULT_LIMIT)
+    chat_evidence_bytes: int = Field(ge=4096, le=262144)
     reranker_provider: str
     reranker_base_url: str
     reranker_api_key: str = Field(max_length=4096)

@@ -1000,7 +1000,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                 if violation["loc"] == ("retrieval_top_n",):
                     raise IndexerError("INVALID_SETTINGS", f"검색 후보 수는 1~{MAX_RETRIEVAL_TOP_N} 사이의 정수여야 합니다.") from error
                 if violation["loc"] == ("rerank_top_n",):
-                    raise IndexerError("INVALID_SETTINGS", "리랭킹 결과 수는 1 이상의 정수이며 검색 후보 수 이하여야 합니다.") from error
+                    raise IndexerError("INVALID_SETTINGS", "리랭킹 결과 수는 1~20 사이의 정수이며 검색 후보 수 이하여야 합니다.") from error
             raise IndexerError("INVALID_SETTINGS", "설정 값을 확인해 주세요.", 422) from error
         except (ValueError, TypeError) as error:
             raise IndexerError("INVALID_SETTINGS", "설정 값을 확인해 주세요.", 422) from error

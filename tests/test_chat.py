@@ -76,3 +76,19 @@ def test_chat_rejects_truncated_completion(tmp_path):
         assert error.value.code == 'LLM_RESPONSE_TRUNCATED'
 
 
+
+
+def test_chat_reports_evidence_budget_to_model_and_client(tmp_path):
+    hits = [{"filename": "doc", "source_refs": [], "search_text": "가" * 1000} for _ in range(4)]
+    retrieval = SimpleNamespace(search=lambda _: {"results": hits, "index_version": "v"})
+    def provider(request):
+        content = json.loads(json.loads(request.content)["messages"][-1]["content"])
+        assert content["근거_제한"]["evidence_limited"]
+        assert content["근거_제한"]["evidence_omitted_count"] == 3
+        assert len(content["검색된 문서"]) == 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": "일부 근거 [1]"}}]})
+    config = Config(tmp_path, external_processing=True, llm_api_key="fake", chat_evidence_bytes=4096)
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(config, retrieval, client).invoke(ChatRequest(message="목록"))
+    assert result["search_counts"]["evidence_omitted_count"] == 3
+    assert len(result["sources"]) == 1
