@@ -326,3 +326,70 @@ def test_model_context_budget_includes_system_evidence_and_history(tmp_path, con
     assert result['search_counts']['model_context_tokens'] == context_tokens
     assert result['search_counts']['history_omitted_count'] > 0
     assert captured[-1]['role'] == 'user'
+
+
+@pytest.mark.parametrize('question', [
+    '이스트소프트의 서비스는?', '그린테크의 2025년 매출은?', '저축은행의 자산은?',
+    '이익은 얼마인가요?', '이마트의 영업시간은?',
+])
+@pytest.mark.parametrize('method', ['bm25', 'hybrid'])
+def test_explicit_new_topic_does_not_include_previous_retrieval_context(tmp_path, question, method):
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'results': [], 'index_version': 'v'})
+    history = [ChatMessage(role='user', content='이전 회사의 정책을 설명해줘'),
+               ChatMessage(role='assistant', content='이전 회사의 답변')]
+    RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message=question, method=method, history=history))
+    assert seen[0].query == question
+
+
+@pytest.mark.parametrize('method', ['bm25', 'dense', 'hybrid'])
+def test_resolved_ordinal_excludes_other_list_entries_and_previous_question(tmp_path, method):
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'results': [], 'index_version': 'v'})
+    history = [ChatMessage(role='user', content='알파 베타 감마를 비교해줘'),
+               ChatMessage(role='assistant', content='1. 알파 서비스\n2. 베타 서비스\n3. 감마 서비스')]
+    RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message='그중 두 번째의 기능은?', method=method, history=history))
+    assert seen[0].query == '베타 서비스\n그중 두 번째의 기능은?'
+
+
+def test_ambiguous_or_multiple_ordinal_references_do_not_pick_one_entry(tmp_path):
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'results': [], 'index_version': 'v'})
+    chat = RagChat(Config(tmp_path), retrieval, None)
+    history = [ChatMessage(role='user', content='서비스 목록'),
+               ChatMessage(role='assistant', content='1. 알파\n2. 베타\n1. 감마\n2. 델타')]
+    for question in ['그중 두 번째는?', '첫 번째와 두 번째를 비교해줘']:
+        chat.retrieve(ChatRequest(message=question, method='bm25', history=history))
+        assert '베타' in seen[-1].query and '델타' in seen[-1].query
+
+
+def test_ambiguous_short_followup_keeps_history(tmp_path):
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'results': [], 'index_version': 'v'})
+    history = [ChatMessage(role='user', content='서비스를 알려줘'),
+               ChatMessage(role='assistant', content='달빛 서비스')]
+    RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message='사용료는?', method='bm25', history=history))
+    assert '달빛 서비스' in seen[0].query
+
+
+def test_bm25_retrieval_ranks_current_and_resolved_targets_above_old_topics(tmp_path):
+    index = BM25Index(tmp_path / 'index.sqlite')
+    index.replace_document('doc', [
+        {'chunk_id': 'old', 'text': '오렌지시스템 사용자 정보와 운영 정책'},
+        {'chunk_id': 'new', 'text': '그린테크 2025년 매출은 300억원'},
+        {'chunk_id': 'first', 'text': '알파시스템 기능은 회계 관리'},
+        {'chunk_id': 'second', 'text': '베타시스템 기능은 주문 관리'},
+        {'chunk_id': 'third', 'text': '감마시스템 기능은 재고 관리'},
+    ])
+    class Retrieval:
+        def search(self, request):
+            return {'results': index.search(request.query, 3), 'index_version': 'v'}
+    chat = RagChat(Config(tmp_path), Retrieval(), None)
+    independent = [ChatMessage(role='user', content='오렌지시스템을 설명해줘'),
+                   ChatMessage(role='assistant', content='오렌지시스템 운영 정책')]
+    _, result = chat.retrieve(ChatRequest(message='그린테크의 2025년 매출은?', method='bm25', history=independent))
+    assert result['results'][0].chunk_id == 'new'
+    followup = [ChatMessage(role='user', content='알파시스템 베타시스템 감마시스템을 소개해줘'),
+                ChatMessage(role='assistant', content='1. 알파시스템\n2. 베타시스템\n3. 감마시스템')]
+    _, result = chat.retrieve(ChatRequest(message='그중 두 번째의 기능은?', method='bm25', history=followup))
+    assert result['results'][0].chunk_id == 'second'

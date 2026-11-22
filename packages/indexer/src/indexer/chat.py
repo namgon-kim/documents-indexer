@@ -214,17 +214,19 @@ def _coverage(hits, sources, method='ranked_search'):
 
 # Previous messages are used for retrieval only when the current question refers
 # back to an earlier subject. Answer generation receives a separately budgeted history.
-_GENERIC_FOLLOWUP = re.compile(r'^\s*(?:목표|배경|내용|일정|이유|방법|결과|차이|장점|단점|한계)(?:은|는|이|가|을|를)?\s*[?？]?\s*$')
+_GENERIC_FOLLOWUP = re.compile(r'^\s*(?:목표|배경|내용|일정|이유|방법|결과|차이|장점|단점|한계|기능|가격)(?:은|는|이|가|을|를)?\s*[?？]?\s*$')
 _CONTEXT_REFERENCE = re.compile(
-    r'(?<![가-힣A-Za-z])(?:그\s*(?:것|거|중|때|쪽|분|곳|시스템|항목|표|문서|대상|내용|중에서)|'
-    r'이\s*(?:것|거|중|때|쪽|시스템|항목|표|문서|대상)|저\s*(?:것|거|쪽)|'
+    r'(?<![가-힣A-Za-z])(?:(?:그|이|저)(?:것|거|중|때|쪽|분|곳)'
+    r'(?=$|[^가-힣A-Za-z]|은|는|이|가|의|을|를|에|으로|와|과|도|만)|'
     r'앞(?:의|서|에)|이전(?:\s*(?:것|내용|답변|질문|항목|시스템|대상|표|문서)|에|의|과|와|$)|방금|위(?:의|에서)|같은\s*(?:것|항목|대상)|'
-    r'(?:해당|그|이|저)\s*[가-힣A-Za-z]+(?:은|는|이|가|의|을|를|에)|(?:첫|두|세|네)\s*번째|\b(?:it|they|them|those|these|previous|former|latter)\b)', re.IGNORECASE)
+    # A determiner must be a separate word: 이스트, 그린, 저축 and 이익
+    # are not references merely because they start with a demonstrative.
+    r'(?:해당|그|이|저)\s+[가-힣A-Za-z]+(?=$|[^가-힣A-Za-z])|(?:첫|두|세|네)\s*번째|\b(?:it|they|them|those|these|previous|former|latter)\b)', re.IGNORECASE)
 
 
 def _needs_retrieval_context(question):
-    # Short topic fragments are ambiguous; use recent context in that case.
-    # Longer standalone questions remain independent unless they refer back.
+    # Short standalone questions can omit their subject, so retain history
+    # when the intent cannot be resolved locally.
     return bool(_CONTEXT_REFERENCE.search(question) or _GENERIC_FOLLOWUP.fullmatch(question)
                 or re.fullmatch(r'[가-힣A-Za-z]{1,8}(?:은|는|이|가|을|를)?[?？]', question))
 
@@ -234,12 +236,14 @@ def _retrieval_history(history, question):
     assistant = next((item for item in reversed(history) if item.role == 'assistant'), None)
     if assistant:
         text = sanitize_history_citations(assistant.content, set(assistant.citation_numbers))
-        ordinal = re.search(r'(첫|두|세|네)\s*번째', question)
-        if ordinal:
-            number = {'첫': 1, '두': 2, '세': 3, '네': 4}[ordinal.group(1)]
-            line = re.search(rf'(?m)^\s*{number}[.)]\s+([^\n]+)', text)
-            if line:
-                text = line.group(1) + '\n' + text
+        ordinals = re.findall(r'(첫|두|세|네)\s*번째', question)
+        if len(ordinals) == 1:
+            number = {'첫': 1, '두': 2, '세': 3, '네': 4}[ordinals[0]]
+            lines = re.findall(rf'(?m)^[ \t]*{number}[.)][ \t]+([^\n]+)', text)
+            # A unique list entry resolves the reference. Other list entries and
+            # previous questions can name competing targets, so do not append them.
+            if len(lines) == 1 and lines[0].strip():
+                return [embedding_text(lines[0])]
         # Keep both ends when answer is long; leave room for the current question.
         text = embedding_text(text)
         if len(text) > 500:
