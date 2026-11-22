@@ -86,7 +86,7 @@ def table_totals(table):
     `totalsRowShown` only says whether a totals row was ever shown; the number of
     totals rows inside the table range is `totalsRowCount`.
     """
-    left, top, right, bottom = range_boundaries(table.ref)
+    _, top, _, bottom = range_boundaries(table.ref)
     header_rows = 1 if table.headerRowCount is None else int(table.headerRowCount)
     count = int(table.totalsRowCount or 0)
     body = (bottom - top + 1) - max(0, header_rows)

@@ -101,7 +101,7 @@ def header_layout(headers, cells, merged, area):
         if cell['hidden_merged'] or not cell['display_text'].strip():
             raise ValueError('헤더에는 값이 있는 표시 셀을 지정해 주세요')
         ref = cell.get('merged_range')
-        spans[key] = merged[ref] if ref in merged else (col, row, col, row)
+        spans[key] = merged.get(ref, (col, row, col, row))
     first = min(span[1] for span in spans.values())
     last = max(span[3] for span in spans.values())
     if last - first + 1 > MAX_HEADER_ROWS or any(span[0] < left or span[2] > right for span in spans.values()):
@@ -262,7 +262,7 @@ def _inferred_header(cells, by_row, merges, whole):
     and is accepted only when it is bold or the data below it is not text, so a
     text-only block keeps its unknown structure.
     """
-    left, top, right, bottom = whole
+    bottom = whole[3]
     merged = {ref: range_boundaries(ref) for ref in merges}
     rows = sorted(by_row)
     start, title_key = rows[0], None

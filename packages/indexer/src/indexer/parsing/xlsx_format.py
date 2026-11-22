@@ -17,7 +17,7 @@ DAYS = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sun
 LOCALE_DATE_FORMATS = {14: 'yyyy-mm-dd', 22: 'yyyy-mm-dd h:mm'}
 
 _TOKEN = re.compile(r'"[^"]*"|\\.|\[[^\]]*\]|_.|\*.|AM/PM|am/pm|A/P|a/p|[yY]+|[mM]+|[dD]+|[hH]+|[sS]+'
-                    r'|[eE][+-]|[0#?]|.', re.S)
+                    r'|[eE][+-]|[0#?]|.', re.DOTALL)
 _ELAPSED = re.compile(r'^\[(h+|m+|s+)\]$', re.IGNORECASE)
 _CURRENCY = re.compile(r'^\[\$([^\]-]*)(?:-[0-9A-Fa-f]+)?\]$')
 _COLOR = re.compile(r'^\[(?:black|blue|cyan|green|magenta|red|white|yellow|color\s*\d{1,2})\]$', re.IGNORECASE)
