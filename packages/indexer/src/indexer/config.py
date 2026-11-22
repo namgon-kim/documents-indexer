@@ -45,6 +45,7 @@ class Config:
     retrieval_top_n: int = DEFAULT_RETRIEVAL_TOP_N
     rerank_top_n: int = DEFAULT_RERANK_TOP_N
     chat_evidence_bytes: int = 32768
+    chat_query_rewrite_enabled: bool = False
     reranker_provider: str = "disabled"
     reranker_base_url: str = "https://api.cohere.com/v2"
     reranker_api_key: str = ""
@@ -102,6 +103,7 @@ class Config:
             retrieval_top_n=int(os.getenv("RETRIEVAL_TOP_N", str(DEFAULT_RETRIEVAL_TOP_N))),
             rerank_top_n=int(os.getenv("RERANK_TOP_N", str(DEFAULT_RERANK_TOP_N))),
             chat_evidence_bytes=int(os.getenv("CHAT_EVIDENCE_BYTES", "32768")),
+            chat_query_rewrite_enabled=flag("CHAT_QUERY_REWRITE_ENABLED"),
             reranker_provider=os.getenv("RERANKER_PROVIDER", "disabled"),
             reranker_base_url=os.getenv("RERANKER_BASE_URL", "https://api.cohere.com/v2"),
             reranker_api_key=os.getenv("RERANKER_API_KEY", ""),

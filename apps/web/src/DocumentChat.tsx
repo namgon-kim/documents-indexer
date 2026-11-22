@@ -5,7 +5,7 @@ import type { Session } from "./api";
 import { VisualAssets } from "./VisualAssets";
 import { TableRelations } from "./TableRelations";
 
-export type ChatMessage = {role: "user" | "assistant"; content: string; sources?: Hit[]; index_version?: string; answer_verification?: {status: string; warnings: {code: string; claim: string; citations: number[]}[]; warnings_truncated: boolean}; coverage?: {scope_verification: string; scope_complete: boolean | null; partial_element_count: number}; page_scope?: {requested_pages: number[]; pages_without_chunks: number[]; all_page_chunks_selected: boolean}; search_counts?: {evidence_limited: boolean; evidence_omitted_count: number; context_omitted_count: number; evidence_truncated_count: number; history_omitted_count?: number}};
+export type ChatMessage = {role: "user" | "assistant"; content: string; sources?: Hit[]; index_version?: string; answer_verification?: {status: string; warnings: {code: string; claim: string; citations: number[]}[]; warnings_truncated: boolean}; coverage?: {scope_verification: string; scope_complete: boolean | null; partial_element_count: number}; page_scope?: {requested_pages: number[]; pages_without_chunks: number[]; all_page_chunks_selected: boolean}; search_counts?: {evidence_limited: boolean; evidence_omitted_count: number; context_omitted_count: number; evidence_truncated_count: number; history_omitted_count?: number; query_rewrite_status?: string}};
 type Props = {
   session: Session;
   messages: ChatMessage[]; searching: boolean; query: string; canSend: boolean;
@@ -120,6 +120,7 @@ export function DocumentChat(props: Props) {
           {message.coverage && <details className="hint"><summary>조회 범위 확인</summary><p>원문 추출과 질문 대상 전체 범위의 완전성은 확인되지 않았습니다.</p></details>}
           {message.page_scope && <p className="hint" role="status">PDF 물리쪽 {message.page_scope.requested_pages.join(", ")} · 페이지 내 BM25 조회 · 인쇄 쪽 번호와 다를 수 있으며 원문 추출 완전성은 미확인입니다.{!message.page_scope.all_page_chunks_selected ? " 일부 청크만 답변 근거로 선택됐습니다." : ""}{message.page_scope.pages_without_chunks.length ? ` 검색 가능한 청크 없음: ${message.page_scope.pages_without_chunks.join(", ")}쪽 (원본·추출 상태 확인 필요).` : ""}</p>}
           {!!message.search_counts?.history_omitted_count && <p className="hint" role="status">이전 대화 {message.search_counts.history_omitted_count}개는 문맥 크기 제한으로 답변에 포함되지 않았습니다.</p>}
+          {["failed", "invalid_response", "validation_failed", "unavailable"].includes(message.search_counts?.query_rewrite_status ?? "") && <p className="hint" role="status">대화 문맥을 검색어에 반영하지 못해 원래 질문으로 검색했습니다. 필요하면 대상을 포함해 다시 질문해 주세요.</p>}
           {message.search_counts?.evidence_limited && <p className="hint" role="status">답변 근거 예산으로 검색 근거 {message.search_counts.evidence_omitted_count}개와 문맥 {message.search_counts.context_omitted_count}개가 제외됐고, 근거 {message.search_counts.evidence_truncated_count}개는 일부만 사용됐습니다.</p>}
           {!!message.sources?.length && <div className={"chat-sources" + (open.includes(index) ? " is-open" : "")}>
             <div className="chat-source-strip">
