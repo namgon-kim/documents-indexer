@@ -363,3 +363,20 @@ def test_chat_flags_invalid_citation_before_redacting_it(tmp_path):
             ChatRequest(message='인원은?'))
     assert '[근거 확인 불가]' in result['answer']
     assert 'invalid_citation' in {warning['code'] for warning in result['answer_verification']['warnings']}
+
+
+def test_chat_checks_explicit_complete_table_column_requested_by_user(tmp_path):
+    items = [f'업무 {letter}' for letter in 'ABCDEF']
+    segments = [{'row': i + 2, 'column': 2, 'value': value, 'label': '업무명',
+                 'label_relations': [{'kind': 'column', 'status': 'explicit', 'text': '업무명'}]}
+                for i, value in enumerate(items)]
+    hit = {'chunk_id': 'c', 'document_id': 'd', 'job_id': 'j', 'element_ids': ['e'], 'kind': 'table',
+           'element_scopes': [{'element_id': 'e', 'indexed_chunks': 1, 'returned_chunks': 1}],
+           'filename': 'doc', 'source_refs': [], 'search_text': '\n'.join(items), 'table_segments': segments}
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
+    def provider(_):
+        return httpx.Response(200, json={'choices': [{'message': {'content': ', '.join(items[:3]) + '입니다. [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
+            ChatRequest(message='업무명 목록을 정리해 주세요'))
+    assert 'table_items_not_literal_in_answer' in {warning['code'] for warning in result['answer_verification']['warnings']}

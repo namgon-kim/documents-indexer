@@ -398,7 +398,7 @@ class RagChat:
                 raise ValueError("empty response")
         except (httpx.HTTPError, ValueError, TypeError, KeyError) as error:
             raise IndexerError("LLM_UNAVAILABLE", "답변 생성에 실패했습니다. 모델 연결 설정을 확인해 주세요.", 503) from error
-        verification = audit_answer(content, context)
+        verification = audit_answer(content, context, question=request.message, sources=sources)
         answer = re.sub(r"\[(\d+)\]", lambda match: match.group(0) if 1 <= int(match.group(1)) <= len(sources) else "[근거 확인 불가]", content)
         if verification["warnings"]:
             answer += "\n\n※ 일부 주장과 인용 근거의 관계를 원문에서 확인해 주세요."

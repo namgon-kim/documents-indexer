@@ -9,7 +9,8 @@ from decimal import Decimal, InvalidOperation
 
 CITATION = re.compile(r'\[(\d+)\]')
 NUMBER = r'[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?'
-PAIR = re.compile(rf'(?<![\w.])({NUMBER})\s*(?:명|개|건|회|%)?\s*(?:→|->|⇒|에서)\s*({NUMBER})')
+UNIT = r'억원|만원|천원|원|퍼센트|%|명|건|개|개월|년|일|회'
+PAIR = re.compile(rf'(?<![\w.])({NUMBER})\s*({UNIT})?\s*(?:→|->|⇒|에서)\s*({NUMBER})\s*({UNIT})?')
 QUANTITY = re.compile(rf'(?<![\w.])({NUMBER})\s*(억원|만원|천원|원|퍼센트|%|명|건|개|개월|년|일|회)(?![A-Za-z0-9])')
 ABSENCE = re.compile(r'(?:문서|전체|모든\s*(?:시트|문서|표|항목))[^\n.!?]{0,65}(?:없(?:다|습니다|음)|미기재|찾을\s*수\s*없|존재하지\s*않|기재(?:되어|돼)?\s*있지\s*않)')
 ENTITY = re.compile(r'([가-힣]{2,})\s+([A-Za-z][0-9A-Za-z_-]{0,15})(?![0-9A-Za-z_-])')
@@ -28,7 +29,19 @@ def _number(value):
 
 
 def _pairs(text):
-    return {(_number(a), _number(b)) for a, b in PAIR.findall(text) if _number(a) != _number(b)}
+    result = set()
+    for a, unit_a, b, unit_b in PAIR.findall(text):
+        unit_a, unit_b = unit_a or unit_b, unit_b or unit_a
+        if unit_a in CURRENCY and unit_b in CURRENCY:
+            pair = ((_number(a) * CURRENCY[unit_a], '원'), (_number(b) * CURRENCY[unit_b], '원'))
+        elif unit_a == unit_b or {unit_a, unit_b} == {'%', '퍼센트'}:
+            dimension = '%' if unit_a in {'%', '퍼센트'} else unit_a
+            pair = ((_number(a), dimension), (_number(b), dimension))
+        else:
+            continue
+        if pair[0] != pair[1]:
+            result.add(pair)
+    return result
 
 
 def _quantities(text):
@@ -59,7 +72,76 @@ def _entities(text):
     return result
 
 
-def audit_answer(answer, evidence):
+def _entity_quantities(text):
+    """Associate a single explicit quantity with each labeled entity in its own segment."""
+    entities = list(ENTITY.finditer(text))
+    grouped = {}
+    for index, entity in enumerate(entities):
+        end = entities[index + 1].start() if index + 1 < len(entities) else len(text)
+        segment = re.split(r'[\n;。!?]', text[entity.end():end], maxsplit=1)[0]
+        quantities = _quantities(segment)
+        key = (entity.group(1), entity.group(2).casefold())
+        if len(quantities) == 1:
+            grouped.setdefault(key, []).append(quantities[0])
+    return grouped
+
+
+def _subject_quantity_conflict(claim, cited):
+    claimed = _entity_quantities(claim)
+    for evidence in cited:
+        data = _entity_quantities(evidence)
+        categories = {}
+        for category, label in data:
+            categories.setdefault(category, set()).add(label)
+        for key, values in claimed.items():
+            if len(categories.get(key[0], ())) < 2 or len(values) != 1 or len(data.get(key, ())) != 1:
+                continue
+            if not _equivalent(values[0], data[key][0]):
+                return True
+    return False
+
+
+def _table_list_warning(question, sources, context, answer):
+    """Review explicit requested columns in a single complete table, not guessed continuations."""
+    if not question or not re.search(r'전체|전부|모든|빠짐없이|목록|나열|정리|\b(?:all|every|list)\b', question, re.IGNORECASE):
+        return None
+    tables = {}
+    for index, (source, item) in enumerate(zip(sources, context, strict=True), 1):
+        ids = source.get('element_ids', [])
+        if (source.get('kind') != 'table' or len(ids) != 1
+                or not source.get('document_id') or not source.get('job_id')):
+            continue
+        key = (source.get('document_id'), source.get('job_id'), ids[0])
+        tables.setdefault(key, []).append((index, source, item))
+    if len(tables) != 1:
+        return None
+    rows = next(iter(tables.values()))
+    if any(source.get('evidence_truncated') or not source.get('model_element_scopes')
+           or not all(scope.get('all_indexed_chunks_in_model') for scope in source['model_element_scopes'])
+           for _, source, _ in rows):
+        return None
+    columns = {}
+    for index, source, item in rows:
+        for segment in source.get('table_segments', []):
+            value = segment.get('value', '')
+            if not value or len(value) > 100 or value not in item.get('text', ''):
+                continue
+            for rel in segment.get('label_relations', []):
+                label = rel.get('text', '').strip()
+                if (rel.get('kind') == 'column' and rel.get('status') == 'explicit' and len(label) >= 2
+                        and label in question):
+                    columns.setdefault((segment.get('column'), label), set()).add(value)
+    columns = {key: values for key, values in columns.items() if 2 <= len(values) <= 100}
+    if len(columns) != 1:
+        return None
+    values = next(iter(columns.values()))
+    if any(value.casefold() not in answer.casefold() for value in values):
+        return {'code': 'table_items_not_literal_in_answer', 'claim': question[:300],
+                'citations': [index for index, _, _ in rows]}
+    return None
+
+
+def audit_answer(answer, evidence, *, question=None, sources=None):
     """Return bounded review signals; neither absence of signals nor citations mean verified."""
     warnings = []
     # Treat citation after a period as belonging to the preceding sentence.
@@ -89,6 +171,8 @@ def audit_answer(answer, evidence):
             if (pairs & cited_pairs and claim_direction and cited_direction
                     and claim_direction != cited_direction):
                 checks.append('possible_direction_description_conflict')
+            if _subject_quantity_conflict(body, [evidence[index - 1].get('text', '') for index in refs]):
+                checks.append('possible_subject_quantity_mismatch')
             claimed_entities, cited_entities = _entities(body), _entities(cited)
             if any(labels.isdisjoint(cited_entities[category]) for category, labels in claimed_entities.items()
                    if category in cited_entities and len(labels) == len(cited_entities[category]) == 1):
@@ -111,5 +195,10 @@ def audit_answer(answer, evidence):
             if len(warnings) > 20:
                 return {'status': 'review_suggested', 'warnings': warnings[:20], 'warnings_truncated': True,
                         'method': 'local_partial_checks'}
+    if sources is not None and (warning := _table_list_warning(question, sources, evidence, answer)):
+        if len(warnings) >= 20:
+            return {'status': 'review_suggested', 'warnings': warnings, 'warnings_truncated': True,
+                    'method': 'local_partial_checks'}
+        warnings.append(warning)
     return {'status': 'review_suggested' if warnings else 'not_verified', 'warnings': warnings,
             'warnings_truncated': False, 'method': 'local_partial_checks'}

@@ -18,6 +18,8 @@ type Props = {
 const verificationMessages: Record<string, string> = {
   possible_reversed_direction: "변화 방향이 인용 근거와 반대일 수 있습니다",
   possible_direction_description_conflict: "증가·감소 서술이 인용 근거와 다를 수 있습니다",
+  possible_subject_quantity_mismatch: "대상에 연결된 수치가 인용 근거와 다를 수 있습니다",
+  table_items_not_literal_in_answer: "질문한 표 열의 일부 값이 답변에 그대로 나타나지 않습니다",
   possible_subject_mismatch: "인용 근거의 대상이 다를 수 있습니다",
   quantity_unit_mismatch: "숫자의 단위가 인용 근거와 다를 수 있습니다",
   quantity_not_literal_in_citation: "인용 근거에서 숫자를 그대로 찾지 못했습니다",

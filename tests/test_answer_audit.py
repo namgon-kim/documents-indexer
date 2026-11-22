@@ -93,3 +93,41 @@ def test_full_list_claim_can_flag_missing_items_without_calling_paraphrases_wron
     complete = '전체 항목은 ' + ', '.join(items) + '입니다. [1]'
     assert 'list_items_not_literal_in_answer' in _codes(partial, evidence)
     assert not _codes(complete, evidence)
+
+
+def test_quantity_is_compared_with_its_explicit_subject():
+    cited = '시스템 A 사용자 7명, 시스템 B 사용자 9명'
+    assert 'possible_subject_quantity_mismatch' in _codes('시스템 A 사용자는 9명입니다. [1]', cited)
+    assert 'possible_subject_quantity_mismatch' not in _codes('시스템 A 사용자는 7명입니다. [1]', cited)
+    assert 'possible_subject_quantity_mismatch' not in _codes('시스템 A는 9명입니다. [1]', '시스템 A 7명 또는 9명, 시스템 B 9명')
+    assert 'possible_subject_quantity_mismatch' not in _codes('시스템 A는 9명입니다. [1]', '시스템 A와 시스템 B는 9명입니다.')
+
+
+def test_pairs_normalize_money_units_dates_and_refuse_incompatible_units():
+    assert 'possible_reversed_direction' in _codes('2억원 → 1억원 감소 [1]', '1억원 → 2억원 증가')
+    assert 'possible_reversed_direction' in _codes('2026년 → 2025년 감소 [1]', '2025년 → 2026년 증가')
+    assert 'possible_reversed_direction' in _codes('2억원 → 10000만원 감소 [1]', '1억원 → 2억원 증가')
+    assert 'possible_direction_description_conflict' in _codes('1억원 → 2억원 감소 [1]', '1억원 → 2억원 증가')
+    assert 'possible_reversed_direction' not in _codes('2명 → 1명 감소 [1]', '1억원 → 2억원 증가')
+
+
+def test_structured_list_uses_question_and_only_complete_explicit_table():
+    items = [f'업무 {letter}' for letter in 'ABCDEF']
+    segments = [{'column': 2, 'row': i + 2, 'value': value,
+                 'label_relations': [{'kind': 'column', 'status': 'explicit', 'text': '업무명'}]}
+                for i, value in enumerate(items)]
+    scope = [{'all_indexed_chunks_in_model': True}]
+    source = {'document_id': 'd', 'job_id': 'j', 'kind': 'table', 'element_ids': ['e'],
+              'table_segments': segments, 'model_element_scopes': scope}
+    evidence = [{'text': '\n'.join(items)}]
+    partial = '요청하신 항목은 ' + ', '.join(items[:3]) + '입니다. [1]'
+    kwargs = {'question': '업무명 목록을 정리해 주세요', 'sources': [source]}
+    assert 'table_items_not_literal_in_answer' in {w['code'] for w in audit_answer(partial, evidence, **kwargs)['warnings']}
+    full = ', '.join(items) + '입니다. [1]'
+    assert 'table_items_not_literal_in_answer' not in {w['code'] for w in audit_answer(full, evidence, **kwargs)['warnings']}
+    source['model_element_scopes'] = [{'all_indexed_chunks_in_model': False}]
+    assert 'table_items_not_literal_in_answer' not in {w['code'] for w in audit_answer(partial, evidence, **kwargs)['warnings']}
+    source['model_element_scopes'] = scope
+    for segment in segments:
+        segment['label_relations'][0]['status'] = 'unverified'
+    assert 'table_items_not_literal_in_answer' not in {w['code'] for w in audit_answer(partial, evidence, **kwargs)['warnings']}
