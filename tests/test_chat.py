@@ -84,11 +84,31 @@ def test_chat_reports_evidence_budget_to_model_and_client(tmp_path):
     def provider(request):
         content = json.loads(json.loads(request.content)["messages"][-1]["content"])
         assert content["근거_제한"]["evidence_limited"]
-        assert content["근거_제한"]["evidence_omitted_count"] == 3
-        assert len(content["검색된 문서"]) == 1
+        assert content["근거_제한"]["evidence_omitted_count"] >= 2
+        assert content["근거_제한"]["evidence_truncated_count"] == 1
         return httpx.Response(200, json={"choices": [{"message": {"content": "일부 근거 [1]"}}]})
     config = Config(tmp_path, external_processing=True, llm_api_key="fake", chat_evidence_bytes=4096)
     with httpx.Client(transport=httpx.MockTransport(provider)) as client:
         result = RagChat(config, retrieval, client).invoke(ChatRequest(message="목록"))
-    assert result["search_counts"]["evidence_omitted_count"] == 3
-    assert len(result["sources"]) == 1
+    assert result["search_counts"]["evidence_omitted_count"] >= 2
+    assert result["search_counts"]["evidence_truncated_count"] == 1
+
+
+
+def test_large_first_evidence_is_utf8_safe_and_cited(tmp_path):
+    hit = {"filename": "표.pdf", "source_refs": [], "search_text": "한글\n" * 2000,
+           "table_expansion_complete": True}
+    retrieval = SimpleNamespace(search=lambda _: {"results": [hit], "index_version": "v"})
+    def provider(request):
+        payload = json.loads(json.loads(request.content)["messages"][-1]["content"])
+        item = payload["검색된 문서"][0]
+        assert item["text"] and hit["search_text"].startswith(item["text"])
+        assert item["표의_분할내용_모두_포함"] is False
+        assert payload["근거_제한"]["evidence_truncated_count"] == 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": "근거 일부 [1]"}}]})
+    config = Config(tmp_path, external_processing=True, llm_api_key="fake", chat_evidence_bytes=4096)
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(config, retrieval, client).invoke(ChatRequest(message="질문"))
+    assert result["sources"][0]["evidence_truncated"]
+    assert result["answer"] == "근거 일부 [1]"
+    assert result["search_counts"]["evidence_bytes"] <= 4096

@@ -149,10 +149,7 @@ class PublishedRetrieval:
             chunk_path = self.publisher.root / result["index_version"] / "chunks.json"
             indexed = {item["chunk_id"]: item for item in json.loads(chunk_path.read_text(encoding="utf-8"))}
             counts = result.get("search_counts")
-            expansion_limit = None
-            if self.ranking:
-                expansion_limit = len(result["results"]) if request.rerank else counts["result_limit"]
-            pending = self._expand_table(result["results"], indexed, expansion_limit)
+            pending = self._expand_table(result["results"], indexed)
             seen_chunks = {item['chunk_id'] for item in pending}
             expanded_visual_count, expanded_visual_chars = 0, 0
             for chunk in pending:
@@ -203,8 +200,7 @@ class PublishedRetrieval:
                             related_images.append({**link, 'url': f'/v1/ingest/{document_id}/jobs/{job_id}/elements/{image["element_id"]}/image',
                                                    'is_preview': bool(image.get('image_is_preview')),
                                                    'location': image.get('office_location'), 'layout': image.get('layout')})
-                            if (link.get('type') != 'image_analysis' and expanded_visual_count < 2
-                                    and (expansion_limit is None or len(pending) < expansion_limit)):
+                            if link.get('type') != 'image_analysis' and expanded_visual_count < 2:
                                 visual_ids = {item['element_id'] for item in source_elements.values()
                                               if item.get('source_origin') == 'visual_analysis'
                                               and item.get('visual_id') == image.get('visual_id') and item.get('visual_id')}
@@ -221,7 +217,7 @@ class PublishedRetrieval:
                                     seen_chunks.add(candidate['chunk_id'])
                                     expanded_visual_count += 1
                                     expanded_visual_chars += length
-                                    if expanded_visual_count >= 2 or (expansion_limit is not None and len(pending) >= expansion_limit):
+                                    if expanded_visual_count >= 2:
                                         break
                             if len(related_images) >= 4:
                                 break

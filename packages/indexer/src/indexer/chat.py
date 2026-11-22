@@ -13,6 +13,8 @@ from indexer.xlsx_query import NUMERIC, QueryPlan
 def _chat_evidence(hits, limit, budget=32768):
     """Fit ranked evidence in a serialized UTF-8 byte budget."""
     sources, context = [], []
+    # A completeness flag can grow from true to false when a later item is omitted.
+    fit_budget = max(0, budget - min(limit, len(hits)))
     truncated = context_omitted = 0
     for hit in hits[:limit]:
         refs = hit["source_refs"]
@@ -26,18 +28,39 @@ def _chat_evidence(hits, limit, budget=32768):
                 "XLSX_행_연결_후보": hit.get("xlsx_row_relations", [])[:10],
                 "XLSX_전체_표_조회": False if hit.get("xlsx_sheet") else None}
         encoded = lambda items: byte_size(json.dumps(items, ensure_ascii=False))
-        if encoded([*context, item]) > budget:
-            break
+        if encoded([*context, item]) > fit_budget:
+            # Fit a prefix measured in JSON-encoded UTF-8 bytes, including escaping.
+            full_text = item["text"]
+            low, high = 1, len(full_text)
+            best = ""
+            while low <= high:
+                middle = (low + high) // 2
+                item["text"] = full_text[:middle]
+                if encoded([*context, item]) <= fit_budget:
+                    best = item["text"]
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if not best.strip():
+                continue
+            item["text"] = best
+            truncated += 1
+            sources.append({**hit, "search_text": best, "evidence_truncated": True})
+        else:
+            sources.append(dict(hit))
         context.append(item)
-        sources.append(dict(hit))
     omitted = len(hits) - len(sources)
     # Fill spare capacity with interpretation context after fitting the ranked evidence.
     for hit, item in zip(sources, context, strict=True):
         extra = hit.get("context_text") or ""
+        if hit.get("evidence_truncated"):
+            if extra and extra != hit["search_text"]:
+                context_omitted += 1
+            continue
         if not extra or extra == hit["search_text"]:
             continue
         item["context"] = extra
-        if byte_size(json.dumps(context, ensure_ascii=False)) > budget:
+        if byte_size(json.dumps(context, ensure_ascii=False)) > fit_budget:
             item["context"] = ""
             context_omitted += 1
     limited = bool(omitted or truncated or context_omitted)
@@ -190,7 +213,7 @@ class RagChat:
 
     def answer(self, inputs):
         request, result = inputs
-        sources, context, counts = _chat_evidence(result["results"], request.top_k or MAX_RESULT_LIMIT, self.config.chat_evidence_bytes)
+        sources, context, counts = _chat_evidence(result["results"], MAX_RESULT_LIMIT + 5, self.config.chat_evidence_bytes)
         diagnostics = {**result.get("search_counts", {}), **counts}
         if not sources:
             answer = ("검색 결과가 답변 근거 크기 한도를 초과했습니다." if result["results"]
