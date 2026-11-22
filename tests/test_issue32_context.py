@@ -95,3 +95,43 @@ def test_local_context_diagnostics_do_not_record_question_or_history(tmp_path):
     assert not trace['stages']['retrieval_query']['history_used']
     assert query not in json.dumps(trace, ensure_ascii=False)
     assert history[0].content not in json.dumps(trace, ensure_ascii=False)
+
+
+@pytest.mark.parametrize('question', [
+    '정책 A는 개인정보 보호 기준입니다. 이것을 어떻게 적용하나요?',
+    '서비스 B는 이용 신청 절차입니다. 그것의 적용 방법은 무엇인가요?',
+])
+def test_explicit_single_local_statement_does_not_import_previous_history(tmp_path, question):
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'index_version': 'v', 'results': []})
+    history = [ChatMessage(role='user', content='이전 무관한 주제')]
+    with capture_trace() as trace:
+        RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message=question, history=history, method='bm25'))
+    assert seen[0].query == question
+    assert trace['stages']['retrieval_query']['reference_states'] == ['local']
+
+
+@pytest.mark.parametrize('question', [
+    '2025년 1차 평가를 거쳤다고 했습니다. 그 결과는 무엇인가요?',
+    '2차 심사를 진행한다고 설명했습니다. 그 결과는 무엇인가요?',
+    '작년 정책이 유효하다고 했습니다. 이것을 어떻게 적용하나요?',
+])
+def test_reported_context_or_ordinal_number_does_not_prove_a_local_referent(tmp_path, question):
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'index_version': 'v', 'results': []})
+    history = [ChatMessage(role='user', content='이전 평가 기록'), ChatMessage(role='assistant', content='이전 평가 내용')]
+    with capture_trace() as trace:
+        RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message=question, history=history, method='bm25'))
+    assert '이전 평가' in seen[0].query
+    assert trace['stages']['retrieval_query']['reference_states'] == ['external']
+
+
+def test_multiple_matching_referents_are_reported_as_ambiguous(tmp_path):
+    question = '2025년 신규 서비스 1은 A이고 신규 서비스 2는 B입니다. 그 서비스는 언제 개시하나요?'
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'index_version': 'v', 'results': []})
+    history = [ChatMessage(role='user', content='관련 없는 이전 주제')]
+    with capture_trace() as trace:
+        RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message=question, history=history, method='bm25'))
+    assert trace['stages']['retrieval_query']['reference_states'] == ['ambiguous']
+    assert seen[0].query == question
