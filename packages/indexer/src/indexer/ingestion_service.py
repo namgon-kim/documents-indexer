@@ -537,19 +537,29 @@ class IngestionService:
             data["manifest"] = publisher.commit(data.pop("prepared")) if "prepared" in data else publisher.publish(document_id, state["chunks"])
         return {"publication": data}
 
-    def run_job(self, document_id: str, job_id: str):
+    def claim_job(self, document_id: str, job_id: str):
         self._ensure_not_deleted(document_id)
-        document = self.storage.load_document(document_id)
-        stored = self.storage.document_dir(document_id) / ("source." + document["format"])
+        self.storage.load_document(document_id)
         status = self.storage.load_job(document_id, job_id, "processing")
         if status.get("status") != "queued":
             raise ValueError("대기 중인 작업이 아닙니다")
         if (status.get("recovery_mode") in {"initial", "retry"}
             and self._job_requires_copy(self.publisher, document_id, job_id)):
             raise ValueError("이미 게시된 작업은 새 작업으로 이어서 처리해야 합니다")
-        profile, settings = status.get("profile"), status.get("settings") or {}
-        status = {**status, "status": "processing", "stage": "representing" if status.get("mode") == "rechunk" else "parsing"}
+        claim = uuid4().hex
+        status = {**status, "status": "processing", "stage": "representing" if status.get("mode") == "rechunk" else "parsing", 'claim_id': claim}
         self.storage.save_job(document_id, job_id, "processing", status)
+        return claim
+
+    def run_job(self, document_id: str, job_id: str, *, claim_id=None):
+        claim_id = claim_id or self.claim_job(document_id, job_id)
+        self._ensure_not_deleted(document_id)
+        document = self.storage.load_document(document_id)
+        stored = self.storage.document_dir(document_id) / ("source." + document["format"])
+        status = self.storage.load_job(document_id, job_id, "processing")
+        if status.get('status') != 'processing' or status.get('claim_id') != claim_id:
+            raise ValueError('작업 예약을 확인할 수 없습니다')
+        profile, settings = status.get("profile"), status.get("settings") or {}
         try:
             try:
                 publisher = self.publisher_for(status.get("embedding_profile_id"), for_ingest=True)
@@ -700,7 +710,7 @@ class IngestionService:
                                    "recovery_mode": attempt if can_resume else None, "error": error_info})
             raise IngestionFailure(document_id, job_id) from error
 
-    def process_next(self):
+    def claim_next(self):
         for document in self.storage.list_documents():
             if document['document_id'] in self._deleted_documents():
                 continue
@@ -717,19 +727,26 @@ class IngestionService:
                             self.storage.save_job(document["document_id"], job["job_id"], "processing", {
                                 **current, "can_resume": False, "error": {"message": str(error)}})
                         return True
-                    try:
-                        self.run_job(document["document_id"], job["job_id"])
-                    except IngestionFailure:
-                        pass
-                    return True
-        return False
+                    return (document['document_id'], job['job_id'], self.claim_job(document['document_id'], job['job_id']))
+        return None
 
-    def recover(self):
+    def process_next(self):
+        claimed = self.claim_next()
+        if isinstance(claimed, tuple):
+            try:
+                self.run_job(claimed[0], claimed[1], claim_id=claimed[2])
+            except IngestionFailure:
+                pass
+        return bool(claimed)
+
+    def recover(self, *, exclude_jobs=()):
         for document in self.storage.list_documents():
             document_id = document["document_id"]
             if document_id in self._deleted_documents():
                 continue
             for job in self.storage.list_jobs(document_id):
+                if (document_id, job['job_id']) in exclude_jobs:
+                    continue
                 stored = self.storage.load_job(document_id, job['job_id'], 'processing')
                 if stored.get('mode') == 'draft_image_actions' and stored.get('status') == 'processing':
                     self._restore_draft_snapshot(document_id, job['job_id'], stored.get('image_snapshot'),
@@ -953,7 +970,7 @@ class IngestionService:
         if unresolved_visuals(elements):
             raise ValueError('확인이 필요한 이미지의 처리 방식을 모두 선택해 주세요')
         if already_published:
-            published_chunks = publisher.document_chunks(document_id, active)
+            published_chunks = publisher.document_chunks(document_id, published_manifest)
             if not published_chunks or any(chunk.get('job_id') != job_id for chunk in published_chunks):
                 raise ValueError('게시된 작업의 출처를 확인할 수 없습니다')
             manifest = published_manifest

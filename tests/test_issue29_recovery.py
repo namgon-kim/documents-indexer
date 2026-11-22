@@ -327,3 +327,146 @@ def test_incomplete_empty_result_is_not_described_as_published(tmp_path):
     result = IngestionService(ArtifactStore(tmp_path), Parser(), retry_pages=0).ingest(source)
     assert result['status'] == 'partial' and result['error']['code'] == 'NO_SEARCHABLE_CONTENT'
     assert not result['pending_review'] and not result['can_accept_partial'] and not result.get('index_version')
+
+
+def test_restore_historical_publication_after_same_document_changes(tmp_path, publication, monkeypatch):
+    publisher, calls = publication
+    store = ArtifactStore(tmp_path)
+    source = tmp_path / 'source.pdf'
+    source.write_bytes(b'%PDF-1.4')
+    doc, first_job, second_job = store.register(source)['document_id'], str(uuid4()), str(uuid4())
+    store.save_job(doc, first_job, 'chunks', [{'chunk_id': str(uuid4()), 'document_id': doc, 'job_id': first_job, 'text': '이전 내용'}])
+    store.save_job(doc, first_job, 'elements', [])
+    store.save_job(doc, first_job, 'processing', {'status': 'partial', 'can_accept_partial': True,
+        'comparison_index_version': None, 'coverage': {'missing_pages': [2]}})
+    service = IngestionService(store, None, publisher)
+    save = store.save_job
+    def fail_final(doc_id, job_id, name, value):
+        if name == 'processing' and value.get('index_version'):
+            raise OSError('injected')
+        return save(doc_id, job_id, name, value)
+    monkeypatch.setattr(store, 'save_job', fail_final)
+    with pytest.raises(OSError):
+        service.accept_content_changes(doc, first_job, accept_partial=True)
+    version_one = publisher.active()['version']
+    monkeypatch.setattr(store, 'save_job', save)
+    version_two = publisher.publish(doc, [{'chunk_id': str(uuid4()), 'document_id': doc,
+                                           'job_id': second_job, 'text': '최신 내용'}])['version']
+    service.recover()
+    assert store.load_job(doc, first_job, 'processing')['index_version'] == version_one
+    assert publisher.active()['version'] == version_two
+    assert publisher.document_chunks(doc, publisher.active())[0]['job_id'] == second_job
+    assert calls == [['이전 내용'], ['최신 내용']]
+
+
+def test_orphan_cleanup_is_retryable_and_preserves_published_versions(publication, monkeypatch):
+    publisher, _ = publication
+    doc, job = str(uuid4()), str(uuid4())
+    chunk = {'chunk_id': str(uuid4()), 'document_id': doc, 'job_id': job, 'text': '본문'}
+    first = publisher.publish(doc, [chunk])
+    from indexer import index_publication
+    atomic = index_publication.atomic_json
+    def crash(path, value):
+        if path == publisher.root / publisher.active_name:
+            raise KeyboardInterrupt()
+        atomic(path, value)
+    monkeypatch.setattr(index_publication, 'atomic_json', crash)
+    with pytest.raises(KeyboardInterrupt):
+        publisher.publish(doc, [chunk])
+    orphan = next(row['index_version'] for row in publisher.versions() if row['status'] == 'unpublished')
+    collection = 'ingestion_' + orphan.replace('-', '')
+    delete = publisher.qdrant.delete_collection
+    def fail(_):
+        raise RuntimeError('temporary failure')
+    monkeypatch.setattr(publisher.qdrant, 'delete_collection', fail)
+    publisher.cleanup_orphans()
+    assert (publisher.root / orphan).exists()
+    monkeypatch.setattr(publisher.qdrant, 'delete_collection', delete)
+    publisher.cleanup_orphans()
+    publisher.cleanup_orphans()
+    assert not (publisher.root / orphan).exists() and not publisher.qdrant.collection_exists(collection)
+    assert publisher.get_version(first['version']) and publisher.active()['version'] == first['version']
+
+
+def test_worker_releases_operation_lock_during_remote_parse(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from io import BytesIO
+
+    from fastapi.testclient import TestClient
+    from indexer.config import Config
+    from indexer.parsing.contracts import ParseResult
+    from pypdf import PdfWriter
+
+    from apps.api.main import create_app
+    entered, release = threading.Event(), threading.Event()
+    class Parser:
+        def parse(self, request):
+            entered.set()
+            assert release.wait(8)
+            rows = [{'page': 1, 'category': 'paragraph', 'content': {'text': '자료'}}]
+            return ParseResult('fake', rows, {'elements': rows})
+    def pdf(width):
+        writer = PdfWriter()
+        writer.add_blank_page(width=width, height=100)
+        output = BytesIO()
+        writer.write(output)
+        return output.getvalue()
+    service = IngestionService(ArtifactStore(tmp_path), Parser())
+    app = create_app(Config(tmp_path, access_key='example', external_processing=True), ingestion_service=service)
+    with TestClient(app, base_url='https://testserver') as client:
+        login = client.post('/v1/auth/login', json={'access_key': 'example'}, headers={'Origin': 'https://testserver'})
+        client.headers.update({'Origin': 'https://testserver', 'X-CSRF-Token': login.json()['csrf_token']})
+        first = client.post('/v1/ingest', data={'deferred': 'true'}, files={'file': ('one.pdf', pdf(100))})
+        assert first.status_code == 200 and entered.wait(3)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                second = executor.submit(client.post, '/v1/ingest', data={'deferred': 'true'},
+                                         files={'file': ('two.pdf', pdf(150))}).result(timeout=2)
+            assert second.status_code == 200
+            doc = first.json()['document_id']
+            assert client.delete(f'/v1/ingest/{doc}').status_code == 409
+            changed = client.put('/v1/settings', json={'values': {'remote_timeout': 60}})
+            assert changed.status_code == 409 and changed.json()['error']['code'] == 'JOB_IN_PROGRESS'
+        finally:
+            release.set()
+
+
+def test_synchronous_upload_releases_lock_during_parse(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from io import BytesIO
+
+    from fastapi.testclient import TestClient
+    from indexer.config import Config
+    from indexer.parsing.contracts import ParseResult
+    from pypdf import PdfWriter
+
+    from apps.api.main import create_app
+    entered, release = threading.Event(), threading.Event()
+    class Parser:
+        def parse(self, request):
+            entered.set()
+            assert release.wait(8)
+            rows = [{'page': 1, 'category': 'paragraph', 'content': {'text': '자료'}}]
+            return ParseResult('fake', rows, {'elements': rows})
+    def pdf(width):
+        writer = PdfWriter()
+        writer.add_blank_page(width=width, height=100)
+        output = BytesIO()
+        writer.write(output)
+        return output.getvalue()
+    service = IngestionService(ArtifactStore(tmp_path), Parser())
+    app = create_app(Config(tmp_path, access_key='example', external_processing=True), ingestion_service=service)
+    with TestClient(app, base_url='https://testserver') as client, ThreadPoolExecutor(max_workers=2) as executor:
+        login = client.post('/v1/auth/login', json={'access_key': 'example'}, headers={'Origin': 'https://testserver'})
+        client.headers.update({'Origin': 'https://testserver', 'X-CSRF-Token': login.json()['csrf_token']})
+        first = executor.submit(client.post, '/v1/ingest', files={'file': ('one.pdf', pdf(100))})
+        try:
+            assert entered.wait(3)
+            second = executor.submit(client.post, '/v1/ingest', data={'deferred': 'true'},
+                                     files={'file': ('two.pdf', pdf(150))}).result(timeout=2)
+            assert second.status_code == 200
+        finally:
+            release.set()
+        assert first.result(timeout=5).status_code == 200

@@ -147,10 +147,17 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
     stop = threading.Event()
     wake = threading.Event()
     operation_lock = threading.RLock()
+    active_claims = set()
     settings_lock = threading.Lock()
     parser_profiles_lock = threading.RLock()
     processing_defaults = {"target_chars": config.default_target_chars, "overlap_chars": config.default_overlap_chars,
                            "ocr_policy": config.default_ocr_policy, "dpi": config.default_dpi, "extraction_mode": "parser"}
+
+    def ensure_no_processing(app):
+        service = getattr(app.state, 'ingestion', None)
+        if service and any(job.get('status') == 'processing' for doc in service.storage.list_documents()
+                           for job in service.storage.list_jobs(doc['document_id'])):
+            raise IndexerError('JOB_IN_PROGRESS', '문서 처리가 진행 중입니다. 완료 후 설정을 변경해 주세요.', 409)
 
     def search_ranking(candidate):
         return {"retrieval_top_n": candidate.retrieval_top_n, "rerank_top_n": candidate.rerank_top_n}
@@ -192,6 +199,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         service.embedding_profiles = profiles
         retrieval = PublishedRetrieval(publisher, service.storage, ranking=search_ranking(candidate))
         if recover:
+            publisher.cleanup_orphans()
             service.recover()
         return service, publisher, profiles, retrieval
 
@@ -228,6 +236,8 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                 http.close()
                 lock.close()
 
+        app.state.finish_cleanup = cleanup
+
         try:
             app.state.http = http
             app.state.qdrant_clients = []
@@ -241,6 +251,8 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                     ingestion_service.embedding_profiles = app.state.embedding_profiles
                 app.state.published_retrieval = PublishedRetrieval(ingestion_service.publisher, ingestion_service.storage)
                 app.state.published_chat = RagChat(config, app.state.published_retrieval, http)
+                if hasattr(ingestion_service.publisher, 'cleanup_orphans'):
+                    ingestion_service.publisher.cleanup_orphans()
                 ingestion_service.recover()
             elif config.parser_provider:
                 publish_pipeline(app, config, install_pipeline(app, config, recover=True))
@@ -254,9 +266,26 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                         try:
                             with operation_lock:
                                 if recovery_needed and hasattr(app.state, 'ingestion'):
-                                    app.state.ingestion.recover()
+                                    if hasattr(app.state.ingestion, 'claim_next'):
+                                        app.state.ingestion.recover(exclude_jobs=active_claims)
+                                    else:
+                                        app.state.ingestion.recover()
                                     recovery_needed = False
-                                processed = (app.state.ingestion.process_next() if hasattr(app.state, "ingestion") else False)
+                                service = getattr(app.state, 'ingestion', None)
+                                claimed = service.claim_next() if service and hasattr(service, 'claim_next') else None
+                                if isinstance(claimed, tuple):
+                                    active_claims.add((claimed[0], claimed[1]))
+                                processed = bool(claimed)
+                                if service and not hasattr(service, 'claim_next'):
+                                    processed = service.process_next()
+                            if isinstance(claimed, tuple):
+                                try:
+                                    service.run_job(claimed[0], claimed[1], claim_id=claimed[2])
+                                except IngestionFailure:
+                                    pass
+                                finally:
+                                    with operation_lock:
+                                        active_claims.discard((claimed[0], claimed[1]))
                             app.state.worker_health = {'status': 'ok', 'consecutive_errors': 0}
                         except Exception as error:
                             failures = app.state.worker_health['consecutive_errors'] + 1
@@ -274,7 +303,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                     if not stop.is_set():
                         app.state.worker_health = {**app.state.worker_health, 'status': 'stopped'}
                         LOG.error('Ingestion worker stopped unexpectedly')
-                    if stop.is_set():
+                    if stop.is_set() and not active_claims:
                         cleanup()
 
             thread = threading.Thread(target=worker, name="indexer-worker", daemon=True)
@@ -286,7 +315,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                 wake.set()
                 await run_in_threadpool(thread.join, 2)
         finally:
-            if thread is None or not thread.is_alive():
+            if (thread is None or not thread.is_alive()) and not active_claims:
                 cleanup()
 
     app = FastAPI(title="DocumentIndexer", version="0.1.0", lifespan=lifespan)
@@ -487,11 +516,21 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                 except zipfile.BadZipFile as error:
                     raise IndexerError("INVALID_FORMAT", "문서 압축 형식이 올바르지 않습니다.", 415) from error
             with operation_lock:
+                service = request.app.state.ingestion
+                result = service.enqueue(path, profile, effective, embedding_profile_id, allow_duplicate=allow_duplicate)
                 if deferred:
-                    result = request.app.state.ingestion.enqueue(path, profile, effective, embedding_profile_id, allow_duplicate=allow_duplicate)
                     wake.set()
                     return result
-                return request.app.state.ingestion.ingest(path, profile, effective, embedding_profile_id, allow_duplicate=allow_duplicate)
+                document_id, job_id = result['document_id'], result['job_id']
+                claim = service.claim_job(document_id, job_id)
+                active_claims.add((document_id, job_id))
+            try:
+                return service.run_job(document_id, job_id, claim_id=claim)
+            finally:
+                with operation_lock:
+                    active_claims.discard((document_id, job_id))
+                    if stop.is_set() and not active_claims:
+                        request.app.state.finish_cleanup()
 
     @app.get("/v1/ingestion-documents", dependencies=[Depends(auth.require)])
     def ingestion_documents(request: Request, profile_id: str | None = None):
@@ -771,6 +810,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError("EMBEDDING_PROFILE_INVALID", "모델 ID가 일치하지 않습니다.", 422)
         try:
             with operation_lock:
+                ensure_no_processing(request.app)
                 return registry.save({**body, "profile_id": profile_id})
         except ValidationError as error:
             raise IndexerError("EMBEDDING_PROFILE_INVALID", "모델 이름, 주소와 차원을 확인해 주세요.", 422) from error
@@ -784,6 +824,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError("INDEX_NOT_READY", "임베딩 모델 연결을 설정해 주세요.", 503)
         try:
             with operation_lock:
+                ensure_no_processing(request.app)
                 registry.delete(profile_id)
         except ValidationError as error:
             raise IndexerError("EMBEDDING_PROFILE_INVALID", "저장된 임베딩 모델 설정을 확인해 주세요.", 409) from error
@@ -1072,6 +1113,8 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                                    "embedding_max_input_bytes", "embedding_batch_size", "reranker_provider",
                                    "reranker_base_url", "reranker_api_key", "reranker_model", "qdrant_url", "qdrant_key"}
                 changed = any(getattr(config, key) != getattr(candidate, key) for key in pipeline_fields)
+                if changed or candidate.external_processing != config.external_processing:
+                    ensure_no_processing(request.app)
                 pipeline = None
                 if changed and ingestion_service is None and candidate.parser_provider:
                     pipeline = install_pipeline(request.app, candidate, recover=not hasattr(request.app.state, "ingestion"))
@@ -1134,7 +1177,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                        else ParserProfiles(config.data_dir).read().get(profile_id))
         if not profile:
             raise IndexerError("PARSER_PROFILE_INVALID", "파서를 찾을 수 없습니다.", 404)
-        with settings_lock:
+        with operation_lock, settings_lock:
             changes = {key: profile[key] for key in PARSER_PROFILE_FIELDS}
             old_service = getattr(request.app.state, "ingestion", None)
             if old_service and old_service.parser_factory:

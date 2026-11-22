@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import shutil
 import threading
 from datetime import UTC, datetime
@@ -23,6 +24,8 @@ from indexer.search_engine import (
     MAX_RETRIEVAL_TOP_N,
     SearchService,
 )
+
+LOG = logging.getLogger(__name__)
 
 
 def _office_source(chunks):
@@ -116,6 +119,37 @@ class IndexPublisher:
             if manifest.get('publication_id') == publication_id:
                 return manifest
         return None
+
+    def cleanup_orphans(self):
+        """Discard only identified new-format builds outside all active histories."""
+        with self.search_lock, self.lock:
+            published = self._published_versions()
+            for folder in self.root.iterdir():
+                if folder.is_symlink() or not folder.is_dir():
+                    continue
+                try:
+                    version = str(UUID(folder.name))
+                    if version != folder.name or version in published:
+                        continue
+                    marker = folder / 'build.json'
+                    manifest_path = folder / 'manifest.json'
+                    manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else None
+                    if manifest and (manifest.get('publication_schema') != 1 or manifest.get('version') != version):
+                        continue
+                    if not marker.exists() and not manifest:
+                        continue
+                    if marker.exists():
+                        build = json.loads(marker.read_text(encoding='utf-8'))
+                        if build != {'version': version, 'schema': 1}:
+                            continue
+                    collection = 'ingestion_' + version.replace('-', '')
+                    if manifest and manifest.get('collection') != collection:
+                        continue
+                    if self.qdrant.collection_exists(collection):
+                        self.qdrant.delete_collection(collection)
+                    shutil.rmtree(folder)
+                except Exception:
+                    LOG.exception('Could not clean incomplete index build %s', folder.name)
 
     def get_version(self, version):
         if version is None:
@@ -218,6 +252,7 @@ class IndexPublisher:
         folder = self.root / version
         folder.mkdir()
         collection = "ingestion_" + version.replace("-", "")
+        atomic_json(folder / 'build.json', {'version': version, 'schema': 1})
         dense = DenseIndex(self.qdrant, collection, self.embedder)
         dense_built = False
         try:
