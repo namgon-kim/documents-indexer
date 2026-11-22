@@ -61,6 +61,7 @@ function App() {
   });
   const [results, setResults] = useState<Hit[]>();
   const [searchedVersion, setSearchedVersion] = useState("");
+  const [searchPageScope, setSearchPageScope] = useState<ChatMessage["page_scope"]>();
   const [searching, setSearching] = useState(false);
   const [expanded, setExpanded] = useState<{ id: string; text: string }>();
 
@@ -204,11 +205,11 @@ function App() {
         ...(role === "assistant" && sources ? {citation_numbers: sources.map((_, index) => index + 1)} : {})})).slice(-10);
       setMessages(items => [...items, {role: "user", content: question}]);
       setQuery("");
-      const response = await api<{ answer: string; sources: Hit[]; index_version: string; search_counts?: ChatMessage["search_counts"] }>("/v1/ingest-chat", session, {
+      const response = await api<{ answer: string; sources: Hit[]; index_version: string; search_counts?: ChatMessage["search_counts"]; page_scope?: ChatMessage["page_scope"] }>("/v1/ingest-chat", session, {
         message: question, history: previous, ...(xlsxScope && xlsxFullTable ? {xlsx_full_table: true} : {}), ...(chatModel ? { model: chatModel } : {}), ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}), ...(scope ? { document_id: scope } : {}), ...(version ? { index_version: version } : {}),
         ...(options?.ingestion_enabled ? {method: searchMethod, rerank: rerank && Boolean(options.rerank_available), profile_id: embeddingProfile} : {}),
       });
-      setMessages(items => [...items, {role: "assistant", content: response.answer, sources: response.sources, index_version: response.index_version, search_counts: response.search_counts}]);
+      setMessages(items => [...items, {role: "assistant", content: response.answer, sources: response.sources, index_version: response.index_version, search_counts: response.search_counts, page_scope: response.page_scope}]);
     } catch (reason) { setQuery(query); setMessages(items => items.slice(0, -1)); showError(reason); }
     finally { setSearching(false); }
   }
@@ -220,13 +221,13 @@ function App() {
       setError("표시 결과 수는 1~20 사이의 정수로 입력해 주세요.");
       return;
     }
-    setSearching(true); setError(""); setResults(undefined); setExpanded(undefined);
+    setSearching(true); setError(""); setResults(undefined); setSearchPageScope(undefined); setExpanded(undefined);
     try {
-      const response = await api<{results: Hit[]; index_version: string}>("/v1/retrieve", session, {
+      const response = await api<{results: Hit[]; index_version: string; page_scope?: ChatMessage["page_scope"]}>("/v1/retrieve", session, {
         query: query.trim(), ...(options?.ingestion_enabled ? {limit: Number(resultLimit), method: searchMethod, rerank: rerank && Boolean(options.rerank_available), profile_id: embeddingProfile} : {top_k: Number(resultLimit)}), ...(scope ? {document_id: scope} : {}),
         ...(version ? {index_version: version} : {}),
       });
-      setResults(response.results); setSearchedVersion(response.index_version);
+      setResults(response.results); setSearchedVersion(response.index_version); setSearchPageScope(response.page_scope);
     } catch (reason) { showError(reason); }
     finally { setSearching(false); }
   }
@@ -318,7 +319,8 @@ function App() {
         {options?.ingestion_enabled && versions.length === 0 && <p className="hint">선택한 모델에 검색 가능한 색인이 없습니다. 문서를 처리한 뒤 검색해 주세요.</p>}
         {selectedVersion?.dense_available === false && <p className="hint">이 검색 버전은 임베딩 계약이 달라 BM25만 사용할 수 있습니다. Dense·Hybrid 검색은 설정에서 색인을 다시 준비해 주세요.</p>}
         {results && <p className="hint">검색 인덱스 · {searchedVersion.slice(0, 8)}{versions.find(item => item.index_version === searchedVersion)?.status === "retired" ? " · 이전 버전" : " · 현재 버전"}</p>}
-        {results?.length === 0 && <p className="hint">일치하는 결과가 없습니다.</p>}
+        {searchPageScope && <p className="hint" role="status">PDF 물리쪽 {searchPageScope.requested_pages.join(", ")} · 페이지 내 BM25 조회 · 인쇄 쪽 번호와 다를 수 있으며 원문 추출 완전성은 미확인입니다.{!searchPageScope.all_page_chunks_selected ? " 일부 청크만 표시됩니다." : ""}{searchPageScope.pages_without_chunks.length ? ` 검색 가능한 청크 없음: ${searchPageScope.pages_without_chunks.join(", ")}쪽 (원본·추출 상태 확인 필요).` : ""}</p>}
+        {results?.length === 0 && <p className="hint">검색 가능한 결과가 없습니다. 지정한 쪽에 내용이 없다는 뜻은 아닙니다.</p>}
         {results?.map(hit => <article className="hit" key={hit.unit_id}>
           <strong>{hit.filename.normalize("NFC")}</strong>
           <p className="hint">문서 {hit.document_id.slice(0, 8)} · 작업 {hit.job_id.slice(0, 8)} · {locationLabel(hit)}{hit.quality === "unverified" ? " · 구조 확인 필요" : ""}{hit.heading_path_origin === "inferred" ? " · 제목 계층 추정" : ""}</p>

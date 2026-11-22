@@ -18,7 +18,10 @@ from indexer.embedding_input import (
     split_text_ranges,
 )
 from indexer.figure_text import figure_search_text
-from indexer.heading_hierarchy import apply_flat_hierarchy
+from indexer.heading_hierarchy import (
+    apply_flat_hierarchy,
+    promote_chapter_headers,
+)
 from indexer.inspection import is_page_label
 from indexer.office_locations import set_xlsx_chunk_evidence
 from indexer.parsing.normalization import (
@@ -34,7 +37,7 @@ from indexer.structure_relations import figure_relationships, table_relationship
 from indexer.table_evidence import set_html_table_evidence
 from indexer.xlsx_structure import confirmed
 
-TABLE_REPRESENTATION = "table-structure-v15"
+TABLE_REPRESENTATION = "table-structure-v16"
 
 def normalize_elements(raw_elements: list[dict]) -> list[dict]:
     elements = []
@@ -93,8 +96,11 @@ def normalize_elements(raw_elements: list[dict]) -> list[dict]:
                             if raw.get("_provider") == "paddle_vl" else {}),
                          **({"heading_level": level, "heading_level_origin": raw.get('_heading_origin', 'parser')} if kind.startswith("heading") or heading else {})})
     # Preserve explicit multi-level parser output. Flat headings need conservative context.
+    promoted = promote_chapter_headers(elements)
     if not any(item.get("heading_level", 1) > 1 or item.get('heading_level_explicit') for item in elements):
         apply_flat_hierarchy(elements)
+    elif promoted:
+        apply_flat_hierarchy(elements, preserve_explicit=True)
     inferred = {item["element_id"] for item in elements if item.get("heading_level_origin") == "inferred"}
     for item in elements:
         item["heading_path_origin"] = "inferred" if inferred.intersection(item.get("heading_element_ids", [])) else "parser"
@@ -149,6 +155,17 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
         if element["kind"] in PAGE_FURNITURE and element.get("page") is not None:
             furniture_pages[(element["kind"], embedding_text(element["text"]))].add(element["page"])
 
+    def furniture_reason(element):
+        if element['kind'] not in PAGE_FURNITURE:
+            return None
+        text = embedding_text(element['text'])
+        if (is_page_label(text) and (element['kind'] == 'page_number'
+                or (element['kind'] in {'footer', 'page_footer'} and element.get('page') is not None))):
+            return 'page_label'
+        if len(furniture_pages[(element['kind'], text)]) > 1:
+            return 'repeated_page_furniture'
+        return None
+
     def append_chunk(text, refs, part_number, kind, heading_path, table_extra=None, body_prefix=None):
         text = embedding_text(text)
         first = refs[0]
@@ -157,7 +174,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
         body_text = text.removeprefix(actual_prefix + "\n") if actual_prefix else text
         chunk_id = str(uuid5(NAMESPACE_URL, f"ingestion:{job_id}:{first['element_id']}:{part_number}"))
         chunk = {"chunk_id": chunk_id, "document_id": document_id, "job_id": job_id,
-                 "representation_version": "structure-v11", "text": text,
+                 "representation_version": "structure-v12", "text": text,
                  "element_ids": [item["element_id"] for item in refs], "page": first["page"], "source_scope": source_scope(first),
                  "group_scope": first.get('container_id') if profile == 'slides' else None,
                  "heading_element_ids": first.get("heading_element_ids", []),
@@ -193,10 +210,8 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
         if element.get('search_exclusion') == 'image_policy':
             flush()
             continue
-        if (element["kind"] in PAGE_FURNITURE
-            and (len(furniture_pages[(element["kind"], text)]) > 1
-                 or (element["kind"] == "page_number" and is_page_label(text)))):
-            element["search_exclusion"] = "repeated_page_furniture"
+        if reason := furniture_reason(element):
+            element["search_exclusion"] = reason
             flush()
             continue
         if not text and not element.get("xlsx_region"):
@@ -213,10 +228,8 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 continue
             if (following and following["kind"] != "heading" and following["heading_path"] == element["heading_path"]
                 and (following["text"] or any(cell['text'].strip() for cell in
-                                             (following.get("xlsx_region") or {}).get('cells', []))) and not (
-                    following["kind"] in PAGE_FURNITURE and (
-                        len(furniture_pages[(following["kind"], embedding_text(following["text"]))]) > 1
-                        or (following["kind"] == "page_number" and is_page_label(following["text"]))))):
+                                             (following.get("xlsx_region") or {}).get('cells', [])))
+                and not furniture_reason(following)):
                 continue
             append_chunk(heading or text, [element], 0, "heading", element["heading_path"])
             continue
@@ -390,7 +403,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 append_chunk("\n".join(filter(None, [prefix, part])), [element], part_number, "figure", element["heading_path"],
                              {"context_element_ids": [relation["caption_id"]], "relations": [{"type": "caption",
                               "origin": "inferred", "status": "unverified", "element_id": relation["caption_id"]}],
-                              "quality": "unverified", "representation_version": "figure-structure-v2"}, body_prefix=prefix)
+                              "quality": "unverified", "representation_version": "figure-structure-v3"}, body_prefix=prefix)
                 chunks[-1]['source_segments'] = [{'element_id': element['element_id'], 'order': element['order'],
                                                   'text': part, 'start': start, 'end': end}]
                 chunks[-1]['source_range_quality'] = 'normalized_element_text'
@@ -419,7 +432,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             append_chunk("\n".join(filter(None, (heading, part))), [element], part_number,
                          kind if kind in {"figure", "chart", "table"} else "text", element["heading_path"], extra)
             if kind in {'figure', 'chart', 'image'}:
-                chunks[-1]['representation_version'] = 'figure-structure-v2'
+                chunks[-1]['representation_version'] = 'figure-structure-v3'
                 chunks[-1]['source_segments'] = [{'element_id': element['element_id'], 'order': element['order'],
                                                   'text': part, 'start': start, 'end': end}]
                 chunks[-1]['source_range_quality'] = 'normalized_element_text'

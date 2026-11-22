@@ -1,15 +1,19 @@
 """게시된 청크를 검색과 대화가 공유하는 근거 계약으로 변환한다."""
 
 import json
+import tempfile
+from collections import defaultdict
 from contextlib import ExitStack, contextmanager, nullcontext
+from pathlib import Path
 
 import httpx
 from openpyxl.utils import get_column_letter
 from qdrant_client.http.exceptions import ApiException
 
+from indexer.bm25_index import BM25Index
 from indexer.contracts import IndexerError
 from indexer.parsing.normalization import cells_from, parse_table_html
-from indexer.search_engine import MAX_RESULT_LIMIT
+from indexer.search_engine import MAX_RESULT_LIMIT, MAX_RETRIEVAL_TOP_N
 from indexer.table_evidence import HTML_CELL_RANGE, html_table_evidence_urls
 from indexer.visual_relations import xlsx_anchor_matches
 from indexer.xlsx_access import CANDIDATE_LIMIT, open_workbook
@@ -82,6 +86,112 @@ class PublishedRetrieval:
             return {**result, 'document_id': document_id, 'job_id': job_id, 'index_version': pinned,
                     'element_id': refs[0]['element_id'], 'source_ranges': refs}
 
+    def search_pdf_pages(self, request, pages):
+        """Select from the requested physical pages of one pinned PDF version."""
+        if not pages or len(pages) > 8 or any(type(page) is not int or page < 1 for page in pages):
+            raise IndexerError('PDF_PAGE_INVALID', 'PDF 쪽 번호를 1개 이상 8개 이하로 지정해 주세요.')
+        pages = list(dict.fromkeys(pages))
+        guard = getattr(self.publisher, 'search_lock', None)
+        with guard if guard is not None else nullcontext():
+            manifest = self.publisher.get_version(str(request.index_version) if request.index_version else None)
+            if not manifest:
+                raise IndexerError('SEARCH_UNAVAILABLE', '검색 가능한 색인이 없습니다.', 409)
+            deleted = self.publisher.deleted_documents()
+            document_ids = [doc for doc in manifest['document_ids'] if doc not in deleted]
+            if request.document_id:
+                document_id = str(request.document_id)
+                if document_id not in document_ids:
+                    raise IndexerError('PDF_PAGE_UNAVAILABLE', '선택한 문서가 검색 버전에 없습니다.', 404)
+            else:
+                pdfs = []
+                for doc in document_ids:
+                    try:
+                        info = json.loads((self.storage.document_dir(doc) / 'document.json').read_text(encoding='utf-8'))
+                    except (OSError, ValueError) as error:
+                        raise IndexerError('PDF_PAGE_DOCUMENT_REQUIRED', '문서 정보를 확인할 수 없습니다. PDF 문서를 선택해 주세요.', 409) from error
+                    if info.get('format') == 'pdf':
+                        pdfs.append(doc)
+                if len(pdfs) != 1:
+                    raise IndexerError('PDF_PAGE_DOCUMENT_REQUIRED', '물리 쪽을 조회할 PDF 문서를 하나 선택해 주세요.', 422)
+                document_id = pdfs[0]
+            try:
+                info = json.loads((self.storage.document_dir(document_id) / 'document.json').read_text(encoding='utf-8'))
+            except (FileNotFoundError, ValueError) as error:
+                raise IndexerError('PDF_PAGE_UNAVAILABLE', '선택한 PDF 원본 정보를 확인할 수 없습니다.', 404) from error
+            if info.get('format') != 'pdf':
+                raise IndexerError('PDF_PAGE_INVALID', '물리 쪽 조회는 PDF에서만 사용할 수 있습니다.')
+            path = self.publisher.root / manifest['version'] / 'chunks.json'
+            chunks = [item for item in json.loads(path.read_text(encoding='utf-8'))
+                      if item.get('document_id') == document_id and item.get('page') in pages]
+            if len(chunks) > 10000:
+                raise IndexerError('PDF_PAGE_LIMIT', '지정한 쪽의 청크가 너무 많습니다. 페이지를 나누어 조회해 주세요.', 422)
+            chunks.sort(key=lambda item: (item.get('page', 0), item.get('first_order', 0), item.get('part_number', 0), item['chunk_id']))
+            ranks = {}
+            if chunks:
+                with tempfile.TemporaryDirectory() as temporary:
+                    lexical = BM25Index(Path(temporary) / 'pages.sqlite')
+                    lexical.replace_document(document_id, chunks)
+                    ranks = {hit.chunk_id: rank for rank, hit in enumerate(
+                        lexical.search(request.query, MAX_RETRIEVAL_TOP_N, document_id), 1)}
+            by_page = defaultdict(list)
+            for item in chunks:
+                by_page[item['page']].append(item)
+            for items in by_page.values():
+                items.sort(key=lambda item: (ranks.get(item['chunk_id'], MAX_RETRIEVAL_TOP_N + 1),
+                                             item.get('first_order', 0), item['chunk_id']))
+            # Alternate pages so one page cannot consume the entire candidate set.
+            candidate_limit = self.ranking.get('retrieval_top_n', 25)
+            pool = []
+            while len(pool) < candidate_limit and any(by_page.get(page) for page in pages):
+                for page in pages:
+                    if len(pool) >= candidate_limit:
+                        break
+                    if by_page.get(page):
+                        pool.append(by_page[page].pop(0))
+            result_limit = min(request.top_k or MAX_RESULT_LIMIT,
+                               self.ranking.get('rerank_top_n', 5) if request.rerank else candidate_limit)
+            reranked_count = 0
+            if request.rerank and pool:
+                if not self.publisher.reranker_factory:
+                    raise IndexerError('RERANK_UNAVAILABLE', '재순위 서비스 설정을 확인해 주세요.', 503)
+                from indexer.search_engine import SearchHit
+
+                lookup = {item['chunk_id']: item for item in pool}
+                ranker = self.publisher.reranker_factory(lambda key: lookup[key]['text'])
+                rerank_take = min(self.ranking.get('rerank_top_n', 5), len(pool))
+                try:
+                    ordered = ranker.rerank(request.query, [SearchHit(item['chunk_id'], 1.0 / (i + 1))
+                                                           for i, item in enumerate(pool)], rerank_take)
+                    if (len(ordered) > rerank_take
+                            or len({hit.chunk_id for hit in ordered}) != len(ordered)
+                            or any(hit.chunk_id not in lookup for hit in ordered)):
+                        raise ValueError('invalid reranker result')
+                except httpx.HTTPStatusError as error:
+                    raise IndexerError('SEARCH_PROVIDER_ERROR', '재순위 서비스 설정 또는 응답을 확인해 주세요.', 503) from error
+                except httpx.RequestError as error:
+                    raise IndexerError('SEARCH_PROVIDER_UNAVAILABLE', '재순위 서비스에 연결할 수 없습니다.', 503) from error
+                except (ValueError, TypeError, KeyError, IndexError, AttributeError) as error:
+                    raise IndexerError('SEARCH_PROVIDER_ERROR', '재순위 서비스 응답을 확인할 수 없습니다.', 503) from error
+                reranked_count = len(ordered)
+                selected = [{**lookup[hit.chunk_id], 'score': hit.score} for hit in ordered[:result_limit]]
+            else:
+                selected = [{**item, 'score': 1.0 / ranks[item['chunk_id']] if item['chunk_id'] in ranks else 0.0}
+                            for item in pool[:result_limit]]
+            present = sorted({item['page'] for item in chunks})
+            scope = {'kind': 'physical_pdf_pages', 'document_id': document_id, 'requested_pages': pages,
+                     'selection_method': 'bm25_within_pages', 'requested_method': request.method,
+                     'source_page_completeness': 'unknown',
+                     'pages_with_chunks': present, 'pages_without_chunks': [p for p in pages if p not in present],
+                     'selected_pages': sorted({item['page'] for item in selected}),
+                     'all_page_chunks_selected': len(selected) == len(chunks)}
+            result = {'index_version': manifest['version'], 'method': 'pdf_page_bm25',
+                      'reranked': request.rerank, 'page_scope': scope, 'results': selected,
+                      'search_counts': {'retrieval_top_n': candidate_limit, 'result_limit': result_limit,
+                                        'rerank_top_n': self.ranking.get('rerank_top_n', 5) if request.rerank else None,
+                                        'retrieved_count': len(pool), 'rerank_input_count': len(pool) if request.rerank else 0,
+                                        'reranked_count': reranked_count}}
+            return self._search(request, page_result=result)
+
     @staticmethod
     def _expand_table(results, indexed, limit=None):
         """Add bounded evidence from the same exact table, never an inferred continuation."""
@@ -137,12 +247,13 @@ class PublishedRetrieval:
         with guard if guard is not None else nullcontext():
             return self._search(request)
 
-    def _search(self, request):
+    def _search(self, request, *, page_result=None):
         try:
-            result = self.publisher.search(request.query, request.method, request.top_k or MAX_RESULT_LIMIT,
-                                           str(request.document_id) if request.document_id else None,
-                                           request.rerank, str(request.index_version) if request.index_version else None,
-                                           **self.ranking)
+            result = page_result if page_result is not None else self.publisher.search(
+                request.query, request.method, request.top_k or MAX_RESULT_LIMIT,
+                str(request.document_id) if request.document_id else None,
+                request.rerank, str(request.index_version) if request.index_version else None,
+                **self.ranking)
             documents = {}
             elements_by_job = {}
             xlsx_relations_by_job = {}

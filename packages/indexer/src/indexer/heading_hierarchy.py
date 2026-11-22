@@ -36,7 +36,7 @@ def heading_marker(text, *, is_first=False, parser_label=None):
     return HeadingMarker('ambiguous')
 
 
-def apply_flat_hierarchy(elements):
+def apply_flat_hierarchy(elements, *, preserve_explicit=False):
     """Infer paths from explicit markers while keeping ambiguous labels local.
 
     The stack contains (level, text, id, numeric key, marker). A later numbered
@@ -49,14 +49,16 @@ def apply_flat_hierarchy(elements):
             marker = heading_marker(item['text'], is_first=first_heading, parser_label=item.get('parser_label'))
             first_heading = False
             level = item.get('heading_level', 1)
-            number_key = None
-            if marker.kind == 'root':
+            number_key = marker.key if marker.kind == 'number' else None
+            fixed = preserve_explicit and (level > 1 or item.get('heading_level_explicit'))
+            if fixed:
+                pass
+            elif marker.kind == 'root':
                 level = 1
             elif marker.kind == 'subitem' and stack:
                 sibling = next((entry for entry in reversed(stack) if entry[4] == marker), None)
                 level = sibling[0] if sibling else min(6, stack[-1][0] + 1)
             elif marker.kind == 'number':
-                number_key = marker.key
                 parent_key = number_key.rpartition('.')[0]
                 parent = next((entry for entry in reversed(stack) if entry[3] == parent_key), None) if parent_key else None
                 if parent:
@@ -72,3 +74,38 @@ def apply_flat_hierarchy(elements):
                 stack.append((level, item['text'], item['element_id'], number_key, marker))
         item['heading_path'] = [entry[1] for entry in stack]
         item['heading_element_ids'] = [entry[2] for entry in stack]
+
+
+def promote_chapter_headers(elements):
+    """Promote unique top-of-page chapter markers followed by a heading."""
+    pages = {}
+    header_pages = {}
+    for item in elements:
+        if page := item.get('page'):
+            pages.setdefault(page, []).append(item)
+            if item['kind'] in {'header', 'page_header'}:
+                header_pages.setdefault(item['text'].strip().casefold(), set()).add(page)
+    promoted = False
+    for page, items in pages.items():
+        for index, item in enumerate(items):
+            if item['kind'] not in {'header', 'page_header'}:
+                continue
+            if len(header_pages.get(item['text'].strip().casefold(), ())) != 1:
+                continue
+            if heading_marker(item['text']).kind != 'root':
+                continue
+            coordinates = item.get('coordinates') or []
+            if not coordinates or any(not isinstance(point, dict) or not isinstance(point.get('y'), (int, float))
+                                      for point in coordinates):
+                continue
+            if min(point['y'] for point in coordinates) > 0.12 or max(point['y'] for point in coordinates) > 0.2:
+                continue
+            if any(other['kind'] not in {'header', 'page_header', 'page_number'} for other in items[:index]):
+                continue
+            following = next((other for other in items[index + 1:]
+                              if other['kind'] not in {'header', 'page_header', 'page_number'}), None)
+            if not following or following['kind'] != 'heading':
+                continue
+            item.update(kind='heading', heading_level=1, heading_level_origin='inferred', original_kind=item['kind'])
+            promoted = True
+    return promoted

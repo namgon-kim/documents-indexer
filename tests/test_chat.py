@@ -179,3 +179,35 @@ def test_interpretation_context_fits_before_table_relationship_metadata():
     assert context[0]['표_라벨_관계_일부_생략'] is True
     assert counts['context_omitted_count'] == 0
     assert counts['evidence_bytes'] <= 4096
+
+
+def test_pdf_page_scope_reflects_evidence_dropped_by_chat_budget(tmp_path):
+    hits = [{'filename': 'doc.pdf', 'source_refs': [{'page': page, 'role': 'evidence'}],
+             'search_text': text} for page, text in [(5, '가' * 3000), (9, '다른 쪽 정보')]]
+    scope = {'kind': 'physical_pdf_pages', 'requested_pages': [5, 9], 'pages_with_chunks': [5, 9],
+             'pages_without_chunks': [], 'selected_pages': [5, 9], 'all_page_chunks_selected': True}
+    retrieval = SimpleNamespace(search_pdf_pages=lambda _request, _pages: {
+        'results': hits, 'index_version': 'v', 'page_scope': scope})
+    def provider(request):
+        content = json.loads(json.loads(request.content)['messages'][-1]['content'])
+        assert content['PDF_물리쪽_조회']['pages_in_model_context'] == [5]
+        assert content['PDF_물리쪽_조회']['evidence_budget_limited']
+        assert not content['PDF_물리쪽_조회']['all_page_chunks_selected']
+        return httpx.Response(200, json={'choices': [{'message': {'content': '일부 근거 [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        chat = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake', chat_evidence_bytes=4096),
+                       retrieval, client)
+        result = chat.invoke(ChatRequest(message='PDF 5쪽과 9쪽', method='bm25'))
+    assert result['page_scope']['pages_in_model_context'] == [5]
+    assert result['search_counts']['evidence_limited']
+
+
+def test_pdf_page_lookup_does_not_apply_unused_embedding_input_limit(tmp_path):
+    seen = []
+    retrieval = SimpleNamespace(
+        publisher=SimpleNamespace(embedder=SimpleNamespace(profile=SimpleNamespace(max_input_bytes=256))),
+        search_pdf_pages=lambda request, pages: seen.append((request, pages)) or {'results': [], 'index_version': 'v'})
+    chat = RagChat(Config(tmp_path), retrieval, None)
+    request = ChatRequest(message='PDF 9쪽 ' + '가' * 200, method='hybrid')
+    chat.retrieve(request)
+    assert seen[0][1] == [9] and seen[0][0].query == request.message

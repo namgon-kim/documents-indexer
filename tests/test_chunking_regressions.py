@@ -547,3 +547,55 @@ def test_numbered_figure_items_remain_searchable_with_source_ranges(tmp_path):
         assert all(chunk['source_segments'][0]['text'] == element['text'][
             chunk['source_segments'][0]['start']:chunk['source_segments'][0]['end']]
             for chunk in chunks if chunk['chunk_id'] in {hit.chunk_id for hit in hits})
+
+
+def test_saved_page_headers_reset_chapters_and_footers_do_not_index():
+    import copy
+    import json
+    from pathlib import Path
+
+    rows = json.loads((Path(__file__).parent / 'fixtures' / 'poc_page_headings.json').read_text(encoding='utf8'))
+    rows.insert(0, {'page': 1, 'category': 'heading1', 'content': {'text': 'I 대학 중장기 발전전략'}})
+    original_rows = copy.deepcopy(rows)
+    elements = normalize_elements(rows)
+    chunks = make_chunks('d', 'j', elements, 400, 0)
+    assert rows == original_rows
+    second = next(e for e in elements if e.get('provider_id') == 48)
+    third = next(e for e in elements if e.get('provider_id') == 115)
+    assert second['heading_path'][0].startswith('II ')
+    assert third['heading_path'][0].startswith('Ⅲ ')
+    assert second['heading_path_origin'] == third['heading_path_origin'] == 'inferred'
+    for provider_id in (55, 118):
+        element = next(e for e in elements if e.get('provider_id') == provider_id)
+        assert element['text'] in {'17', '32'} and element['search_exclusion'] == 'page_label'
+        assert all(element['element_id'] not in chunk['element_ids'] for chunk in chunks)
+
+
+def test_repeated_chapter_header_and_numeric_body_are_not_misclassified():
+    coords = [{'x': 0.1, 'y': 0.02}, {'x': 0.4, 'y': 0.05}]
+    rows = [{'category': 'header', 'page': page, 'coordinates': coords, 'content': {'text': 'II 보고서'}}
+            for page in (1, 2)]
+    rows.insert(1, {'category': 'heading2', 'page': 1, 'content': {'html': '<h2>세부 제목</h2>'}})
+    rows.append({'category': 'heading2', 'page': 2, 'content': {'html': '<h2>다른 제목</h2>'}})
+    rows.append({'category': 'paragraph', 'page': 2, 'content': {'text': '17'}})
+    elements = normalize_elements(rows)
+    assert all(e['kind'] == 'header' for e in elements if e['text'] == 'II 보고서')
+    assert all(e['heading_level'] == 2 and e['heading_level_origin'] == 'parser'
+               for e in elements if e['kind'] == 'heading')
+    chunks = make_chunks('d', 'j', elements, 400, 0)
+    assert any('17' in c['text'] for c in chunks)
+
+
+def test_promoted_chapter_and_mixed_explicit_heading_levels_coexist():
+    coords = [{'x': 0.1, 'y': 0.02}, {'x': 0.4, 'y': 0.05}]
+    rows = [{'page': 1, 'category': 'heading1', 'content': {'text': 'I 이전 장'}},
+            {'page': 2, 'category': 'header', 'coordinates': coords, 'content': {'text': 'II 새 장'}},
+            {'page': 2, 'category': 'heading1', 'content': {'text': '1.4 실행 계획'}},
+            {'page': 2, 'category': 'heading2', 'content': {'html': '<h2>명시적 세부 제목</h2>'}},
+            {'page': 2, 'category': 'heading3', 'content': {'html': '<h3>명시적 하위 제목</h3>'}},
+            {'page': 2, 'category': 'paragraph', 'content': {'text': '실제 본문'}}]
+    elements = normalize_elements(rows)
+    assert elements[2]['heading_path'] == ['II 새 장', '1.4 실행 계획']
+    assert elements[3]['heading_level'] == 2 and elements[3]['heading_level_origin'] == 'parser'
+    assert elements[4]['heading_level'] == 3 and elements[4]['heading_level_origin'] == 'parser'
+    assert elements[-1]['heading_path'] == ['II 새 장', '명시적 세부 제목', '명시적 하위 제목']
