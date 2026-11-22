@@ -156,10 +156,19 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                            "ocr_policy": config.default_ocr_policy, "dpi": config.default_dpi, "extraction_mode": "parser"}
 
     def ensure_no_processing(app):
+        """Call with operation_lock held. Covers claimed worker and upload jobs, reserved
+        publications, index rebuilds and jobs whose stored status is still processing."""
         service = getattr(app.state, 'ingestion', None)
-        if reserved_documents or active_rebuilds or (service and any(job.get('status') == 'processing' for doc in service.storage.list_documents()
-                           for job in service.storage.list_jobs(doc['document_id']))):
+        if active_claims or reserved_documents or active_rebuilds or (service and any(
+                job.get('status') == 'processing' for doc in service.storage.list_documents()
+                for job in service.storage.list_jobs(doc['document_id']))):
             raise IndexerError('JOB_IN_PROGRESS', '문서 처리가 진행 중입니다. 완료 후 설정을 변경해 주세요.', 409)
+
+    def ensure_no_rebuild():
+        # A full rebuild replaces the active index from every published document, so
+        # it runs exclusively instead of failing late on a concurrent publication.
+        if active_rebuilds:
+            raise ValueError('검색 색인을 다시 만드는 중입니다. 완료 후 다시 시도해 주세요')
 
     def ensure_document_unreserved(document_id):
         if str(document_id) in reserved_documents:
@@ -169,6 +178,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
     def reserve_document(document_id):
         document_id = str(document_id)
         with operation_lock:
+            ensure_no_rebuild()
             ensure_document_unreserved(document_id)
             reserved_documents.add(document_id)
         try:
@@ -292,7 +302,9 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                                         app.state.ingestion.recover()
                                     recovery_needed = False
                                 service = getattr(app.state, 'ingestion', None)
-                                claimed = service.claim_next(exclude_documents=reserved_documents) if service and hasattr(service, 'claim_next') else None
+                                # Queued jobs wait while a full index rebuild runs.
+                                claimed = (service.claim_next(exclude_documents=reserved_documents)
+                                           if service and hasattr(service, 'claim_next') and not active_rebuilds else None)
                                 if isinstance(claimed, tuple):
                                     active_claims.add((claimed[0], claimed[1]))
                                 processed = bool(claimed)
@@ -536,6 +548,9 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                 except zipfile.BadZipFile as error:
                     raise IndexerError("INVALID_FORMAT", "문서 압축 형식이 올바르지 않습니다.", 415) from error
             with operation_lock:
+                if not deferred and active_rebuilds:
+                    raise IndexerError('INDEX_REBUILD_IN_PROGRESS',
+                                       '검색 색인을 다시 만드는 중입니다. 완료 후 업로드하거나 대기열에 추가해 주세요.', 409)
                 service = request.app.state.ingestion
                 result = service.enqueue(path, profile, effective, embedding_profile_id, allow_duplicate=allow_duplicate)
                 if deferred:
@@ -582,6 +597,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError("PARSER_NOT_CONFIGURED", "파서 연결을 설정해 주세요.", 503)
         try:
             with operation_lock:
+                ensure_no_rebuild()
                 ensure_document_unreserved(document_id)
                 request.app.state.ingestion.delete_document(str(document_id))
         except FileNotFoundError as error:
@@ -1045,8 +1061,14 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             with operation_lock:
                 publisher = request.app.state.ingestion.publisher_for(profile_id, for_ingest=True)
                 key = getattr(publisher, 'active_name', profile_id or '__default__')
-                if key in active_rebuilds:
-                    raise ValueError('이미 해당 색인을 다시 만들고 있습니다')
+                if active_rebuilds:
+                    raise ValueError('이미 검색 색인을 다시 만들고 있습니다')
+                try:
+                    # Start only when no job is claimed, reserved or processing. While the
+                    # rebuild runs, claims, publications and deletions wait or are refused.
+                    ensure_no_processing(request.app)
+                except IndexerError as error:
+                    raise ValueError('문서 처리 또는 게시가 진행 중입니다. 완료 후 색인을 다시 만들어 주세요') from error
                 active_rebuilds.add(key)
             try:
                 manifest = publisher.rebuild_with_current_profile()
@@ -1213,8 +1235,9 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         if not profile:
             raise IndexerError("PARSER_PROFILE_INVALID", "파서를 찾을 수 없습니다.", 404)
         with operation_lock, settings_lock:
-            if reserved_documents or active_rebuilds:
-                raise IndexerError('JOB_IN_PROGRESS', '게시 또는 색인 작업이 진행 중입니다.', 409)
+            # Running worker and upload jobs hold claims, not reservations. Do not swap
+            # the pipeline while any job is claimed, reserved, rebuilding or processing.
+            ensure_no_processing(request.app)
             changes = {key: profile[key] for key in PARSER_PROFILE_FIELDS}
             old_service = getattr(request.app.state, "ingestion", None)
             if old_service and old_service.parser_factory:

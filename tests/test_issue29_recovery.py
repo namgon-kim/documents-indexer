@@ -590,3 +590,76 @@ def test_long_review_resume_and_rebuild_do_not_hold_api_lock(tmp_path, monkeypat
         finally:
             release.set()
         assert running.result(timeout=5).status_code == 200
+
+
+def test_full_rebuild_runs_exclusively_with_processing_and_index_changes(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from io import BytesIO
+    from time import monotonic, sleep
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+    from indexer.config import Config
+    from indexer.parsing.contracts import ParseResult
+    from pypdf import PdfWriter
+
+    from apps.api.main import create_app
+    parsing, finish_parse = threading.Event(), threading.Event()
+    rebuilding, finish_rebuild = threading.Event(), threading.Event()
+
+    class Parser:
+        def parse(self, request):
+            parsing.set()
+            assert finish_parse.wait(8)
+            rows = [{'page': 1, 'category': 'paragraph', 'content': {'text': '자료'}}]
+            return ParseResult('fake', rows, {'elements': rows})
+
+    def rebuild():
+        rebuilding.set()
+        assert finish_rebuild.wait(8)
+        return {'version': 'v', 'chunk_count': 1}
+
+    def pdf(width):
+        writer = PdfWriter()
+        writer.add_blank_page(width=width, height=100)
+        output = BytesIO()
+        writer.write(output)
+        return output.getvalue()
+
+    publisher = SimpleNamespace(deleted_documents=lambda: set(), rebuild_with_current_profile=rebuild)
+    store = ArtifactStore(tmp_path)
+    service = IngestionService(store, Parser(), publisher)
+    app = create_app(Config(tmp_path, access_key='example', external_processing=True), ingestion_service=service)
+    with TestClient(app, base_url='https://testserver') as client, ThreadPoolExecutor(max_workers=2) as pool:
+        login = client.post('/v1/auth/login', json={'access_key': 'example'}, headers={'Origin': 'https://testserver'})
+        client.headers.update({'Origin': 'https://testserver', 'X-CSRF-Token': login.json()['csrf_token']})
+        first = client.post('/v1/ingest', data={'deferred': 'true'}, files={'file': ('one.pdf', pdf(100))})
+        assert first.status_code == 200 and parsing.wait(3)
+        doc, job = first.json()['document_id'], first.json()['job_id']
+        try:
+            # The worker holds a claim while parsing, so a rebuild cannot start.
+            refused = client.post('/v1/ingest-index-rebuild')
+            assert refused.status_code == 409 and refused.json()['error']['code'] == 'REBUILD_UNAVAILABLE'
+        finally:
+            finish_parse.set()
+        deadline = monotonic() + 5
+        while True:
+            running = pool.submit(client.post, '/v1/ingest-index-rebuild')
+            if rebuilding.wait(0.5):
+                break
+            assert running.result(timeout=2).status_code == 409 and monotonic() < deadline
+        try:
+            synchronous = client.post('/v1/ingest', files={'file': ('two.pdf', pdf(150))})
+            assert synchronous.status_code == 409
+            assert synchronous.json()['error']['code'] == 'INDEX_REBUILD_IN_PROGRESS'
+            queued = client.post('/v1/ingest', data={'deferred': 'true'}, files={'file': ('three.pdf', pdf(200))})
+            assert queued.status_code == 200
+            sleep(0.8)
+            assert store.load_job(queued.json()['document_id'], queued.json()['job_id'], 'processing')['status'] == 'queued'
+            assert client.delete(f'/v1/ingest/{doc}').status_code == 409
+            accepted = client.post(f'/v1/ingest/{doc}/jobs/{job}/accept-content-changes', json={})
+            assert accepted.status_code == 409 and '색인을 다시 만드는' in accepted.json()['error']['message']
+        finally:
+            finish_rebuild.set()
+        assert running.result(timeout=5).status_code == 200

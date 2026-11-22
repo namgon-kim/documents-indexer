@@ -123,8 +123,9 @@ def test_queued_and_resumed_jobs_keep_original_parser(tmp_path):
     assert stat.S_IMODE((store.document_dir(job["document_id"]) / "jobs" / job["job_id"] / "parser_config.json").stat().st_mode) == 0o600
 
 
-def test_switch_parser_does_not_wait_for_inflight_job(tmp_path, monkeypatch):
+def test_switch_parser_is_refused_while_a_worker_job_is_processing(tmp_path, monkeypatch):
     import threading
+    from time import monotonic, sleep
 
     from indexer.parsing.registry import PROVIDERS
     from pypdf import PdfWriter
@@ -153,9 +154,16 @@ def test_switch_parser_does_not_wait_for_inflight_job(tmp_path, monkeypatch):
             assert started.wait(3)
             assert client.put("/v1/parser-profiles/paddle", json={"name": "Paddle", "parser_provider": "paddle_vl",
                 "parser_base_url": "https://proxy.test"}).status_code == 200
+            # The worker holds a claim, not a document reservation, while it parses.
             response = client.post("/v1/parser-profiles/paddle/activate", json={})
-            assert response.status_code == 200
-            assert client.app.state.ingestion.parser.config.provider == "paddle_vl"
+            assert response.status_code == 409 and response.json()["error"]["code"] == "JOB_IN_PROGRESS"
+            assert client.app.state.ingestion is old_service
             assert old_service.parser.config.provider == "upstage"
         finally:
             release.set()
+        deadline = monotonic() + 5
+        while (response := client.post("/v1/parser-profiles/paddle/activate", json={})).status_code == 409:
+            assert monotonic() < deadline
+            sleep(0.05)
+        assert response.status_code == 200
+        assert client.app.state.ingestion.parser.config.provider == "paddle_vl"
