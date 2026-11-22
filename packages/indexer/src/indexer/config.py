@@ -68,6 +68,7 @@ class Config:
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-6.1-terra"
     llm_models: tuple[str, ...] = ()
+    llm_context_tokens: int = 131072
     xlsx_structure_enabled: bool = False
     xlsx_structure_model: str = ""
     xlsx_structure_max_input_bytes: int = 64000
@@ -124,6 +125,7 @@ class Config:
             llm_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
             llm_model=os.getenv("LLM_MODEL", "gpt-6.1-terra"),
             llm_models=tuple(dict.fromkeys(os.getenv("LLM_MODELS", "").replace(",", " ").split())),
+            llm_context_tokens=int(os.getenv("LLM_CONTEXT_TOKENS", "131072")),
             default_target_chars=int(os.getenv("DEFAULT_TARGET_CHARS", "1000")),
             default_overlap_chars=int(os.getenv("DEFAULT_OVERLAP_CHARS", "150")),
             default_ocr_policy=os.getenv("DEFAULT_OCR_POLICY", "automatic"),

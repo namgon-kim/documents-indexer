@@ -53,7 +53,9 @@ def apply_flat_hierarchy(elements, *, preserve_explicit=False):
     hyphen_keys = set()
     for number in numbers:
         parent = number.rpartition('-')[0]
-        if number.count('-') >= 2 and (parent in numbers or any(
+        # A sibling sequence is evidence at any depth. Exclude year-like
+        # prefixes so a set of date headings is not mistaken for numbering.
+        if int(number.split('-')[0]) < 1000 and (parent in numbers or any(
                 other != number and other.rpartition('-')[0] == parent for other in numbers)):
             hyphen_keys.add(number)
             if parent in numbers:

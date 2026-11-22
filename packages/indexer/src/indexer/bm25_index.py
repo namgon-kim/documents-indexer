@@ -119,8 +119,8 @@ class BM25Index:
             if short:
                 channels.append(run(db, 'chunks', ' OR '.join('"' + term + '"*' for term in short)))
                 diagnostics.ranking('bm25_prefix', [hit for hit, _ in channels[-1]])
-            # Korean partial evidence is a supplementary candidate source, not
-            # stemming: keep exact candidates first and require multiple trigrams.
+            # Korean partial evidence is supplementary, not stemming. Require
+            # multiple trigrams, then compare it with all other candidates below.
             groups = [{term[index:index + 3] for index in range(len(term) - 2)}
                       for term in terms if re.fullmatch(r'[가-힣]{4,}', term)]
             grams = list(dict.fromkeys(gram for term in terms if re.fullmatch(r'[가-힣]{4,}', term)
@@ -133,6 +133,8 @@ class BM25Index:
                 fallback = [(hit, text) for hit, text in fallback if any(
                     sum(gram in embedding_text(text) for gram in group & selected) >= 2 for group in groups)]
                 diagnostics.ranking('bm25_korean_partial', [hit for hit, _ in fallback])
+                if fallback:
+                    channels.append(fallback)
 
         # FTS scores from different tokenizers are not comparable. Fuse ranks,
         # then prioritize how much of the query is actually present in each
@@ -164,18 +166,19 @@ class BM25Index:
                         covered_terms[chunk_id].add(index)
         scored = []
         for hit in ranks:
-            covered = sum(len(terms[index]) for index in covered_terms[hit.chunk_id])
+            normalized = embedding_text(texts[hit.chunk_id])
+            covered = 0.0
+            for index, term in enumerate(terms):
+                if index in covered_terms[hit.chunk_id]:
+                    covered += len(term)
+                elif re.fullmatch(r'[가-힣]{4,}', term):
+                    grams = {term[i:i + 3] for i in range(len(term) - 2)}
+                    matched = sum(gram in normalized for gram in grams)
+                    if matched >= 2:
+                        covered += len(term) * 0.8 * matched / len(grams)
             score = covered / total + hit.score / 100
             scored.append(SearchHit(hit.chunk_id, score))
         result = sorted(scored, key=lambda hit: (-hit.score, hit.chunk_id))
-        seen = {hit.chunk_id for hit in result}
-        additions = []
-        for hit, text in fallback:
-            if hit.chunk_id not in seen:
-                additions.append(SearchHit(hit.chunk_id, 0.0))
-                texts[hit.chunk_id] = text
-                seen.add(hit.chunk_id)
-        result.extend(additions)
         result = prioritize_identifiers(result, texts, codes)[:limit]
         diagnostics.ranking('bm25_final', result)
         return result

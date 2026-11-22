@@ -191,7 +191,7 @@ def test_large_history_is_bounded_by_utf8_and_reports_omissions(tmp_path):
         assert '29 ' in messages[-2]['content'] and len(messages) > 12
         return httpx.Response(200, json={'choices': [{'message': {'content': '응답 [1]'}}]})
     with httpx.Client(transport=httpx.MockTransport(provider)) as client:
-        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='x'), retrieval, client).invoke(
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='x', llm_context_tokens=524288), retrieval, client).invoke(
             ChatRequest(message='새 질문', method='bm25', history=history))
     assert result['search_counts']['history_omitted_count'] > 0
     assert result['search_counts']['history_budget_bytes'] == 262144
@@ -247,13 +247,13 @@ def test_followup_long_history_keeps_start_and_end_within_embedding_limit(tmp_pa
     assert seen[0].query.endswith('그 시스템은?') and byte_size(seen[0].query) <= 400
 
 
-def test_partial_candidates_do_not_displace_a_full_exact_candidate_pool(tmp_path):
+def test_partial_candidates_compete_with_generic_exact_matches(tmp_path):
     index = BM25Index(tmp_path / 'db')
     chunks = [{'chunk_id': f'generic-{i}', 'text': '사업 추진'} for i in range(40)]
     chunks.append({'chunk_id': 'target', 'text': '학습지원시스템 상세'})
     index.replace_document('d', chunks)
     hits = [hit.chunk_id for hit in index.search('학습지원시스템은 사업', 10)]
-    assert len(hits) == 10 and all(hit.startswith('generic-') for hit in hits)
+    assert len(hits) == 10 and 'target' in hits
 
 
 def test_history_retains_uncited_bracket_numbers_without_reusing_citation_ids():
@@ -273,3 +273,56 @@ def test_plain_decimal_is_not_treated_as_a_compound_identifier():
     from indexer.bm25_index import identifiers
 
     assert identifiers('비율 2.5 및 버전 v2.5') == ['v2.5']
+
+
+def test_partial_candidates_do_not_outrank_complete_query_matches(tmp_path):
+    index = BM25Index(tmp_path / 'db')
+    index.replace_document('d', [{'chunk_id': 'exact', 'text': '학습지원시스템은 사업'},
+                                 {'chunk_id': 'partial', 'text': '학습지원시스템 사업'}])
+    assert index.search('학습지원시스템은 사업', 2)[0].chunk_id == 'exact'
+
+
+def test_two_part_hyphen_siblings_and_date_headings():
+    rows = [{'category': 'heading1', 'content': {'text': text}}
+            for text in ['Ⅰ. 계획', '1-1 A', '1-2 B']]
+    elements = normalize_elements(rows)
+    assert elements[-1]['heading_path'] == ['Ⅰ. 계획', '1-2 B']
+    assert heading_marker('2025-03-15 일정').kind == 'ambiguous'
+
+
+@pytest.mark.parametrize('question', ['그 기능은 어떻게 작동해?', '그 서비스의 가격은?', '해당 시스템의 주요 기능은?', '기능은?'])
+def test_general_followup_uses_previous_answer(tmp_path, question):
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'results': [], 'index_version': 'v'})
+    history = [ChatMessage(role='user', content='서비스 목록'),
+               ChatMessage(role='assistant', content='1. 알파 서비스\n2. 베타 서비스\n3. 감마 서비스')]
+    RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message=question, method='bm25', history=history))
+    assert '베타 서비스' in seen[0].query and seen[0].query.endswith(question)
+
+
+def test_ordinal_followup_preserves_target_from_long_answer(tmp_path):
+    seen = []
+    retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'results': [], 'index_version': 'v'})
+    history = [ChatMessage(role='user', content='시스템을 소개해줘'),
+               ChatMessage(role='assistant', content='1. 알파 ' + '설명' * 200 + '\n2. 베타시스템\n3. 감마 ' + '설명' * 200)]
+    RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message='그중 두 번째의 기능은?', method='bm25', history=history))
+    assert '베타시스템' in seen[0].query
+
+
+@pytest.mark.parametrize('context_tokens', [8192, 16384, 65536])
+def test_model_context_budget_includes_system_evidence_and_history(tmp_path, context_tokens):
+    history = [ChatMessage(role='user', content=f'{i} ' + '가' * 2000) for i in range(12)]
+    hit = {'filename': 'doc', 'source_refs': [], 'search_text': '근거' * 5000}
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
+    captured = []
+    def provider(request):
+        payload = json.loads(request.content)
+        captured.extend(payload['messages'])
+        assert byte_size(json.dumps(payload['messages'], ensure_ascii=False)) + 16 * len(payload['messages']) <= context_tokens - min(4096, context_tokens // 4)
+        return httpx.Response(200, json={'choices': [{'message': {'content': '응답 [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='x', llm_context_tokens=context_tokens), retrieval, client).invoke(
+            ChatRequest(message='질문', method='bm25', history=history))
+    assert result['search_counts']['model_context_tokens'] == context_tokens
+    assert result['search_counts']['history_omitted_count'] > 0
+    assert captured[-1]['role'] == 'user'
