@@ -240,6 +240,34 @@ def probe_results(probes, result, trace, publisher, *, chat):
         elif isinstance(value, (str, int, float)) and not isinstance(value, bool):
             yield str(value)
 
+    def cell_text_status(probe, source, item):
+        """Confirm a cell only when its unique rendered segment is present in model text."""
+        if str(probe.document_id) != source.get('document_id') or probe.page not in item.get('evidence_pages', []):
+            return 'not_applicable'
+        segments = source.get('table_segments', [])
+        terms = [embedding_text(term) for term in probe.contains_line]
+        candidates = [segment for segment in segments
+                      if (probe.row is None or segment.get('row') == probe.row)
+                      and (probe.column is None or segment.get('column') == probe.column)
+                      and match_terms(terms, segment.get('text', ''))]
+        if not candidates:
+            return 'not_applicable'
+        segment_texts = [embedding_text(segment.get('text', '')) for segment in segments]
+        expected_body = embedding_text('\n'.join(segment.get('text', '') for segment in segments))
+        stored_body = embedding_text(source.get('body_text') or '')
+        actual_text = embedding_text(str(item.get('text', '')))
+        # Require a consistent full table body, so a heading or duplicate value cannot
+        # masquerade as the requested cell. Older or partially sent chunks stay unknown.
+        if (not expected_body or stored_body != expected_body
+                or not (actual_text == expected_body or actual_text.endswith('\n' + expected_body))):
+            return 'unknown'
+        model_lines = [embedding_text(line) for line in actual_text.splitlines()]
+        for candidate in candidates:
+            rendered = embedding_text(candidate.get('text', ''))
+            if rendered and segment_texts.count(rendered) == 1 and model_lines.count(rendered) == 1:
+                return 'confirmed'
+        return 'unknown'
+
     def model_matches(probe, terms):
         if model_input is None:
             return []
@@ -249,13 +277,14 @@ def probe_results(probes, result, trace, publisher, *, chat):
                 continue
             fields = []
             if probe.row is not None or probe.column is not None:
-                if match(probe, source, returned=True):
+                if cell_text_status(probe, source, item) == 'confirmed':
                     fields.append('text')
             else:
                 evidence_pages = item.get('evidence_pages', [])
                 all_pages = {*evidence_pages, *item.get('context_pages', [])}
-                if probe.page in evidence_pages and (not terms or any(
-                        match_terms(terms, line) for line in str(item.get('text', '')).splitlines())):
+                model_text = str(item.get('text', ''))
+                if probe.page in evidence_pages and model_text.strip() and (not terms or any(
+                        match_terms(terms, line) for line in model_text.splitlines())):
                     fields.append('text')
                 if terms and probe.page in all_pages and any(
                         match_terms(terms, line) for line in str(item.get('context', '')).splitlines()):
@@ -299,6 +328,24 @@ def probe_results(probes, result, trace, publisher, *, chat):
         terms = [embedding_text(term) for term in probe.contains_line]
         matching = [hit['chunk_id'] for hit in hits if hit.get('chunk_id') and match(probe, hit, returned=True)]
         model_fields = model_matches(probe, terms) if chat else []
+        cell_unknown = []
+        if chat and model_input is not None and (probe.row is not None or probe.column is not None):
+            for source, item in zip(hits, model_input, strict=True):
+                if not source.get('chunk_id') or str(probe.document_id) != source.get('document_id'):
+                    continue
+                if probe.page not in {*item.get('evidence_pages', []), *item.get('context_pages', [])}:
+                    continue
+                status = cell_text_status(probe, source, item)
+                metadata = {key: value for key, value in item.items() if key not in {'text', 'context'}}
+                possible_values = [*str(item.get('text', '')).splitlines(),
+                                   *str(item.get('context', '')).splitlines(), *leaves(metadata)]
+                unlinked = status == 'not_applicable' and (
+                    not terms or any(match_terms(terms, value) for value in possible_values))
+                if status == 'unknown' or unlinked:
+                    cell_unknown.append(source['chunk_id'])
+        if chat:
+            # For chat, report only actual captured model text; do not infer it from source metadata.
+            matching = [entry['chunk_id'] for entry in model_fields if 'text' in entry['fields']]
         uncertain = [hit['chunk_id'] for hit in hits if hit.get('chunk_id') in indexed
                      and hit.get('evidence_truncated') and (probe.row is not None or probe.column is not None)
                      and match(probe, indexed[hit['chunk_id']], returned=False)]
@@ -316,12 +363,15 @@ def probe_results(probes, result, trace, publisher, *, chat):
                     stages[stage] = [chunk_id for chunk_id in ids if chunk_id in indexed and match(probe, indexed[chunk_id], returned=False)]
         published_matches = [key for key, item in indexed.items() if match(probe, item, returned=False)]
         output.append({'probe': number, 'returned_chunk_ids': matching,
-                       'truncated_cell_match_unverified_chunk_ids': uncertain, 'stage_chunk_ids': stages,
+                       'truncated_cell_match_unverified_chunk_ids': uncertain,
+                       'cell_model_input_unverified_chunk_ids': cell_unknown, 'stage_chunk_ids': stages,
                        'published_matching_chunk_ids': published_matches[:1000],
                        'published_matches_truncated': len(published_matches) > 1000,
                        'table_expansion_reasons': expansion_reasons(published_matches),
                        'model_input_status': ('captured' if model_input is not None else 'not_captured') if chat else 'not_requested',
                        'model_input_matches': model_fields, 'model_input_scope': 'source_evidence_fields_only',
+                       'metadata_match_status': ('checked' if model_input is not None and terms
+                                                  and probe.row is None and probe.column is None else 'not_checked'),
                        'answer_sentence_ids': [index for index, sentence in enumerate(sentence_texts, 1)
                                                if terms and match_terms(terms, sentence)],
                        'answer_literal_match': match_terms(terms, answer) if answer is not None and terms else None,

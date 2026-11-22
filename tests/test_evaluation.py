@@ -86,9 +86,9 @@ def test_chat_trace_reports_context_presence_separately_from_citable_recall():
     cases = [{'id': 'x', 'query': 'question', 'evidence': [{'document_id': doc, 'page': 1}]}]
     with httpx.Client(base_url='https://test.example', transport=httpx.MockTransport(handler)) as client:
         report = evaluate(client, cases, 5, method='bm25', trace_mode='chat')
-    assert report['recall'] == 0
+    assert report['recall'] == 0 and report['recall_scope'] == 'confirmed_citable_source_lower_bound'
     assert report['cases'][0]['model_input_recall'] == 1
-    assert report['cases'][0]['model_input_recall_status'] == 'literal_source_fields_only'
+    assert report['cases'][0]['model_input_recall_status'] == 'literal_text_or_context_only'
 
 
 def test_chat_trace_reports_truncated_cell_as_unknown_not_missing():
@@ -105,3 +105,21 @@ def test_chat_trace_reports_truncated_cell_as_unknown_not_missing():
         report = evaluate(client, cases, 5, method='bm25', trace_mode='chat')
     assert report['cases'][0]['model_input_recall'] is None
     assert report['cases'][0]['model_input_recall_status'] == 'unknown'
+
+
+def test_metadata_only_match_is_separate_from_content_recall():
+    from uuid import uuid4
+
+    doc, version = str(uuid4()), str(uuid4())
+    def handler(_request):
+        return httpx.Response(200, json={'index_version': version, 'trace': {'trace_id': 't',
+            'stages': {'model_evidence': [{'chunk_id': 'c', 'citation_id': 1}]},
+            'probes': [{'returned_chunk_ids': [], 'model_input_status': 'captured', 'metadata_match_status': 'checked',
+                        'model_input_matches': [{'chunk_id': 'c', 'fields': ['metadata']}],
+                        'cell_model_input_unverified_chunk_ids': []}]}})
+    cases = [{'id': 'x', 'query': 'question', 'evidence': [{'document_id': doc, 'page': 1, 'contains_line': ['1']}]}]
+    with httpx.Client(base_url='https://test.example', transport=httpx.MockTransport(handler)) as client:
+        report = evaluate(client, cases, 5, method='bm25', trace_mode='chat')
+    result = report['cases'][0]
+    assert result['model_input_recall'] == result['model_text_recall'] == result['model_context_recall'] == 0
+    assert result['model_metadata_recall'] == 1

@@ -48,6 +48,11 @@ def evidence_matches(expected, result):
     )
 
 
+def model_field_recall(probes, fields):
+    return sum(any(fields.intersection(match.get('fields', []))
+                   for match in probe.get('model_input_matches', [])) for probe in probes) / len(probes)
+
+
 def evaluate(client, cases, top_k, method="hybrid", index_version=None, profile_id=None, *,
              trace_mode=None, rerank=False):
     report = []
@@ -110,14 +115,20 @@ def evaluate(client, cases, top_k, method="hybrid", index_version=None, profile_
                 row['recall_scope'] = 'confirmed_citable_source_lower_bound'
                 probes = trace['probes']
                 unknown = any(probe.get('model_input_status') != 'captured' or (
-                    probe.get('truncated_cell_match_unverified_chunk_ids') and not probe.get('model_input_matches'))
-                    for probe in probes)
+                    (probe.get('cell_model_input_unverified_chunk_ids')
+                     or probe.get('truncated_cell_match_unverified_chunk_ids'))
+                    and not probe.get('model_input_matches')) for probe in probes)
                 if unknown:
-                    row['model_input_recall'] = None
+                    row['model_input_recall'] = row['model_text_recall'] = row['model_context_recall'] = None
                     row['model_input_recall_status'] = 'unknown'
                 else:
-                    row['model_input_recall'] = sum(bool(probe.get('model_input_matches')) for probe in probes) / len(probes)
-                    row['model_input_recall_status'] = 'literal_source_fields_only'
+                    row['model_text_recall'] = model_field_recall(probes, {'text'})
+                    row['model_context_recall'] = model_field_recall(probes, {'context'})
+                    row['model_input_recall'] = model_field_recall(probes, {'text', 'context'})
+                    row['model_input_recall_status'] = 'literal_text_or_context_only'
+                row['model_metadata_recall'] = (model_field_recall(probes, {'metadata'}) if all(
+                    probe.get('model_input_status') == 'captured' and probe.get('metadata_match_status') == 'checked'
+                    for probe in probes) else None)
         report.append(row)
     if not report:
         raise ValueError("Provide at least one evaluation case")
@@ -128,6 +139,7 @@ def evaluate(client, cases, top_k, method="hybrid", index_version=None, profile_
         "method": method,
         "profile_id": profile_id,
         "rerank": rerank, "trace_mode": trace_mode,
+        "recall_scope": "confirmed_citable_source_lower_bound" if trace_mode == "chat" else "returned_search_evidence",
         "count": len(report),
         "hit_rate": sum(case["hit"] for case in report) / len(report),
         "recall": sum(case["recall"] for case in report) / len(report),

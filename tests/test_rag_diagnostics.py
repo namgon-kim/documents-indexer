@@ -370,3 +370,81 @@ def test_context_excluded_by_budget_is_not_reported_as_model_input(tmp_path):
         assert result['search_counts']['context_omitted_count'] == 1
         assert probe['model_input_status'] == 'captured' and probe['model_input_matches'] == []
         assert 'hiddenContext' not in json.dumps({'trace': trace, 'probe': probe})
+
+
+def test_cell_probe_checks_actual_model_text_and_marks_ambiguous_as_unknown(tmp_path):
+    from indexer.diagnostics import probe_results, set_model_input
+
+    from apps.api.main import DiagnosticProbe
+
+    doc, version = str(uuid4()), str(uuid4())
+    folder = tmp_path / version
+    folder.mkdir()
+    segment = {'row': 4, 'column': 2, 'text': '부서 / 742명'}
+    chunk = {'chunk_id': 'a', 'document_id': doc, 'page': 1, 'text': segment['text'],
+             'body_text': segment['text'], 'table_segments': [segment]}
+    (folder / 'chunks.json').write_text(json.dumps([chunk]))
+    publisher = SimpleNamespace(root=tmp_path, deleted_documents=lambda: set())
+    result = {'index_version': version, 'answer': '', 'sources': [{**chunk, 'search_text': segment['text'],
+              'source_refs': [{'page': 1, 'role': 'evidence'}]}]}
+    trace = {'stages': {'model_evidence': [{'chunk_id': 'a', 'citation_id': 1, 'status': 'included'}]}}
+    probe = DiagnosticProbe(document_id=doc, page=1, row=4, column=2, contains_line=['742명'])
+    def check(model_text):
+        with capture_trace():
+            set_model_input([{'id': 1, 'text': model_text, 'context': '', 'evidence_pages': [1]}])
+            return probe_results([probe], result, trace, publisher, chat=True)[0]
+    missing = check('다른 내용')
+    assert missing['returned_chunk_ids'] == [] and missing['model_input_matches'] == []
+    assert missing['cell_model_input_unverified_chunk_ids'] == ['a']
+    assert missing['stage_chunk_ids']['model_evidence'] == []
+    present = check('제목\n부서 / 742명')
+    assert present['model_input_matches'] == [{'citation_id': 1, 'chunk_id': 'a', 'fields': ['text']}]
+    assert present['returned_chunk_ids'] == ['a'] and not present['cell_model_input_unverified_chunk_ids']
+    # The same rendered value in two distinct cells cannot be uniquely attributed.
+    result['sources'][0]['table_segments'] = [segment, {'row': 5, 'column': 2, 'text': segment['text']}]
+    ambiguous = check('부서 / 742명')
+    assert ambiguous['model_input_matches'] == [] and ambiguous['cell_model_input_unverified_chunk_ids'] == ['a']
+
+
+def test_cell_value_seen_only_in_unlinked_context_remains_unknown(tmp_path):
+    from indexer.diagnostics import probe_results, set_model_input
+
+    from apps.api.main import DiagnosticProbe
+
+    doc, version = str(uuid4()), str(uuid4())
+    folder = tmp_path / version
+    folder.mkdir()
+    chunk = {'chunk_id': 'a', 'document_id': doc, 'page': 1, 'text': '본문'}
+    (folder / 'chunks.json').write_text(json.dumps([chunk]))
+    publisher = SimpleNamespace(root=tmp_path, deleted_documents=lambda: set())
+    result = {'index_version': version, 'answer': '', 'sources': [{**chunk, 'search_text': '본문',
+              'source_refs': [{'page': 1, 'role': 'evidence'}]}]}
+    trace = {'stages': {'model_evidence': [{'chunk_id': 'a', 'citation_id': 1, 'status': 'included'}]}}
+    probe = DiagnosticProbe(document_id=doc, page=1, row=4, column=2, contains_line=['742'])
+    with capture_trace():
+        set_model_input([{'id': 1, 'text': '본문', 'context': '742', 'evidence_pages': [1], 'context_pages': []}])
+        [observed] = probe_results([probe], result, trace, publisher, chat=True)
+    assert observed['model_input_matches'] == []
+    assert observed['cell_model_input_unverified_chunk_ids'] == ['a']
+
+
+def test_numeric_metadata_match_does_not_become_body_match(tmp_path):
+    from indexer.diagnostics import probe_results, set_model_input
+
+    from apps.api.main import DiagnosticProbe
+
+    doc, version = str(uuid4()), str(uuid4())
+    folder = tmp_path / version
+    folder.mkdir()
+    chunk = {'chunk_id': 'a', 'document_id': doc, 'page': 1, 'text': '내용'}
+    (folder / 'chunks.json').write_text(json.dumps([chunk]))
+    publisher = SimpleNamespace(root=tmp_path, deleted_documents=lambda: set())
+    result = {'index_version': version, 'answer': '', 'sources': [{**chunk, 'search_text': '내용',
+              'source_refs': [{'page': 1, 'role': 'evidence'}]}]}
+    trace = {'stages': {'model_evidence': [{'chunk_id': 'a', 'citation_id': 1, 'status': 'included'}]}}
+    probe = DiagnosticProbe(document_id=doc, page=1, contains_line=['1'])
+    with capture_trace():
+        set_model_input([{'id': 1, 'text': '내용', 'context': '', 'evidence_pages': [1], 'context_pages': []}])
+        [observed] = probe_results([probe], result, trace, publisher, chat=True)
+    assert observed['model_input_matches'] == [{'chunk_id': 'a', 'citation_id': 1, 'fields': ['metadata']}]
+    assert observed['returned_chunk_ids'] == [] and observed['metadata_match_status'] == 'checked'
