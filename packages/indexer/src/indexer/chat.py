@@ -1,9 +1,11 @@
+import hashlib
 import json
 import re
 
 import httpx
 from langchain_core.runnables import RunnableLambda
 
+from indexer import diagnostics
 from indexer.answer_audit import audit_answer
 from indexer.contracts import IndexerError, SearchRequest
 from indexer.embedding_input import byte_size, embedding_text
@@ -24,6 +26,8 @@ def _chat_evidence(hits, limit, budget=32768):
     chosen = ordered[:limit]
     primary = [hit for hit in chosen if hit.get('expansion_reason') != 'same_source_element']
     supplementary = [hit for hit in chosen if hit.get('expansion_reason') == 'same_source_element']
+    decisions = ({hit['chunk_id']: 'evidence_count_limit' for hit in ordered[limit:] if hit.get('chunk_id')}
+                 if diagnostics.active() else None)
 
     def add(hit, *, allow_truncation):
         nonlocal truncated
@@ -46,6 +50,8 @@ def _chat_evidence(hits, limit, budget=32768):
             item['표_라벨_관계_일부_생략'] = True
         if encoded([*context, item]) > fit_budget:
             if not allow_truncation:
+                if decisions is not None and hit.get('chunk_id'):
+                    decisions[hit['chunk_id']] = 'evidence_byte_budget'
                 return
             full_text = item["text"]
             low, high = 1, len(full_text)
@@ -59,11 +65,17 @@ def _chat_evidence(hits, limit, budget=32768):
                 else:
                     high = middle - 1
             if not best.strip():
+                if decisions is not None and hit.get('chunk_id'):
+                    decisions[hit['chunk_id']] = 'evidence_byte_budget'
                 return
             item["text"] = best
             truncated += 1
+            if decisions is not None and hit.get('chunk_id'):
+                decisions[hit['chunk_id']] = 'truncated_byte_budget'
             sources.append({**hit, "search_text": best, "evidence_truncated": True})
         else:
+            if decisions is not None and hit.get('chunk_id'):
+                decisions[hit['chunk_id']] = 'included'
             sources.append(dict(hit))
         context.append(item)
 
@@ -112,6 +124,8 @@ def _chat_evidence(hits, limit, budget=32768):
             item['context'] = ''
             context_omitted += 1
     omitted = len(hits) - len(sources)
+    if decisions is not None:
+        diagnostics.record('model_fit_decisions', [{'chunk_id': key, 'reason': value} for key, value in decisions.items()])
     limited = bool(omitted or truncated or context_omitted)
     for hit, item in zip(sources, context, strict=True):
         if not hit.get('table_expansion_complete'):
@@ -194,6 +208,7 @@ class RagChat:
         return self.chain.invoke(request)
 
     def answer_xlsx(self, request):
+        diagnostics.record('direct_xlsx', {'mode': 'confirmed_table_query', 'status': 'planning'})
         if not request.document_id:
             raise IndexerError('XLSX_DOCUMENT_REQUIRED', '전체 표를 조회할 XLSX 문서를 선택해 주세요.')
         document_id = str(request.document_id)
@@ -228,9 +243,12 @@ class RagChat:
         except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, AttributeError) as error:
             raise IndexerError('XLSX_PLAN_UNAVAILABLE', '전체 표 조회 계획을 만들지 못했습니다.', 503) from error
         if plan is None or plan.operation == 'rows':
+            diagnostics.record('direct_xlsx', {'mode': 'confirmed_table_query', 'status': 'plan_unavailable'})
             return {'answer': '확인된 표 하나에서 조회할 개수, 분포, 날짜 범위, 합계, 평균, 최솟값 또는 최댓값을 질문해 주세요.',
                     'sources': [], 'index_version': catalog['index_version']}
         result = self.retrieval.xlsx_query(document_id, catalog['index_version'], plan)
+        diagnostics.record('direct_xlsx', {'mode': 'confirmed_table_query', 'status': 'completed',
+                                           'operation': plan.operation, 'complete': result['complete']})
         scope = result['scope']
         summary = result['result']
         lines = [(f'{scope["sheet"]} {scope["start"]}–{scope["end"]}에서 '
@@ -314,7 +332,7 @@ class RagChat:
     def answer(self, inputs):
         request, result = inputs
         sources, context, counts = _chat_evidence(result["results"], MAX_RESULT_LIMIT + 5, self.config.chat_evidence_bytes)
-        diagnostics = {**result.get("search_counts", {}), **counts}
+        counts_report = {**result.get("search_counts", {}), **counts}
         coverage = _coverage(result["results"], sources, result.get("method", "ranked_search"))
         # The status belongs to each model evidence item, not only to API sources.
         for source, item in zip(sources, context, strict=True):
@@ -326,7 +344,16 @@ class RagChat:
                 if byte_size(json.dumps(context, ensure_ascii=False)) > self.config.chat_evidence_bytes:
                     del item['원본_요소_범위']
         counts['evidence_bytes'] = byte_size(json.dumps(context, ensure_ascii=False))
-        diagnostics['evidence_bytes'] = counts['evidence_bytes']
+        counts_report['evidence_bytes'] = counts['evidence_bytes']
+        if diagnostics.active():
+            included = {item.get('chunk_id'): (index, item) for index, item in enumerate(sources, 1)}
+            diagnostics.record('model_evidence', [{'chunk_id': hit.get('chunk_id'),
+                'citation_id': included[hit.get('chunk_id')][0] if hit.get('chunk_id') in included else None,
+                'status': ('truncated' if included[hit.get('chunk_id')][1].get('evidence_truncated') else 'included')
+                          if hit.get('chunk_id') in included else 'omitted'} for hit in result['results']])
+            diagnostics.record('model', {'model': request.model or self.config.llm_model,
+                                          'evidence_budget_bytes': self.config.chat_evidence_bytes,
+                                          'reasoning_effort': request.reasoning_effort})
         page_scope = dict(result['page_scope']) if result.get('page_scope') else None
         if page_scope is not None:
             page_scope['pages_in_model_context'] = sorted({ref['page'] for source in sources
@@ -342,7 +369,7 @@ class RagChat:
                       "검색 결과가 답변 근거 크기 한도를 초과했습니다." if result["results"]
                       else "질문하신 정보를 찾을 수 없습니다.")
             return {"answer": answer, "sources": [], "index_version": result["index_version"],
-                    "search_counts": diagnostics, "coverage": coverage, **({'page_scope': page_scope} if page_scope else {})}
+                    "search_counts": counts_report, "coverage": coverage, **({'page_scope': page_scope} if page_scope else {})}
         messages = []
         for item in request.history:
             content = item.content
@@ -381,6 +408,8 @@ class RagChat:
                             "각 핵심 주장에는 해당 대상과 내용을 실제로 뒷받침하는 근거를 인용하고, 종합이나 계산은 근거와 추론을 구분해 설명하세요. "
                             "근거가 서로 충돌하면 그 사실과 범위를 밝히고 근거 없는 결론을 선택하지 마세요. "
                             "이전 대화는 질문의 맥락이며 사실의 근거로 사용하지 마세요.")
+        if diagnostics.active():
+            diagnostics.record('model_contract', {'system_prompt_sha256': hashlib.sha256(instructions.encode('utf-8')).hexdigest()})
         payload = {"model": request.model or self.config.llm_model,
                    "messages": [{"role": "system", "content": instructions}, *messages]}
         if request.reasoning_effort is not None:
@@ -403,9 +432,11 @@ class RagChat:
                 raise ValueError("empty response")
         except (httpx.HTTPError, ValueError, TypeError, KeyError) as error:
             raise IndexerError("LLM_UNAVAILABLE", "답변 생성에 실패했습니다. 모델 연결 설정을 확인해 주세요.", 503) from error
+        diagnostics.record('answer_citations', sorted({int(value) for value in re.findall(r'\[(\d+)\]', content)
+                                                     if 1 <= int(value) <= len(sources)}))
         verification = audit_answer(content, context)
         answer = re.sub(r"\[(\d+)\]", lambda match: match.group(0) if 1 <= int(match.group(1)) <= len(sources) else "[근거 확인 불가]", content)
         if verification["warnings"]:
             answer += "\n\n※ 일부 주장과 인용 근거의 관계를 원문에서 확인해 주세요."
         return {"answer": answer, "sources": sources, "index_version": result["index_version"],
-                "answer_verification": verification, "search_counts": diagnostics, "coverage": coverage, **({'page_scope': page_scope} if page_scope else {})}
+                "answer_verification": verification, "search_counts": counts_report, "coverage": coverage, **({'page_scope': page_scope} if page_scope else {})}
