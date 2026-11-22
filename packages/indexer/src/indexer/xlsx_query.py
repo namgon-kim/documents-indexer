@@ -310,6 +310,8 @@ class TableData:
     derived: dict = field(default_factory=dict)
     # Table-level conditions that make results incomplete, e.g. unclear totals rows.
     notes: Counter = field(default_factory=Counter)
+    # Rows that may be a totals row. They stay in range and are undecided when used.
+    uncertain_rows: set = field(default_factory=set)
 
     def column(self, key):
         number = column_index_from_string(key)
@@ -371,14 +373,16 @@ def _read_table(raw, sheet_name, region_start, include_hidden, selected=None):
     notes = Counter()
     totals = region.get('totals_rows', 0)
     basis = region.get('totals_rows_basis', 'legacy' if totals else 'none')
-    if totals and basis != 'declared':
-        # Older artifacts derived a totals row from `totalsRowShown`; do not
-        # silently drop a possible data row without the declared count.
-        notes['totals_rows_unverified'] += 1
+    uncertain = set()
     if basis == 'inconsistent':
         notes['totals_rows_inconsistent'] += 1
     if totals > max(0, bottom - start + 1):
         notes['totals_rows_inconsistent'] += 1
+        totals = 0
+    if totals and basis != 'declared':
+        # Older artifacts derived a totals row from `totalsRowShown`, so the last
+        # row may be data. Keep it in range; a query that needs it stays undecided.
+        uncertain = set(range(bottom - totals + 1, bottom + 1))
         totals = 0
     end = bottom - totals
     data_area = left, start, right, end
@@ -428,12 +432,13 @@ def _read_table(raw, sheet_name, region_start, include_hidden, selected=None):
              'populated_rows': len(populated), 'scanned_rows': max(0, end - start + 1) - skipped,
              'hidden_rows_excluded': skipped, 'includes_hidden_rows': include_hidden,
              'totals_rows_excluded': totals, 'totals_rows_basis': basis, 'merged_group_cells': len(derived),
+             'uncertain_totals_rows': sorted(uncertain),
              'hidden_columns': [get_column_letter(col) for col in range(left, right + 1)
                                 if any(item['start'] is not None and item['end'] is not None
                                        and item['start'] <= col <= item['end'] for item in sheet['hidden_column_ranges'])],
              'excluded_cells': sorted(key for key in sheet['excluded'] if contains(area, coordinate_to_tuple(key)))}
     return TableData(scope, left, right, values, problems, populated, set() if include_hidden else hidden, available_rows,
-                     derived, notes)
+                     derived, notes, uncertain)
 
 
 def join_candidates(raw, sheet, start, right_sheet, right_start):
@@ -637,6 +642,10 @@ def execute(raw, plan):
             if decision is None:
                 outcome = None
                 notes.append(note or 'filter_type_mismatch')
+        if any(row is not None and row in tables[side].uncertain_rows
+               for side, row in zip(('left', 'right'), pair, strict=False) if side in tables):
+            # A possible totals row is neither counted nor silently dropped.
+            return None, [*notes, 'totals_row_uncertain']
         return outcome, notes
 
     # A unit is one aggregated item: a source row without a join, a joined pair,
@@ -756,6 +765,17 @@ def execute(raw, plan):
                 entry.update(_number_summary(plan.operation, group_numbers[key]))
             groups.append(entry)
         result.update(groups=groups, omitted_groups=len(group_counts) - len(groups))
+    if issues.get('duplicated_join_values'):
+        # Without an explicit unit the repeated values make the figure ambiguous.
+        # Keep the pair-based figure apart so it is not read as the answer.
+        result['aggregate_unit_required'] = True
+        for key in ('value', 'distribution'):
+            if key in result:
+                result[f'pair_based_{key}'] = result[key]
+                result[key] = None
+        for entry in result.get('groups', []):
+            if 'value' in entry:
+                entry['pair_based_value'], entry['value'] = entry['value'], None
 
     return {'operation': plan.operation, 'result': result, 'complete': not (
                 unknown or missing or issues or result.get('omitted_buckets') or result.get('omitted_groups')

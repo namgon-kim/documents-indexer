@@ -32,7 +32,7 @@ from indexer.parsing.normalization import (
     parse_table_html,
     readable,
 )
-from indexer.representation import table_groups, table_parts
+from indexer.representation import compose_row_labels, full_label, table_groups, table_parts
 from indexer.structure_relations import figure_relationships, table_relationships
 from indexer.table_evidence import set_html_table_evidence
 from indexer.xlsx_structure import confirmed
@@ -304,7 +304,6 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                 row_labels[value['address']] = label
                             else:
                                 ambiguous_pairs = True
-            grouped_rows = set()
             for item in sorted(cells.values(), key=lambda cell: (cell['row'], cell['column'])):
                 if not item['text'].strip():
                     continue
@@ -317,21 +316,24 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                               'sheet': region['sheet'], 'address': source['address'], 'origin': region['origin'],
                               'status': 'unverified' if kind == 'row' else context_status} for source in sources]
                 label = ' > '.join(source['text'] for source in sources)
-                groups = [] if item['row'] in grouped_rows else [
-                    group for group in row_groups.get(item['row'], []) if group['column'] != item['column']]
+                part = {**item, 'label': label, 'label_origin': region['origin'] if label else 'source'}
+                groups = [group for group in row_groups.get(item['row'], []) if group['column'] != item['column']]
                 if groups:
-                    # A merged group label belongs to the whole row; add it once.
-                    grouped_rows.add(item['row'])
-                    context = [' '.join(filter(None, [' > '.join(s['text'] for s in paths.get(group['column'], [])),
-                                                      group['text']])) for group in groups]
-                    label = ' / '.join(filter(None, [*context, label]))
+                    # Every cell in the merged rows keeps the group relation. The text
+                    # context is written once per row in each chunk (compose_row_labels).
+                    part['row_context'] = ' / '.join(
+                        ' '.join(filter(None, [' > '.join(s['text'] for s in paths.get(group['column'], [])),
+                                               group['text']])) for group in groups)
+                    part['column_label'] = label
+                    part['label'] = full_label(part)
+                    part['label_origin'] = region['origin']
                     relations = [{'kind': 'group', 'text': group['text'], 'element_id': element['element_id'],
                                   'sheet': region['sheet'], 'address': group['address'], 'origin': region['origin'],
                                   'status': context_status} for group in groups] + relations
-                parts.append({**item, 'label': label, 'label_origin': region['origin'] if label else 'source',
-                              'label_relations': relations})
+                parts.append({**part, 'label_relations': relations})
             rows = (list(row) for _, row in groupby(parts, key=lambda item: item['row'])) if profile == 'spreadsheet' else [parts]
-            groups = (group for row in rows for group in table_groups(prefix, row, target_chars, max_bytes))
+            groups = (compose_row_labels(group, max_bytes)
+                      for row in rows for group in table_groups(prefix, row, target_chars, max_bytes))
             for number, group in enumerate(groups):
                 segments = [{**part, 'value': part['text'],
                              'text': ' / '.join(filter(None, [part['label'], part['text']]))} for part in group]

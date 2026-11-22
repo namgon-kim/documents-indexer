@@ -158,6 +158,26 @@ def table_parts(cells, inherited_headers=(), *, infer_first_row=False):
     return output, uncertain
 
 
+def full_label(part):
+    """A cell label with its row group context, as used before chunk boundaries are known."""
+    if 'row_context' not in part:
+        return part.get('label', '')
+    return ' / '.join(filter(None, [part['row_context'], part.get('column_label', '')]))
+
+
+def compose_row_labels(parts, max_bytes=MAX_INPUT_BYTES):
+    """Write a row's group context once per chunk; every cell keeps its group relation."""
+    seen, result = set(), []
+    for part in parts:
+        if 'row_context' in part:
+            key = part['row'], part['row_context']
+            label = full_label(part) if key not in seen else part.get('column_label', '')
+            seen.add(key)
+            part = {**part, 'label': context_prefix(label, min(800, max_bytes // 3))}
+        result.append(part)
+    return result
+
+
 def table_groups(context, parts, target, max_bytes=MAX_INPUT_BYTES):
     def fits(group):
         text = render_embedding(context, group)

@@ -170,6 +170,34 @@ def test_layered_headers_and_merged_group_labels_keep_column_meaning(tmp_path):
     assert segment['label'] == '구분 서울 / 2023 > 상반기'
     assert [(rel['kind'], rel['address'], rel['status']) for rel in segment['label_relations']] == [
         ('group', 'A3', 'verified'), ('column', 'B1', 'verified'), ('column', 'B2', 'verified')]
+    # In the same chunk the context text is written once, but every cell keeps the relation.
+    other = next(s for c in state['chunks'] for s in c.get('table_segments', []) if s['address'] == 'C4')
+    assert other['label'] == '2023 > 하반기'
+    assert ('group', 'A3') in [(rel['kind'], rel['address']) for rel in other['label_relations']]
+
+
+def test_group_context_follows_each_cell_into_split_chunks(tmp_path):
+    from indexer.embedding_adaptation import split_chunk
+
+    path = tmp_path / 'groups.xlsx'
+    book = Workbook()
+    sheet = book.active
+    sheet.append(['지역', '상반기 판매 실적', '하반기 판매 실적', '연간 판매 실적'])
+    sheet.append(['서울특별시', 10, 20, 30])
+    sheet.append([None, 40, 50, 90])
+    sheet.merge_cells('A2:A3')
+    book.save(path)
+    state = native(path)
+    chunk = next(c for c in state['chunks'] if any(s['address'] == 'D3' for s in c.get('table_segments', [])))
+    labels = {s['address']: s['label'] for s in chunk['table_segments']}
+    assert labels == {'B3': '지역 서울특별시 / 상반기 판매 실적', 'C3': '하반기 판매 실적', 'D3': '연간 판매 실적'}
+    pieces = split_chunk(chunk, 144)
+    assert len(pieces) > 1
+    for piece in pieces:
+        first = piece['table_segments'][0]
+        assert first['label'].startswith('지역 서울특별시 / ') and '지역 서울특별시' in piece['text']
+        assert all(('group', 'A2') in [(rel['kind'], rel['address']) for rel in s['label_relations']]
+                   for s in piece['table_segments'])
 
 
 def test_layered_headers_are_inferred_from_merges_and_rejected_when_columns_share_a_leaf(tmp_path):
@@ -299,12 +327,14 @@ def test_join_aggregates_do_not_repeat_source_rows_silently(tmp_path):
         return execute(raw, PublishedTableQuery.model_validate({**base, **changes}))
 
     automatic = run()
-    assert automatic['result']['value'] == 250 and automatic['result']['aggregate_unit'] == 'pairs'
+    assert automatic['result']['value'] is None and automatic['result']['aggregate_unit_required']
+    assert automatic['result']['pair_based_value'] == 250 and automatic['result']['aggregate_unit'] == 'pairs'
     assert automatic['issues'] == {'duplicated_join_values': 1} and not automatic['complete']
     per_department = run(aggregate_unit='left_rows')
     assert per_department['result']['value'] == 150 and per_department['complete']
     per_pair = run(aggregate_unit='pairs')
     assert per_pair['result']['value'] == 250 and per_pair['complete']
+    assert 'aggregate_unit_required' not in per_pair['result']
     employees = run(operation='count', column=None, aggregate_unit='right_rows')
     assert employees['result']['matched_rows'] == 3
     ambiguous = run(operation='count', column=None, aggregate_unit='left_rows', group_by='B', group_side='right')
@@ -333,13 +363,22 @@ def test_totals_rows_follow_the_declared_count(tmp_path, count, expected, basis)
     assert result['scope']['totals_rows_excluded'] == 3 - expected
 
 
-def test_legacy_totals_rows_are_not_dropped_silently(tmp_path):
+def test_legacy_totals_rows_stay_in_range_and_are_undecided_only_when_used(tmp_path):
     raw = status_table(tmp_path / 'legacy.xlsx')
     table = raw['xlsx_sheets'][0]['regions'][0]
     table['totals_rows'] = 1
     table.pop('totals_rows_basis')
     result = execute(raw, QueryPlan(sheet='Sheet', start='A1', operation='count'))
-    assert result['issues'] == {'totals_rows_unverified': 1} and not result['complete']
+    assert result['scope']['last_data_row'] == 5 and result['scope']['totals_rows_excluded'] == 0
+    assert result['scope']['uncertain_totals_rows'] == [5]
+    assert result['result']['matched_rows'] == 3 and result['unknown_filter_rows'] == 1
+    assert result['issues'] == {'totals_row_uncertain': 1} and not result['complete']
+    total = execute(raw, QueryPlan(sheet='Sheet', start='A1', operation='sum', column='B'))
+    assert total['result']['value'] == 1.6 and not total['complete']
+    # A filter that already excludes the possible totals row leaves a complete answer.
+    progress = execute(raw, QueryPlan(sheet='Sheet', start='A1', operation='count',
+                                      filters=[{'column': 'A', 'operator': 'eq', 'value': '진행'}]))
+    assert progress['result']['matched_rows'] == 1 and progress['complete']
 
 
 # X3 and X9-2 — size limits and formatting-only cells
