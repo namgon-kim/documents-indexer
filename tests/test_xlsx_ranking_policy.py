@@ -1,5 +1,4 @@
 """XLSX-specific ranking must not change other published search paths."""
-import json
 from uuid import uuid4
 
 import pytest
