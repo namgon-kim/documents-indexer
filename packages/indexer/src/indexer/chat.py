@@ -109,14 +109,7 @@ def _chat_evidence(hits, limit, budget=32768):
     return sources, context, counts
 
 
-# Detection only requests a clearer limitation notice; it never filters or reroutes search.
-_FULL_SCOPE = re.compile(
-    r'전체|모두|모든|전부|빠짐없이|누락\s*없이|각각|몇\s*(?:개|건|명|회|행)|'
-    r'총\s*(?:개수|건수|인원|합계|액)|개수|건수|합계|총합|평균|분포|최솟값|최댓값|'
-    r'최소값|최대값|날짜\s*범위|\b(?:all|every|total|count|sum|average|distribution)\b', re.IGNORECASE)
-
-
-def _coverage(question, hits, sources, method='ranked_search'):
+def _coverage(hits, sources, method='ranked_search'):
     """Summarize indexed fragments, without asserting extraction or document completeness."""
     groups = {}
     for hit in hits:
@@ -144,8 +137,7 @@ def _coverage(question, hits, sources, method='ranked_search'):
             source['model_element_scopes'] = model_scopes
     partial = sum(1 for item in groups.values()
                   if item['truncated'] or len(item['model_chunks']) < item['indexed_chunks'])
-    return {'full_scope_requested': bool(_FULL_SCOPE.search(question)),
-            'method': method, 'scope_complete': None, 'scope_verification': 'unknown',
+    return {'method': method, 'scope_complete': None, 'scope_verification': 'unknown',
             'source_completeness': 'unknown', 'element_count': len(groups),
             'partial_element_count': partial, 'retrieved_chunks': len(hits),
             'model_chunks': len(sources), 'truncated_chunks': sum(bool(hit.get('evidence_truncated')) for hit in sources),
@@ -297,7 +289,7 @@ class RagChat:
         request, result = inputs
         sources, context, counts = _chat_evidence(result["results"], MAX_RESULT_LIMIT + 5, self.config.chat_evidence_bytes)
         diagnostics = {**result.get("search_counts", {}), **counts}
-        coverage = _coverage(request.message, result["results"], sources, result.get("method", "ranked_search"))
+        coverage = _coverage(result["results"], sources, result.get("method", "ranked_search"))
         page_scope = dict(result['page_scope']) if result.get('page_scope') else None
         if page_scope is not None:
             page_scope['pages_in_model_context'] = sorted({ref['page'] for source in sources

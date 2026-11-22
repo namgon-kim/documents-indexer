@@ -222,16 +222,15 @@ def test_completeness_tracks_source_fragments_and_budget_without_filtering():
              'element_scopes': [scope], 'filename': 'doc', 'source_refs': [], 'search_text': text}
             for i, text in enumerate(['first', 'second'])]
     sources, _, _ = _chat_evidence(hits, 25, 4096)
-    coverage = _coverage('모든 항목을 나열해 주세요', hits, sources)
+    coverage = _coverage(hits, sources)
     assert [source['search_text'] for source in sources] == ['first', 'second']
-    assert coverage['full_scope_requested'] and coverage['partial_element_count'] == 1
+    assert coverage['partial_element_count'] == 1
     assert coverage['source_completeness'] == 'unknown' and not coverage['scope_complete']
-    assert not _coverage('관련 내용을 설명해 주세요', hits, sources)['full_scope_requested']
     scope['indexed_chunks'] = 2
-    assert _coverage('총 개수', hits, sources)['partial_element_count'] == 0
-    assert not _coverage('총 개수', hits, sources)['scope_complete']
-    assert _coverage('총 개수', hits, sources[:1])['partial_element_count'] == 1
-    assert _coverage('총 개수', hits, [{**sources[0], 'evidence_truncated': True}, sources[1]])['partial_element_count'] == 1
+    assert _coverage(hits, sources)['partial_element_count'] == 0
+    assert not _coverage(hits, sources)['scope_complete']
+    assert _coverage(hits, sources[:1])['partial_element_count'] == 1
+    assert _coverage(hits, [{**sources[0], 'evidence_truncated': True}, sources[1]])['partial_element_count'] == 1
 
 
 def test_chat_transmits_coverage_and_preserves_unknown_legacy_provenance(tmp_path):
@@ -239,7 +238,7 @@ def test_chat_transmits_coverage_and_preserves_unknown_legacy_provenance(tmp_pat
     retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
     def provider(request):
         payload = json.loads(json.loads(request.content)['messages'][-1]['content'])
-        assert payload['조회_범위']['full_scope_requested']
+        assert payload['조회_범위']['scope_verification'] == 'unknown'
         assert payload['조회_범위']['unknown_element_scope_count'] == 1
         assert not payload['조회_범위']['scope_complete']
         return httpx.Response(200, json={'choices': [{'message': {'content': '확인된 항목 [1]'}}]})
@@ -260,7 +259,7 @@ def test_unrelated_budget_omission_does_not_mark_complete_table_partial():
     other = {'chunk_id': 'other', 'document_id': 'd', 'job_id': 'j', 'element_ids': ['other'],
              'filename': 'doc', 'source_refs': [], 'search_text': 'B' * 9000}
     sources, context, counts = _chat_evidence([table, other], 1, 4096)
-    coverage = _coverage('모든 행', [table, other], sources)
+    coverage = _coverage([table, other], sources)
     assert counts['evidence_omitted_count'] == 1
     assert context[0]['표의_분할내용_모두_포함'] is True
     assert sources[0]['model_element_scopes'][0]['all_indexed_chunks_in_model']

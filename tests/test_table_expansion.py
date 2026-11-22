@@ -1,3 +1,4 @@
+import pytest
 from indexer.published_retrieval import PublishedRetrieval
 
 
@@ -103,28 +104,26 @@ def test_expansion_shares_budget_between_independent_ranked_tables():
     assert not result[1]['table_expansion_complete']
 
 
-def test_saved_q13_table_expands_into_model_input(tmp_path):
-    import json
-    from pathlib import Path
-
+@pytest.mark.parametrize(('topic', 'parts'), [('inventory', 2), ('일정', 3), ('測定', 5)])
+def test_indexed_table_fragments_flow_to_model_with_bounded_scope(tmp_path, topic, parts):
     from indexer.bm25_index import BM25Index
     from indexer.chat import _chat_evidence
 
-    chunks = json.loads((Path(__file__).parent / 'fixtures' / 'poc_q13_chunks.json').read_text())
-    index = BM25Index(tmp_path / 'q13.sqlite')
-    index.replace_document(chunks[0]['document_id'], chunks)
-    [ranked] = index.search('1-1-1 1차년도 추진 일정', 1)
-    lookup = {c['chunk_id']: c for c in chunks}
+    chunks = [{**table(str(part), part=part), 'text': f'{topic} item-{part}', 'page': part + 1}
+              for part in range(parts)]
+    index = BM25Index(tmp_path / 'test.sqlite')
+    index.replace_document('d1', chunks)
+    [ranked] = index.search(topic, 1)
+    lookup = {chunk['chunk_id']: chunk for chunk in chunks}
     results = PublishedRetrieval._expand_table([lookup[ranked.chunk_id]], lookup)
-    hits = [{**c, 'filename': 'source.pdf', 'source_refs': [], 'search_text': c['text']} for c in results]
+    hits = [{**chunk, 'filename': 'source.pdf', 'source_refs': [], 'search_text': chunk['text']}
+            for chunk in results]
     sources, context, counts = _chat_evidence(hits, 25, 32768)
-    assert len(sources) == 3 and counts['evidence_omitted_count'] == 0
-    text = '\n'.join(c['text'] for c in context)
-    for title in ('AI·DX 전공 교과목개발', '미래형 역량기반교육과정 개발',
-                  'AI·DX교양교육과정개발', '고숙련 전문기술인재양성',
-                  '학생안내애플리케이션', '학사제도 변경 대응'):
-        assert title in text
-    assert "'25.12-'26.02" in text and "'25.09-'26.02" in text
+    expected_ids = {chunk['chunk_id'] for chunk in results}
+    assert len(sources) == min(parts, 4) and counts['evidence_omitted_count'] == 0
+    assert {source['chunk_id'] for source in sources} == expected_ids
+    assert {item['text'] for item in context} == {lookup[chunk_id]['text'] for chunk_id in expected_ids}
+    assert all(chunk['table_expansion_complete'] == (parts <= 4) for chunk in results)
 
 
 def test_search_reports_list_fragment_coverage_without_removing_candidates(tmp_path):
