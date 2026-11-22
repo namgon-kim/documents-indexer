@@ -334,3 +334,84 @@ def test_fusion_prefers_more_query_coverage_and_handles_mixed_terms(tmp_path):
         assert hits[0].chunk_id == 'all'
         assert len(hits) == len({hit.chunk_id for hit in hits})
     assert index.search('RAG 서비스 2026', 0) == []
+
+
+def test_unicode61_exact_matches_receive_coverage_without_changing_source(tmp_path):
+    index = BM25Index(tmp_path / 'unicode.sqlite')
+    index.replace_document('d', [
+        {'chunk_id': 'plain', 'text': 'resume'},
+        {'chunk_id': 'accented', 'text': 'Résumé'},
+        {'chunk_id': 'mixed', 'text': 'RÉSUMÉ 지원 2026'},
+        {'chunk_id': 'unrelated', 'text': 'summer 2026'},
+    ])
+    scores = {hit.chunk_id: hit.score for hit in index.search('resume', 5)}
+    assert {'plain', 'accented', 'mixed'} <= scores.keys()
+    assert min(scores[key] for key in ('plain', 'accented', 'mixed')) >= 1
+    with sqlite3.connect(index.path) as db:
+        assert db.execute("SELECT text FROM chunks WHERE chunk_id='accented'").fetchone()[0] == 'Résumé'
+    mixed = index.search('resume 지원 2026', 5)
+    assert mixed[0].chunk_id == 'mixed'
+    assert index.search(normalize('NFD', 'Résumé'), 5)
+
+
+def test_historical_unicode61_index_retains_rank_and_raw_scores(tmp_path):
+    path = tmp_path / 'historic.sqlite'
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE VIRTUAL TABLE chunks USING fts5(chunk_id UNINDEXED, document_id UNINDEXED, text, tokenize='unicode61')")
+        db.executemany('INSERT INTO chunks VALUES (?, ?, ?)', [
+            ('a', 'd', 'Résumé and education'), ('b', 'd', 'resume resume example'),
+            ('c', 'other', 'resume other')])
+        expected = [(key, -score) for key, score in db.execute(
+            "SELECT chunk_id, bm25(chunks) FROM chunks WHERE chunks MATCH ? AND document_id=? ORDER BY bm25(chunks), chunk_id, rowid LIMIT ?",
+            ('"resume"', 'd', 5))]
+    index = BM25Index(path)
+    assert not index.has_substrings
+    actual = index.search('resume', 5, 'd')
+    assert [(hit.chunk_id, hit.score) for hit in actual] == expected
+    with sqlite3.connect(path) as db:
+        assert not db.execute("SELECT name FROM sqlite_master WHERE name='substrings'").fetchone()
+
+
+@pytest.mark.parametrize(('query', 'expected'), [
+    ('quota', 'quota'), ('provider quota policy', 'exact'), ('access-control', 'access'),
+    ('서비스 예산', 'service'), ('2026', 'year'),
+])
+def test_existing_exact_search_ranks_are_preserved_on_fixed_corpus(tmp_path, query, expected):
+    import re
+
+    index = BM25Index(tmp_path / 'baseline.sqlite')
+    index.replace_document('d', [
+        {'chunk_id': 'quota', 'text': 'quota limit'},
+        {'chunk_id': 'exact', 'text': 'provider quota policy'},
+        {'chunk_id': 'access', 'text': 'access control'},
+        {'chunk_id': 'service', 'text': '서비스 예산'},
+        {'chunk_id': 'year', 'text': '2026'},
+        {'chunk_id': 'other', 'text': '다른 문서 보고서'},
+    ])
+    terms = re.findall(r'[^\W_]+', query, flags=re.UNICODE)
+    match = ' OR '.join('"' + term + '"' for term in terms)
+    with sqlite3.connect(index.path) as db:
+        old = [row[0] for row in db.execute(
+            'SELECT chunk_id FROM chunks WHERE chunks MATCH ? ORDER BY bm25(chunks), chunk_id LIMIT 5', (match,))]
+    new = [hit.chunk_id for hit in index.search(query, 5)]
+    assert expected in old and expected in new
+    assert new.index(expected) <= old.index(expected)
+
+
+def test_fusion_does_not_add_python_only_unicode_matches(tmp_path):
+    index = BM25Index(tmp_path / 'unicode-distinct.sqlite')
+    index.replace_document('d', [{'chunk_id': 'ss', 'text': 'AI strasse'},
+                                 {'chunk_id': 'sharp-s', 'text': 'AI straße'}])
+    scores = {hit.chunk_id: hit.score for hit in index.search('AI strasse', 5)}
+    assert scores['ss'] > 1 and scores['sharp-s'] < 0.3
+    with sqlite3.connect(index.path) as db:
+        assert db.execute('SELECT COUNT(*) FROM chunks WHERE chunks MATCH ?', ('"strasse"',)).fetchone()[0] == 1
+
+
+def test_exact_and_substring_matches_compete_without_losing_exact_result(tmp_path):
+    index = BM25Index(tmp_path / 'exact-substring.sqlite')
+    index.replace_document('d', [{'chunk_id': 'exact', 'text': 'budget planning'},
+                                 {'chunk_id': 'partial', 'text': 'budgetary planning'},
+                                 {'chunk_id': 'unrelated', 'text': 'planning'}])
+    hits = index.search('budget planning', 3)
+    assert [hit.chunk_id for hit in hits][:2] == ['exact', 'partial']

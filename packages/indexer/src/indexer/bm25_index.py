@@ -34,7 +34,7 @@ class BM25Index:
         if not terms:
             return []
         if self.has_substrings:
-            terms = list(dict.fromkeys(term.casefold() for term in terms))
+            terms = list(dict.fromkeys(terms))
 
         def run(db, table, match):
             sql = f"SELECT chunk_id, text, bm25({table}) AS rank FROM {table} WHERE {table} MATCH ?"
@@ -68,12 +68,26 @@ class BM25Index:
             return []
         ranks = reciprocal_rank_fusion([[hit for hit, _ in channel] for channel in channels], len(texts))
         total = sum(len(term) for term in terms)
+        covered_terms = {hit.chunk_id: set() for hit in ranks}
+        # Reuse the actual index tokenizers for bounded candidate texts. This
+        # avoids both false negatives and false positives from Python's Unicode
+        # folding, without rewriting source text or changing stored indexes.
+        with sqlite3.connect(':memory:') as db:
+            db.execute("CREATE VIRTUAL TABLE candidates USING fts5(chunk_id UNINDEXED, text, tokenize='unicode61')")
+            db.executemany('INSERT INTO candidates(chunk_id, text) VALUES (?, ?)', texts.items())
+            if long:
+                db.execute("CREATE VIRTUAL TABLE candidate_substrings USING fts5(chunk_id UNINDEXED, text, tokenize='trigram')")
+                db.executemany('INSERT INTO candidate_substrings(chunk_id, text) VALUES (?, ?)', texts.items())
+            for index, term in enumerate(terms):
+                match = '"' + term + '"' + ('*' if len(term) < 3 else '')
+                for (chunk_id,) in db.execute('SELECT chunk_id FROM candidates WHERE candidates MATCH ?', (match,)):
+                    covered_terms[chunk_id].add(index)
+                if len(term) >= 3:
+                    for (chunk_id,) in db.execute('SELECT chunk_id FROM candidate_substrings WHERE candidate_substrings MATCH ?', (match,)):
+                        covered_terms[chunk_id].add(index)
         scored = []
         for hit in ranks:
-            text = embedding_text(texts[hit.chunk_id]).casefold()
-            words = re.findall(r"[^\W_]+", text, flags=re.UNICODE)
-            covered = sum(len(term) for term in terms if (
-                term in text if len(term) >= 3 else any(word.startswith(term) for word in words)))
+            covered = sum(len(terms[index]) for index in covered_terms[hit.chunk_id])
             score = covered / total + hit.score / 100
             scored.append(SearchHit(hit.chunk_id, score))
         return sorted(scored, key=lambda hit: (-hit.score, hit.chunk_id))[:limit]
