@@ -312,3 +312,30 @@ def test_poc_q14_saved_parser_table_has_local_candidate_headers():
     assert any(rel['text'] == '산업체' and rel['row'] == 4 and rel['status'] == 'unverified'
                for rel in industry['label_relations'])
     assert all(not (part['value'] == '지역사회' and '산업체' in part['label']) for part in parts)
+
+
+def test_scoped_headers_survive_short_data_row_between_long_rows():
+    html = ('<table><tr><th colspan="2">직원 기록</th></tr>'
+            '<tr><th scope="col">이름</th><th scope="col">직무</th></tr>'
+            '<tr><td>' + '긴 직원 이름 ' * 10 + '</td><td>기획</td></tr>'
+            '<tr><td>김철수</td><td>개발자</td></tr>'
+            '<tr><td>' + '다른 긴 직원 이름 ' * 10 + '</td><td>디자이너</td></tr></table>')
+    elements = normalize_elements([{'category': 'table', 'content': {'html': html}}])
+    parts = [part for chunk in make_chunks('d', 'j', elements, 400, 0)
+             for part in chunk['table_segments']]
+    role = next(part for part in parts if part['value'] == '디자이너')
+    assert '직무' in role['label'] and '개발자' not in role['label']
+    assert any(rel['text'] == '직무' and rel['status'] == 'explicit' for rel in role['label_relations'])
+
+
+def test_legacy_xlsx_label_coordinates_use_original_offsets():
+    html = ('<table><tr><th scope="col">Name</th><th scope="col">Result</th></tr>'
+            '<tr><td>A</td><td>Pass</td></tr></table>')
+    elements = normalize_elements([{'category': 'table', 'content': {'html': html},
+                                    '_layout': {'space': 'xlsx_region', 'row_offset': 10, 'column_offset': 3},
+                                    '_origin': 'native_extraction'}])
+    parts = [part for chunk in make_chunks('d', 'j', elements, 400, 0)
+             for part in chunk['table_segments']]
+    result = next(part for part in parts if part['value'] == 'Pass')
+    assert (result['row'], result['column']) == (12, 5)
+    assert {(rel['row'], rel['column']) for rel in result['label_relations']} == {(12, 4), (11, 5)}

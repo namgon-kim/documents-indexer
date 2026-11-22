@@ -322,11 +322,21 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                     for part in parts:
                         part['row'] += layout.get('row_offset', 0)
                         part['column'] += layout.get('column_offset', 0)
+                        for rel in part.get('label_relations', []):
+                            if not rel.get('inherited'):
+                                rel['row'] += layout.get('row_offset', 0)
+                                rel['column'] += layout.get('column_offset', 0)
                     uncertain = True
                 for part in parts:
                     for rel in part.get('label_relations', []):
-                        rel['element_id'] = (relation.get('previous_table_id') if rel.pop('inherited', False)
-                                             else element['element_id'])
+                        inherited = rel.pop('inherited', False)
+                        rel['element_id'] = relation.get('previous_table_id') if inherited else element['element_id']
+                        if legacy_xlsx and inherited:
+                            source = next((item for item in elements if item['element_id'] == rel['element_id']), {})
+                            source_layout = source.get('layout') or {}
+                            if source_layout.get('space') == 'xlsx_region':
+                                rel['row'] += source_layout.get('row_offset', 0)
+                                rel['column'] += source_layout.get('column_offset', 0)
                 parts.sort(key=lambda item: (item["row"], item["column"]))
                 table_parts_by_policy = (list(row) for _, row in groupby(parts, key=lambda part: part["row"])) if profile == "spreadsheet" else [parts]
                 groups = (group for row in table_parts_by_policy for group in table_groups(table_heading, row, target_chars, max_bytes))

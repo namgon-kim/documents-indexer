@@ -28,20 +28,10 @@ def _chat_evidence(hits, limit, budget=32768):
                 "XLSX_행_연결_후보": hit.get("xlsx_row_relations", [])[:10],
                 "XLSX_전체_표_조회": False if hit.get("xlsx_sheet") else None}
         if hit.get('table_segments'):
-            labeled = [part for part in hit['table_segments'] if part.get('label')]
-            item['표_라벨_관계'] = [
-                {'row': part.get('row'), 'column': part.get('column'),
-                 'relations': [{**relation, 'text': relation.get('text', '')[:120]}
-                               for relation in (part.get('label_relations') or [])[:8]]
-                 if part.get('label_relations') is not None else None}
-                for part in labeled[:12]
-            ]
-            item['표_라벨_관계_일부_생략'] = len(labeled) > 12 or any(
-                len(part.get('label_relations') or []) > 8 for part in labeled[:12])
-        encoded = lambda items: byte_size(json.dumps(items, ensure_ascii=False))
-        if '표_라벨_관계' in item and encoded([*context, {**item, 'text': ''}]) >= fit_budget:
+            # Reserve only a small marker until all ranked evidence is fitted.
             item['표_라벨_관계'] = None
             item['표_라벨_관계_일부_생략'] = True
+        encoded = lambda items: byte_size(json.dumps(items, ensure_ascii=False))
         if encoded([*context, item]) > fit_budget:
             # Fit a prefix measured in JSON-encoded UTF-8 bytes, including escaping.
             full_text = item["text"]
@@ -64,6 +54,25 @@ def _chat_evidence(hits, limit, budget=32768):
             sources.append(dict(hit))
         context.append(item)
     omitted = len(hits) - len(sources)
+    # Relations supplement the evidence and must not displace its text or a
+    # later ranked hit. Add whole relationships only when spare budget permits.
+    for hit, item in zip(sources, context, strict=True):
+        if '표_라벨_관계' not in item:
+            continue
+        labeled = [part for part in hit['table_segments'] if part.get('label')]
+        selected = []
+        for part in labeled[:12]:
+            entry = {'row': part.get('row'), 'column': part.get('column'),
+                     'relations': [{**rel, 'text': rel.get('text', '')[:120]}
+                                   for rel in (part.get('label_relations') or [])[:8]]
+                     if part.get('label_relations') is not None else None}
+            item['표_라벨_관계'] = [*selected, entry]
+            if encoded(context) > fit_budget:
+                item['표_라벨_관계'] = selected or None
+                break
+            selected.append(entry)
+        item['표_라벨_관계_일부_생략'] = (len(selected) < len(labeled) or any(
+            len(part.get('label_relations') or []) > 8 for part in labeled[:len(selected)]))
     # Fill spare capacity with interpretation context after fitting the ranked evidence.
     for hit, item in zip(sources, context, strict=True):
         extra = hit.get("context_text") or ""

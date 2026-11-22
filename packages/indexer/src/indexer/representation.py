@@ -58,6 +58,7 @@ def table_parts(cells, inherited_headers=(), *, infer_first_row=False):
     for row in rows[1:]:
         previous, current, following = by_row.get(row - 1, []), by_row[row], by_row.get(row + 1, [])
         if (any(c.columns > 1 for c in local_columns)
+                and not any(c.scope in {'col', 'colgroup'} and c.columns == 1 for c in local_columns)
                 and len(current) >= 2 and len(current) == len(previous) == len(following)
                 and all(not c.header and c.rows == c.columns == 1 and len(c.search_text) <= 30 for c in current)
                 and {c.column for c in current} == {c.column for c in previous} == {c.column for c in following}

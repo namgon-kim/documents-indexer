@@ -132,3 +132,33 @@ def test_chat_passes_inferred_table_relations_and_accepts_legacy_hits(tmp_path):
     with httpx.Client(transport=httpx.MockTransport(provider)) as client:
         RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
             ChatRequest(message='질문'))
+
+
+def test_table_relation_metadata_does_not_displace_ranked_evidence():
+    from indexer.chat import _chat_evidence
+
+    relation = {'kind': 'column', 'text': 'A' * 60, 'element_id': 'e1', 'row': 1, 'column': 1,
+                'origin': 'inferred', 'status': 'unverified'}
+    hit = {'filename': 'doc', 'source_refs': [], 'search_text': 'A' * 2500,
+           'table_segments': [{'row': i, 'column': 1, 'label': 'X', 'label_relations': [relation]}
+                              for i in range(12)]}
+    _, context, counts = _chat_evidence([hit], 20, 4096)
+    assert context[0]['text'] == hit['search_text']
+    assert context[0]['표_라벨_관계_일부_생략'] is True
+    assert counts['evidence_truncated_count'] == 0
+    assert counts['evidence_bytes'] <= 4096
+
+
+def test_table_relation_metadata_does_not_displace_later_evidence():
+    from indexer.chat import _chat_evidence
+
+    relation = {'kind': 'column', 'text': 'X' * 100, 'element_id': 'e1', 'row': 1, 'column': 1,
+                'origin': 'inferred', 'status': 'unverified'}
+    table = {'filename': 'table', 'source_refs': [], 'search_text': 'A' * 1300,
+             'table_segments': [{'row': i, 'column': 1, 'label': 'X', 'label_relations': [relation]}
+                                for i in range(12)]}
+    later = {'filename': 'later', 'source_refs': [], 'search_text': 'B' * 1300}
+    _, context, counts = _chat_evidence([table, later], 20, 4096)
+    assert [item['text'] for item in context] == [table['search_text'], later['search_text']]
+    assert context[0]['표_라벨_관계_일부_생략'] is True
+    assert counts['evidence_omitted_count'] == counts['evidence_truncated_count'] == 0
