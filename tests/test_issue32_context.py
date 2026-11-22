@@ -100,6 +100,11 @@ def test_local_context_diagnostics_do_not_record_question_or_history(tmp_path):
 @pytest.mark.parametrize('question', [
     '정책 A는 개인정보 보호 기준입니다. 이것을 어떻게 적용하나요?',
     '서비스 B는 이용 신청 절차입니다. 그것의 적용 방법은 무엇인가요?',
+    '과제 A는 필수라고 명시되어 있습니다. 이것의 의미는 무엇인가요?',
+    '과제 A는 필수라고 말씀하셨습니다. 이것의 의미는 무엇인가요?',
+    '시스템은 A입니다. 해당 시스템은 무엇인가요?',
+    '서비스 A는 2026년에 출시됐습니다. 이것의 특징은 무엇인가요?',
+    '서비스 B는 2026년에 출시되었습니다. 이것의 특징은 무엇인가요?',
 ])
 def test_explicit_single_local_statement_does_not_import_previous_history(tmp_path, question):
     seen = []
@@ -115,6 +120,8 @@ def test_explicit_single_local_statement_does_not_import_previous_history(tmp_pa
     '2025년 1차 평가를 거쳤다고 했습니다. 그 결과는 무엇인가요?',
     '2차 심사를 진행한다고 설명했습니다. 그 결과는 무엇인가요?',
     '작년 정책이 유효하다고 했습니다. 이것을 어떻게 적용하나요?',
+    '지난 정책이 유효하다고 설명했습니다. 이것을 어떻게 적용하나요?',
+    '2026년에 정책이 유효하다고 설명했습니다. 이것을 어떻게 적용하나요?',
 ])
 def test_reported_context_or_ordinal_number_does_not_prove_a_local_referent(tmp_path, question):
     seen = []
@@ -135,3 +142,32 @@ def test_multiple_matching_referents_are_reported_as_ambiguous(tmp_path):
         RagChat(Config(tmp_path), retrieval, None).retrieve(ChatRequest(message=question, history=history, method='bm25'))
     assert trace['stages']['retrieval_query']['reference_states'] == ['ambiguous']
     assert seen[0].query == question
+
+
+def test_explicit_reported_target_stays_first_through_hybrid_and_reranking(tmp_path):
+    texts = {'target': '과제 A는 필수이며 실행 기준을 설명합니다', 'old': '교통 노선 시간표와 정류장'}
+    index = BM25Index(tmp_path / 'retrieval.sqlite')
+    index.replace_document('doc', [{'chunk_id': key, 'text': value} for key, value in texts.items()])
+    queries = []
+    class Dense:
+        def search(self, query, limit, document_id=None):
+            queries.append(query)
+            return [SearchHit('target', 1), SearchHit('old', .5)]
+    class Reranker:
+        def rerank(self, query, hits, limit):
+            queries.append(query)
+            selected = {hit.chunk_id: hit for hit in hits}
+            order = ['old', 'target'] if '교통' in query else ['target', 'old']
+            return [selected[key] for key in order if key in selected][:limit]
+    search = SearchService(Dense(), index, Reranker())
+    def retrieve(request):
+        hits = search.search(request.query, 'hybrid', 5, rerank=True, retrieval_top_n=25, rerank_top_n=5)
+        return {'index_version': 'v', 'results': [{'chunk_id': hit.chunk_id} for hit in hits]}
+    question = '과제 A는 필수라고 명시되어 있습니다. 이것의 의미는 무엇인가요?'
+    history = [ChatMessage(role='user', content='교통 정류장 위치를 알려줘')]
+    with capture_trace() as trace:
+        _, result = RagChat(Config(tmp_path), SimpleNamespace(search=retrieve), None).retrieve(
+            ChatRequest(message=question, history=history, method='hybrid', rerank=True))
+    assert result['results'][0]['chunk_id'] == 'target'
+    assert queries == [question, question]
+    assert trace['stages']['reranked'][0]['chunk_id'] == 'target'

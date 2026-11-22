@@ -225,9 +225,10 @@ _CONTEXT_REFERENCE = re.compile(
 _LOCAL_CLAUSE = re.compile(r'\d|(?:은|는|이|가|을|를|의|에서)(?=\s|[,.:;])|\b(?:is|are|was|were|has|have)\b', re.IGNORECASE)
 _NUMERIC_REFERENCE = frozenset({'수치', '값', '숫자', '비율', '금액', '인원', '건수', '합계'})
 _MEASURED_VALUE = re.compile(r'\d[\d,.]*\s*(?:%|명|건|개|원|회|억|만|배|점|시간|분|초|대|곳|항목)')
-_DECLARATIVE = re.compile(r'(?:입니다|이다|였다|됩니다|합니다|한다|했다|되었다)\s*[.!?。]$')
-_REPORTED = re.compile(r'(?:다고|라고|라며|이라며|말했|말씀|설명했|전했|들었)')
+_COMPLETED_STATEMENT = re.compile(r'[.。!]\s*$')
+_PRIOR_CONVERSATION = re.compile(r'(?:다고|라고|라며|이라며)\s*(?:했|말씀|말했|설명했|전했|들었|알려)')
 _SUBJECT = re.compile(r'(?<![가-힣A-Za-z0-9])[가-힣A-Za-z0-9]+(?:은|는|이|가)(?=\s)')
+_TEMPORAL_WORD = re.compile(r'^(?:(?:작년|올해|내년|당시|이전|최근|현재|지난)(?:의|에|에는)?|\d+(?:년|월|일|분기)(?:의|에|에는|부터|까지)?)$')
 
 
 def _local_reference(question, match):
@@ -238,7 +239,7 @@ def _local_reference(question, match):
     """
     prefix = question[:match.start()].strip()
     words = re.findall(r'[가-힣A-Za-z0-9]+', prefix)
-    if len(words) < 3 or not _LOCAL_CLAUSE.search(prefix):
+    if not _LOCAL_CLAUSE.search(prefix):
         return 'external'
     reference = match.group().strip()
     if nominal := re.fullmatch(r'(?:해당|그|이|저)\s+([가-힣A-Za-z]+)', reference):
@@ -248,14 +249,18 @@ def _local_reference(question, match):
             return 'ambiguous'
         if occurrences == 1:
             return 'local'
-        return 'local' if _MEASURED_VALUE.search(prefix) and name in _NUMERIC_REFERENCE else 'external'
+        return 'local' if len(words) >= 3 and _MEASURED_VALUE.search(prefix) and name in _NUMERIC_REFERENCE else 'external'
     if reference in {'이것', '그것', '이거', '그거'}:
-        if _REPORTED.search(prefix):
-            return 'external'
-        subjects = _SUBJECT.findall(prefix)
+        subjects = list(_SUBJECT.finditer(prefix))
         if len(subjects) > 1:
             return 'ambiguous'
-        if len(subjects) == 1 and _DECLARATIVE.search(prefix):
+        if len(subjects) == 1 and len(words) >= 2 and _COMPLETED_STATEMENT.search(prefix):
+            if _PRIOR_CONVERSATION.search(prefix):
+                subject_text = prefix[:subjects[0].end()].rsplit('.', 1)[-1]
+                subject_words = [word for word in re.findall(r'[가-힣A-Za-z0-9]+', subject_text)
+                                 if not _TEMPORAL_WORD.fullmatch(word)]
+                if len(subject_words) < 2:
+                    return 'external'
             return 'local'
     return 'external'
 
