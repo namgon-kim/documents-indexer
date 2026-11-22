@@ -26,7 +26,7 @@ from indexer.structure_relations import figure_relationships, table_relationship
 from indexer.table_evidence import set_html_table_evidence
 from indexer.xlsx_structure import confirmed
 
-TABLE_REPRESENTATION = "table-structure-v14"
+TABLE_REPRESENTATION = "table-structure-v15"
 
 def normalize_elements(raw_elements: list[dict]) -> list[dict]:
     elements = []
@@ -230,15 +230,27 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 title = linked_title['xlsx_region']['title_text']
             prefix = context_prefix(' > '.join(dict.fromkeys(filter(None, [heading, title]))),
                                     min(800, target_chars // 2, max_bytes // 3))
-            parts, row_labels = [], {}
+            parts, row_labels, ambiguous_pairs = [], {}, False
             if region['kind'] == 'key_value' and confirmed(region):
                 ordered = sorted((cell for cell in cells.values() if cell['address'] != region['title']),
                                  key=lambda cell: (cell['row'], cell['column']))
                 for _, row in groupby(ordered, key=lambda cell: cell['row']):
                     members = list(row)
-                    for index in range(0, len(members) - 1, 2):
-                        if not members[index]['hidden_merged'] and members[index]['text'].strip():
-                            row_labels[members[index + 1]['address']] = members[index]
+                    # Gaps and merges make positional pairing ambiguous. Never
+                    # shift the remaining values across a missing cell.
+                    for _, run in groupby(enumerate(members), key=lambda pair: pair[1]['column'] - pair[0]):
+                        contiguous = [cell for _, cell in run]
+                        if len(contiguous) % 2:
+                            ambiguous_pairs = True
+                            continue
+                        for index in range(0, len(contiguous), 2):
+                            label, value = contiguous[index:index + 2]
+                            if (not label['hidden_merged'] and not value['hidden_merged']
+                                    and not label.get('merged_range') and not value.get('merged_range')
+                                    and label['text'].strip()):
+                                row_labels[value['address']] = label
+                            else:
+                                ambiguous_pairs = True
             for item in sorted(cells.values(), key=lambda cell: (cell['row'], cell['column'])):
                 if not item['text'].strip():
                     continue
@@ -266,7 +278,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 kind = region['kind'] if region['kind'] in {'title', 'code', 'key_value'} else 'table'
                 append_chunk('\n'.join(filter(None, [prefix, *(item['text'] for item in segments)])),
                              [element], number, kind, element['heading_path'], {
-                                 'representation_version': 'xlsx-structure-v4', 'xlsx_region_start': region['start'],
+                                 'representation_version': 'xlsx-structure-v5', 'xlsx_region_start': region['start'],
                                  'xlsx_region_kind': region['kind'], 'xlsx_sheet': region['sheet'],
                                  'xlsx_context_cells': list(dict.fromkeys(key for key in [region['title'] if title else None, *header_keys,
                                      *(rel['address'] for part in group for rel in part['label_relations'])] if key)),
@@ -274,7 +286,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                  'relations': [{'type': 'xlsx_title', 'origin': 'inferred',
                                                 'status': 'unverified', 'element_id': linked_title['element_id'],
                                                 'adjacent': direct_title}] if linked_title else [],
-                                 'quality': ('unverified' if not confirmed(region) or any(
+                                 'quality': ('unverified' if not confirmed(region) or ambiguous_pairs or any(
                                      rel['status'] == 'unverified' for part in group for rel in part['label_relations'])
                                              else 'extracted'),
                              }, body_prefix=prefix)
@@ -311,7 +323,8 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 for cell in cells:
                     if cell.search_text and (cell.row + 1, cell.column + 1) not in represented:
                         parts.append({"text": cell.search_text, "label": "", "row": cell.row + 1, "column": cell.column + 1})
-                        uncertain = True
+                        if not cell.header:
+                            uncertain = True
                 layout = element.get('layout') or {}
                 legacy_xlsx = layout.get('space') == 'xlsx_region'
                 if not legacy_xlsx:

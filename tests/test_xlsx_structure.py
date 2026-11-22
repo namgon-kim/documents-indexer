@@ -431,6 +431,20 @@ def test_legacy_xlsx_search_rechunk_and_reparse_preserve_historical_version(tmp_
         upgraded = service.run_job(doc, queued['job_id'])
         assert upgraded['status'] == 'completed'
         assert retrieval.xlsx_catalog(doc)['tables'][0]['start'] == 'A1'
+        # Compare the historical parser-shaped index with a newly extracted
+        # native workbook, including both search recall and cell provenance.
+        new_version = upgraded['index_version']
+        for query, expected in [('하늘', '하늘'), ('20', '20'), ('점수', '점수')]:
+            old_hits = retrieval.search(SearchRequest(query=query, method='bm25', index_version=old_version))['results']
+            new_hits = retrieval.search(SearchRequest(query=query, method='bm25', index_version=new_version))['results']
+            assert any(expected in hit['search_text'] for hit in old_hits)
+            assert any(expected in hit['search_text'] for hit in new_hits)
+        old_hit = retrieval.search(request)['results'][0]
+        new_hit = retrieval.search(SearchRequest(query='하늘', method='bm25', index_version=new_version))['results'][0]
+        assert any(cell['row'] == 2 and cell['column'] == 1 for cell in old_hit['table_cells'])
+        assert any(cell['address'] == 'A2' for cell in new_hit['table_cells'])
+        assert any(source['cell'] == 'A2' and source['text'] == '하늘' for source in new_hit['source_segments'])
+        assert any('cells=' in url and 'A2' in url for url in new_hit['evidence_urls'])
         assert retrieval.search(request)['results'][0]['job_id'] == job
         assert manifest_path.read_bytes() == old_index
         qdrant.close()
@@ -734,3 +748,35 @@ def test_reviewed_horizontal_key_value_pairs_do_not_share_labels(tmp_path):
     assert [(parts[key]['label'], parts[key]['label_relations'][0]['address']) for key in ('B1', 'D1', 'F1')] == [
         ('검토 기준', 'A1'), ('기준 버전', 'C1'), ('원본 항목', 'E1')]
     assert not parts['C1']['label']
+
+
+@pytest.mark.parametrize('merged', [False, True])
+def test_key_value_gaps_and_merges_do_not_shift_pairs(tmp_path, merged):
+    path = tmp_path / 'gaps.xlsx'
+    book = Workbook()
+    sheet = book.active
+    sheet['A1'], sheet['C1'], sheet['D1'], sheet['E1'] = '담당자', '예산', 100, '정상'
+    if merged:
+        sheet.merge_cells('A1:B1')
+    book.save(path)
+    review = {'Sheet': {'regions': [region('A1', 'E1', kind='key_value')], 'excluded': {}}}
+    state = make_graph(None).invoke({'path': str(path), 'document_id': 'd', 'job_id': 'j',
+                                    'settings': SETTINGS, 'xlsx_review': review})
+    parts = {s['address']: s for c in state['chunks'] for s in c.get('table_segments', [])}
+    assert set(parts) == {'A1', 'C1', 'D1', 'E1'}
+    assert all(not part['label'] and not part['label_relations'] for part in parts.values())
+    assert all(c['quality'] == 'unverified' for c in state['chunks'] if c.get('xlsx_region_kind') == 'key_value')
+
+
+def test_merged_key_value_cells_are_not_automatically_paired(tmp_path):
+    path = tmp_path / 'merged.xlsx'
+    book = Workbook()
+    sheet = book.active
+    sheet['A1'], sheet['C1'] = '담당자', '김철수'
+    sheet.merge_cells('A1:B1')
+    book.save(path)
+    review = {'Sheet': {'regions': [region('A1', 'C1', kind='key_value')], 'excluded': {}}}
+    state = make_graph(None).invoke({'path': str(path), 'document_id': 'd', 'job_id': 'j',
+                                    'settings': SETTINGS, 'xlsx_review': review})
+    value = next(s for c in state['chunks'] for s in c.get('table_segments', []) if s['address'] == 'C1')
+    assert not value['label'] and not value['label_relations']

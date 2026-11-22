@@ -339,3 +339,27 @@ def test_legacy_xlsx_label_coordinates_use_original_offsets():
     result = next(part for part in parts if part['value'] == 'Pass')
     assert (result['row'], result['column']) == (12, 5)
     assert {(rel['row'], rel['column']) for rel in result['label_relations']} == {(12, 4), (11, 5)}
+
+
+def test_plain_unscoped_header_has_explicit_column_relation():
+    html = '<table><tr><th>이름</th><th>직무</th></tr><tr><td>김철수</td><td>개발자</td></tr></table>'
+    elements = normalize_elements([{'category': 'table', 'content': {'html': html}}])
+    chunks = make_chunks('d', 'j', elements, 400, 0)
+    parts = [part for chunk in chunks for part in chunk['table_segments']]
+    name = next(part for part in parts if part['value'] == '김철수')
+    assert name['label_origin'] == 'parser'
+    assert name['label_relations'][0]['text'] == '이름'
+    assert name['label_relations'][0]['status'] == 'explicit'
+    role = next(part for part in parts if part['value'] == '개발자')
+    assert next(rel for rel in role['label_relations'] if rel['text'] == '직무')['status'] == 'explicit'
+    # A data cell used as a row label remains a separate, inferred relation.
+    assert next(rel for rel in role['label_relations'] if rel['text'] == '김철수')['status'] == 'unverified'
+
+
+def test_single_column_unscoped_header_does_not_lower_quality():
+    html = '<table><tr><th>이름</th></tr><tr><td>김철수</td></tr></table>'
+    elements = normalize_elements([{'category': 'table', 'content': {'html': html}}])
+    chunk = make_chunks('d', 'j', elements, 400, 0)[0]
+    assert chunk['quality'] == 'extracted'
+    value = next(part for part in chunk['table_segments'] if part['value'] == '김철수')
+    assert value['label_relations'][0]['status'] == 'explicit'

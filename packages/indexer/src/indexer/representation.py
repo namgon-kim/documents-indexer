@@ -47,6 +47,14 @@ def table_parts(cells, inherited_headers=(), *, infer_first_row=False):
     if not rows:
         return [], False
     first_data_row = rows[0]
+    # A single complete unmerged header row has an unambiguous column mapping
+    # even when the author omitted HTML's optional scope attribute.
+    simple_header = (first_data_row == 1 and bool(headers)
+                     and all(h.row == 0 and h.rows == h.columns == 1
+                             and h.scope in {'', 'col'} for h in headers)
+                     and len({h.column for h in headers}) == len(headers)
+                     and {h.column for h in headers} == {c.column for c in cells if not c.header}
+                     and all(c.rows == c.columns == 1 for c in cells))
     # A complete short row between longer data rows can introduce a new set of
     # local headings (a common HTML rendering of a diagram). Keep it as data;
     # the relationship to the following row is only a candidate.
@@ -128,7 +136,9 @@ def table_parts(cells, inherited_headers=(), *, infer_first_row=False):
         for kind, items in (("row", row_headers), ("column", columns)):
             for source in items:
                 inherited = any(source is item for item in inherited_headers)
-                inferred = (not source.header or inherited or source.scope not in {"row", "rowgroup", "col", "colgroup"})
+                inferred = (not source.header or inherited or (
+                    source.scope not in {"row", "rowgroup", "col", "colgroup"}
+                    and not (kind == 'column' and simple_header and source in local_columns)))
                 relation_items.append({"kind": kind, "text": source.search_text, "row": source.row + 1,
                                        "column": source.column + 1, "inherited": inherited,
                                        "origin": "inferred" if inferred else "parser",
