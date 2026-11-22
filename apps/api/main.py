@@ -148,6 +148,8 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
     wake = threading.Event()
     operation_lock = threading.RLock()
     active_claims = set()
+    reserved_documents = set()
+    active_rebuilds = set()
     settings_lock = threading.Lock()
     parser_profiles_lock = threading.RLock()
     processing_defaults = {"target_chars": config.default_target_chars, "overlap_chars": config.default_overlap_chars,
@@ -155,9 +157,27 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
 
     def ensure_no_processing(app):
         service = getattr(app.state, 'ingestion', None)
-        if service and any(job.get('status') == 'processing' for doc in service.storage.list_documents()
-                           for job in service.storage.list_jobs(doc['document_id'])):
+        if reserved_documents or active_rebuilds or (service and any(job.get('status') == 'processing' for doc in service.storage.list_documents()
+                           for job in service.storage.list_jobs(doc['document_id']))):
             raise IndexerError('JOB_IN_PROGRESS', '문서 처리가 진행 중입니다. 완료 후 설정을 변경해 주세요.', 409)
+
+    def ensure_document_unreserved(document_id):
+        if str(document_id) in reserved_documents:
+            raise ValueError('이 문서의 다른 작업이 진행 중입니다')
+
+    @contextmanager
+    def reserve_document(document_id):
+        document_id = str(document_id)
+        with operation_lock:
+            ensure_document_unreserved(document_id)
+            reserved_documents.add(document_id)
+        try:
+            yield
+        finally:
+            with operation_lock:
+                reserved_documents.discard(document_id)
+                if stop.is_set() and not (active_claims or reserved_documents or active_rebuilds):
+                    app.state.finish_cleanup()
 
     def search_ranking(candidate):
         return {"retrieval_top_n": candidate.retrieval_top_n, "rerank_top_n": candidate.rerank_top_n}
@@ -267,12 +287,12 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                             with operation_lock:
                                 if recovery_needed and hasattr(app.state, 'ingestion'):
                                     if hasattr(app.state.ingestion, 'claim_next'):
-                                        app.state.ingestion.recover(exclude_jobs=active_claims)
+                                        app.state.ingestion.recover(exclude_jobs=active_claims, exclude_documents=reserved_documents)
                                     else:
                                         app.state.ingestion.recover()
                                     recovery_needed = False
                                 service = getattr(app.state, 'ingestion', None)
-                                claimed = service.claim_next() if service and hasattr(service, 'claim_next') else None
+                                claimed = service.claim_next(exclude_documents=reserved_documents) if service and hasattr(service, 'claim_next') else None
                                 if isinstance(claimed, tuple):
                                     active_claims.add((claimed[0], claimed[1]))
                                 processed = bool(claimed)
@@ -303,7 +323,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                     if not stop.is_set():
                         app.state.worker_health = {**app.state.worker_health, 'status': 'stopped'}
                         LOG.error('Ingestion worker stopped unexpectedly')
-                    if stop.is_set() and not active_claims:
+                    if stop.is_set() and not (active_claims or reserved_documents or active_rebuilds):
                         cleanup()
 
             thread = threading.Thread(target=worker, name="indexer-worker", daemon=True)
@@ -315,7 +335,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                 wake.set()
                 await run_in_threadpool(thread.join, 2)
         finally:
-            if (thread is None or not thread.is_alive()) and not active_claims:
+            if (thread is None or not thread.is_alive()) and not (active_claims or reserved_documents or active_rebuilds):
                 cleanup()
 
     app = FastAPI(title="DocumentIndexer", version="0.1.0", lifespan=lifespan)
@@ -529,7 +549,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             finally:
                 with operation_lock:
                     active_claims.discard((document_id, job_id))
-                    if stop.is_set() and not active_claims:
+                    if stop.is_set() and not (active_claims or reserved_documents or active_rebuilds):
                         request.app.state.finish_cleanup()
 
     @app.get("/v1/ingestion-documents", dependencies=[Depends(auth.require)])
@@ -562,6 +582,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError("PARSER_NOT_CONFIGURED", "파서 연결을 설정해 주세요.", 503)
         try:
             with operation_lock:
+                ensure_document_unreserved(document_id)
                 request.app.state.ingestion.delete_document(str(document_id))
         except FileNotFoundError as error:
             raise IndexerError("DOCUMENT_NOT_FOUND", "문서를 찾을 수 없습니다.", 404) from error
@@ -577,6 +598,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError("PARSER_NOT_CONFIGURED", "파서 연결을 설정해 주세요.", 503)
         try:
             with operation_lock:
+                ensure_document_unreserved(document_id)
                 request.app.state.ingestion.delete_job(str(document_id), str(job_id))
         except FileNotFoundError as error:
             raise IndexerError("JOB_NOT_FOUND", "작업을 찾을 수 없습니다.", 404) from error
@@ -593,6 +615,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         service = request.app.state.ingestion
         try:
             with operation_lock:
+                ensure_document_unreserved(document_id)
                 document = service.storage.load_document(str(document_id))
                 base = service.storage.load_job(str(document_id), str(body.base_job_id), "processing")
                 settings = settings_from(body.settings, document["format"], base.get("settings", {}))
@@ -650,6 +673,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError('XLSX_REVIEW_INVALID', '수정한 시트를 지정해 주세요.')
         try:
             with operation_lock:
+                ensure_document_unreserved(document_id)
                 service = request.app.state.ingestion
                 base = service.storage.load_job(str(document_id), str(job_id), 'processing')
                 result = service.enqueue_reprocess(str(document_id), str(job_id), 'rechunk', base['settings'],
@@ -678,7 +702,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         if not config.external_processing:
             raise IndexerError("EXTERNAL_PROCESSING_DISABLED", "외부 문서 처리가 비활성화되어 있습니다.", 403)
         try:
-            with operation_lock:
+            with reserve_document(document_id):
                 service = request.app.state.ingestion
                 status = service.storage.load_job(str(document_id), str(job_id), "processing")
                 if status.get("can_resume"):
@@ -704,7 +728,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         if not config.external_processing:
             raise IndexerError("EXTERNAL_PROCESSING_DISABLED", "외부 문서 처리가 비활성화되어 있습니다.", 403)
         try:
-            with operation_lock:
+            with reserve_document(document_id):
                 return request.app.state.ingestion.accept_content_changes(str(document_id), str(job_id))
         except (FileNotFoundError, ValueError, AttributeError) as error:
             raise IndexerError("REVIEW_UNAVAILABLE", str(error), 409) from error
@@ -714,7 +738,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         if not config.external_processing:
             raise IndexerError("EXTERNAL_PROCESSING_DISABLED", "외부 문서 처리가 비활성화되어 있습니다.", 403)
         try:
-            with operation_lock:
+            with reserve_document(document_id):
                 return request.app.state.ingestion.accept_content_changes(str(document_id), str(job_id), accept_partial=True)
         except (FileNotFoundError, ValueError, AttributeError) as error:
             raise IndexerError("REVIEW_UNAVAILABLE", str(error), 409) from error
@@ -926,6 +950,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError('EXTERNAL_PROCESSING_DISABLED', '외부 문서 처리가 비활성화되어 있습니다.', 403)
         try:
             with operation_lock:
+                ensure_document_unreserved(document_id)
                 result = request.app.state.ingestion.enqueue_image_actions(str(document_id), str(job_id), body.actions,
                                                                            body.embedding_profile_id, body.descriptions)
                 wake.set()
@@ -1019,7 +1044,17 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         try:
             with operation_lock:
                 publisher = request.app.state.ingestion.publisher_for(profile_id, for_ingest=True)
+                key = getattr(publisher, 'active_name', profile_id or '__default__')
+                if key in active_rebuilds:
+                    raise ValueError('이미 해당 색인을 다시 만들고 있습니다')
+                active_rebuilds.add(key)
+            try:
                 manifest = publisher.rebuild_with_current_profile()
+            finally:
+                with operation_lock:
+                    active_rebuilds.discard(key)
+                    if stop.is_set() and not (active_claims or reserved_documents or active_rebuilds):
+                        request.app.state.finish_cleanup()
         except ValueError as error:
             raise IndexerError("REBUILD_UNAVAILABLE", str(error), 409) from error
         except Exception as error:
@@ -1178,6 +1213,8 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         if not profile:
             raise IndexerError("PARSER_PROFILE_INVALID", "파서를 찾을 수 없습니다.", 404)
         with operation_lock, settings_lock:
+            if reserved_documents or active_rebuilds:
+                raise IndexerError('JOB_IN_PROGRESS', '게시 또는 색인 작업이 진행 중입니다.', 409)
             changes = {key: profile[key] for key in PARSER_PROFILE_FIELDS}
             old_service = getattr(request.app.state, "ingestion", None)
             if old_service and old_service.parser_factory:

@@ -470,3 +470,123 @@ def test_synchronous_upload_releases_lock_during_parse(tmp_path):
         finally:
             release.set()
         assert first.result(timeout=5).status_code == 200
+
+
+def test_prepared_documents_rebase_but_same_document_conflict_is_rejected(publication):
+    publisher, calls = publication
+    def chunk(doc, text):
+        return {'chunk_id': str(uuid4()), 'document_id': doc, 'text': text}
+    one = publisher.prepare('one', [chunk('one', '첫 번째')])
+    two = publisher.prepare('two', [chunk('two', '두 번째')])
+    publisher.commit(one)
+    publisher.commit(two)
+    assert set(publisher.active()['document_ids']) == {'one', 'two'}
+    assert calls == [['첫 번째'], ['두 번째']]
+    previous = publisher.active()['version']
+    old = publisher.prepare('one', [chunk('one', '오래된 수정')])
+    new = publisher.prepare('one', [chunk('one', '새 수정')])
+    publisher.commit(new)
+    with pytest.raises(ValueError, match='같은 문서'):
+        publisher.commit(old)
+    assert publisher.active()['version'] != previous
+    assert publisher.document_chunks('one', publisher.active())[0]['text'] == '새 수정'
+
+
+def test_two_simultaneous_uploads_both_reach_published_index(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from io import BytesIO
+
+    from fastapi.testclient import TestClient
+    from indexer.config import Config
+    from indexer.parsing.contracts import ParseResult
+    from pypdf import PdfReader, PdfWriter
+
+    from apps.api.main import create_app
+    barrier = threading.Barrier(2)
+    calls = []
+    def embed(request):
+        body = json.loads(request.content)
+        calls.extend(body['input'])
+        if any(text in {'자료 하나', '자료 둘'} for text in body['input']):
+            barrier.wait(timeout=5)
+        return httpx.Response(200, json={'model': body['model'], 'data': [
+            {'index': i, 'embedding': [1.0, 0.5]} for i in range(len(body['input']))]})
+    class Parser:
+        def parse(self, request):
+            width = float(PdfReader(request.path).pages[0].mediabox.width)
+            rows = [{'page': 1, 'category': 'paragraph', 'content': {'text': '자료 하나' if width == 100 else '자료 둘'}}]
+            return ParseResult('fake', rows, {'elements': rows})
+    def pdf(width):
+        writer = PdfWriter()
+        writer.add_blank_page(width=width, height=100)
+        out = BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    with httpx.Client(transport=httpx.MockTransport(embed)) as embedding_http:
+        qdrant = QdrantClient(':memory:')
+        publisher = IndexPublisher(tmp_path, qdrant, EmbeddingClient(embedding_http, 'https://example.test/v1', 'key',
+                                   EmbeddingProfile('p', 'doc', 'query', 2)))
+        service = IngestionService(ArtifactStore(tmp_path), Parser(), publisher)
+        with TestClient(create_app(Config(tmp_path, access_key='example', external_processing=True), ingestion_service=service),
+                        base_url='https://testserver') as client, ThreadPoolExecutor(max_workers=2) as pool:
+            login = client.post('/v1/auth/login', json={'access_key': 'example'}, headers={'Origin': 'https://testserver'})
+            client.headers.update({'Origin': 'https://testserver', 'X-CSRF-Token': login.json()['csrf_token']})
+            futures = [pool.submit(client.post, '/v1/ingest', files={'file': (f'{n}.pdf', pdf(width))})
+                       for n, width in enumerate((100, 150))]
+            results = [future.result(timeout=10) for future in futures]
+            assert [result.status_code for result in results] == [200, 200]
+            assert all(result.json()['status'] == 'completed' for result in results)
+            assert set(publisher.active()['document_ids']) == {result.json()['document_id'] for result in results}
+            assert calls.count('자료 하나') == calls.count('자료 둘') == 1
+        qdrant.close()
+
+
+@pytest.mark.parametrize('operation', ['accept-content-changes', 'accept-partial', 'resume', 'rebuild'])
+def test_long_review_resume_and_rebuild_do_not_hold_api_lock(tmp_path, monkeypatch, operation):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from io import BytesIO
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+    from indexer.config import Config
+    from pypdf import PdfWriter
+
+    from apps.api.main import create_app
+    entered, release = threading.Event(), threading.Event()
+    def delayed(*args, **kwargs):
+        entered.set()
+        assert release.wait(8)
+        return {'version': 'v', 'chunk_count': 1}
+    publisher = SimpleNamespace(deleted_documents=lambda: set(), rebuild_with_current_profile=delayed)
+    store = ArtifactStore(tmp_path)
+    source = tmp_path / 'first.pdf'
+    source.write_bytes(b'%PDF-1.4')
+    doc, job = store.register(source)['document_id'], str(uuid4())
+    store.save_job(doc, job, 'processing', {'status': 'failed', 'stage': 'indexing', 'can_resume': False})
+    service = IngestionService(store, None, publisher)
+    monkeypatch.setattr(service, 'accept_content_changes', delayed)
+    monkeypatch.setattr(service, 'resume_index', delayed)
+    app = create_app(Config(tmp_path, access_key='example', external_processing=True), ingestion_service=service)
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    output = BytesIO()
+    writer.write(output)
+    path = '/v1/ingest-index-rebuild' if operation == 'rebuild' else f'/v1/ingest/{doc}/jobs/{job}/{operation}'
+    with TestClient(app, base_url='https://testserver') as client, ThreadPoolExecutor(max_workers=2) as pool:
+        login = client.post('/v1/auth/login', json={'access_key': 'example'}, headers={'Origin': 'https://testserver'})
+        client.headers.update({'Origin': 'https://testserver', 'X-CSRF-Token': login.json()['csrf_token']})
+        running = pool.submit(client.post, path)
+        try:
+            assert entered.wait(3)
+            upload = pool.submit(client.post, '/v1/ingest', data={'deferred': 'true'},
+                                 files={'file': ('other.pdf', output.getvalue())}).result(timeout=2)
+            assert upload.status_code == 200
+            if operation != 'rebuild':
+                assert client.delete(f'/v1/ingest/{doc}').status_code == 409
+            changed = client.put('/v1/settings', json={'values': {'remote_timeout': 60}})
+            assert changed.status_code == 409
+        finally:
+            release.set()
+        assert running.result(timeout=5).status_code == 200

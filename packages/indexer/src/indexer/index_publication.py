@@ -209,19 +209,38 @@ class IndexPublisher:
         chunks, vectors = embed_chunks(cache, chunks, profile.max_input_bytes, profile.batch_size, progress,
                                        tracked_document=document_id, detail_progress=getattr(progress, "document_progress", None))
         return {"chunks": chunks, "vectors": vectors, "contract": contract,
-                "previous_version": previous["version"] if previous else None}
+                "previous_version": previous["version"] if previous else None,
+                'document_id': document_id,
+                'baseline_document': [item for item in prior if item['document_id'] == document_id]}
 
     def commit(self, prepared):
-        with self.lock:
-            active = self.active()
-            if (active["version"] if active else None) != prepared["previous_version"]:
-                raise ValueError("검색 버전이 변경되었습니다. 저장된 청크로 다시 시도해 주세요")
-            if prepared["contract"] != self.embedding_contract():
-                raise ValueError("임베딩 프로필이 변경되었습니다")
-            if any(item["document_id"] in self.deleted_documents() for item in prepared["chunks"]):
-                raise ValueError("삭제된 문서가 포함되어 있습니다")
-            return self._build(prepared["chunks"], prepared["contract"], prepared["vectors"],
-                               previous_version=prepared['previous_version'], publication_id=prepared.get('publication_id'))
+        original = prepared
+        document_id = original.get('document_id')
+        target_chunks = [item for item in original['chunks'] if item['document_id'] == document_id] if document_id else None
+        for attempt in range(4):
+            with self.lock:
+                active = self.active()
+                if prepared["contract"] != self.embedding_contract():
+                    raise ValueError("임베딩 프로필이 변경되었습니다")
+                if any(item["document_id"] in self.deleted_documents() for item in prepared["chunks"]):
+                    raise ValueError("삭제된 문서가 포함되어 있습니다")
+                if (active["version"] if active else None) == prepared["previous_version"]:
+                    return self._build(prepared["chunks"], prepared["contract"], prepared["vectors"],
+                                       previous_version=prepared['previous_version'], publication_id=prepared.get('publication_id'))
+                doc = original.get('document_id')
+                if not doc or not active or active['embedding_profile'] != original['contract']:
+                    raise ValueError("검색 버전이 변경되었습니다. 저장된 청크로 다시 시도해 주세요")
+                if self.document_chunks(doc, active) != original['baseline_document']:
+                    raise ValueError("같은 문서의 검색 내용이 변경되었습니다. 다시 확인해 주세요")
+            if attempt == 3:
+                break
+            # Reuse the existing cache outside the lock; a new snapshot may
+            # introduce other documents but must never overwrite this document.
+            prepared = self.prepare(doc, target_chunks)
+            if prepared['baseline_document'] != original['baseline_document']:
+                raise ValueError("같은 문서의 검색 내용이 변경되었습니다. 다시 확인해 주세요")
+            prepared['publication_id'] = original.get('publication_id')
+        raise ValueError("검색 버전이 계속 변경되어 게시하지 못했습니다. 다시 시도해 주세요")
 
     def publish(self, document_id: str, new_chunks: list[dict], *, publication_id=None):
         prepared = self.prepare(document_id, new_chunks)

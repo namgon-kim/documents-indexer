@@ -710,9 +710,9 @@ class IngestionService:
                                    "recovery_mode": attempt if can_resume else None, "error": error_info})
             raise IngestionFailure(document_id, job_id) from error
 
-    def claim_next(self):
+    def claim_next(self, *, exclude_documents=()):
         for document in self.storage.list_documents():
-            if document['document_id'] in self._deleted_documents():
+            if document['document_id'] in exclude_documents or document['document_id'] in self._deleted_documents():
                 continue
             for job in self.storage.list_jobs(document["document_id"]):
                 if job.get("status") == "queued":
@@ -739,9 +739,11 @@ class IngestionService:
                 pass
         return bool(claimed)
 
-    def recover(self, *, exclude_jobs=()):
+    def recover(self, *, exclude_jobs=(), exclude_documents=()):
         for document in self.storage.list_documents():
             document_id = document["document_id"]
+            if document_id in exclude_documents:
+                continue
             if document_id in self._deleted_documents():
                 continue
             for job in self.storage.list_jobs(document_id):
@@ -1004,6 +1006,9 @@ class IngestionService:
     def resume_index(self, document_id: str, job_id: str):
         self._ensure_not_deleted(document_id)
         status = self.storage.load_job(document_id, job_id, "processing")
+        if any(job.get('status') in {'queued', 'processing'} and job['job_id'] != job_id
+               for job in self.storage.list_jobs(document_id)):
+            raise ValueError('이 문서의 다른 작업이 진행 중입니다')
         publisher = self.publisher_for(status.get("embedding_profile_id"), for_ingest=True)
         if status.get("status") != "failed" or status.get("stage") not in {"embedding", "indexing"} or not publisher:
             raise ValueError("저장된 청크에서 재개할 수 없는 작업입니다")

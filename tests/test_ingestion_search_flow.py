@@ -510,12 +510,11 @@ def test_spreadsheet_explicit_source_location_survives_retrieval_and_chat(tmp_pa
         qdrant.close()
 
 
-def test_search_and_profile_lookup_continue_while_embedding_and_stale_commit_rejected(tmp_path):
+def test_search_and_profile_lookup_continue_while_independent_commit_rebases(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
     from uuid import uuid4
 
-    import pytest
     from indexer.embedding_profiles import EmbeddingProfiles
 
     started, release = Event(), Event()
@@ -546,9 +545,8 @@ def test_search_and_profile_lookup_continue_while_embedding_and_stale_commit_rej
             finally:
                 release.set()
             prepared = pending.result(timeout=5)
-        with pytest.raises(ValueError, match="검색 버전이 변경"):
-            publisher.commit(prepared)
-        assert "third" in publisher.active()["document_ids"]
+        publisher.commit(prepared)
+        assert set(publisher.active()["document_ids"]) == {"first", "second", "third"}
 
 
 def test_credit_exhaustion_is_reported_and_resumes_without_reparsing(tmp_path):
