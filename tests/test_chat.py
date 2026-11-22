@@ -112,3 +112,70 @@ def test_large_first_evidence_is_utf8_safe_and_cited(tmp_path):
     assert result["sources"][0]["evidence_truncated"]
     assert result["answer"] == "근거 일부 [1]"
     assert result["search_counts"]["evidence_bytes"] <= 4096
+
+
+def test_chat_passes_inferred_table_relations_and_accepts_legacy_hits(tmp_path):
+    relation = {'kind': 'row', 'text': '학생', 'element_id': 'e1', 'row': 2, 'column': 1,
+                'origin': 'inferred', 'status': 'unverified'}
+    hits = [{'filename': 'doc', 'source_refs': [], 'search_text': '학생 / 설문',
+             'table_segments': [{'row': 2, 'column': 2, 'label': '학생', 'label_relations': [relation]}]},
+            {'filename': 'old', 'source_refs': [], 'search_text': '이전 청크',
+             'table_segments': [{'row': 1, 'column': 1, 'label': '옛 라벨'}]}]
+    retrieval = SimpleNamespace(search=lambda _: {'results': hits, 'index_version': 'v'})
+    def provider(request):
+        body = json.loads(request.content)
+        items = json.loads(body['messages'][-1]['content'])['검색된 문서']
+        assert items[0]['표_라벨_관계'][0]['relations'][0] == relation
+        assert items[1]['표_라벨_관계'][0]['relations'] is None
+        assert '정보가 없거나 생략된 사실만으로 관계가 틀렸다고 판단하지 마세요' in body['messages'][0]['content']
+        return httpx.Response(200, json={'choices': [{'message': {'content': '답변 [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
+            ChatRequest(message='질문'))
+
+
+def test_table_relation_metadata_does_not_displace_ranked_evidence():
+    from indexer.chat import _chat_evidence
+
+    relation = {'kind': 'column', 'text': 'A' * 60, 'element_id': 'e1', 'row': 1, 'column': 1,
+                'origin': 'inferred', 'status': 'unverified'}
+    hit = {'filename': 'doc', 'source_refs': [], 'search_text': 'A' * 2500,
+           'table_segments': [{'row': i, 'column': 1, 'label': 'X', 'label_relations': [relation]}
+                              for i in range(12)]}
+    _, context, counts = _chat_evidence([hit], 20, 4096)
+    assert context[0]['text'] == hit['search_text']
+    assert context[0]['표_라벨_관계_일부_생략'] is True
+    assert counts['evidence_truncated_count'] == 0
+    assert counts['evidence_bytes'] <= 4096
+
+
+def test_table_relation_metadata_does_not_displace_later_evidence():
+    from indexer.chat import _chat_evidence
+
+    relation = {'kind': 'column', 'text': 'X' * 100, 'element_id': 'e1', 'row': 1, 'column': 1,
+                'origin': 'inferred', 'status': 'unverified'}
+    table = {'filename': 'table', 'source_refs': [], 'search_text': 'A' * 1300,
+             'table_segments': [{'row': i, 'column': 1, 'label': 'X', 'label_relations': [relation]}
+                                for i in range(12)]}
+    later = {'filename': 'later', 'source_refs': [], 'search_text': 'B' * 1300}
+    _, context, counts = _chat_evidence([table, later], 20, 4096)
+    assert [item['text'] for item in context] == [table['search_text'], later['search_text']]
+    assert context[0]['표_라벨_관계_일부_생략'] is True
+    assert counts['evidence_omitted_count'] == counts['evidence_truncated_count'] == 0
+
+
+def test_interpretation_context_fits_before_table_relationship_metadata():
+    from indexer.chat import _chat_evidence
+
+    relation = {'kind': 'column', 'text': '제목' * 30, 'element_id': 'e1', 'row': 1, 'column': 1,
+                'origin': 'inferred', 'status': 'unverified'}
+    hit = {'filename': 'doc', 'source_refs': [], 'search_text': 'A' * 1000,
+           'context_text': '필요한 앞뒤 문맥 ' * 50,
+           'table_segments': [{'row': i, 'column': 1, 'label': '제목', 'label_relations': [relation]}
+                              for i in range(12)]}
+    _, context, counts = _chat_evidence([hit], 20, 4096)
+    assert context[0]['text'] == hit['search_text']
+    assert context[0]['context'] == hit['context_text']
+    assert context[0]['표_라벨_관계_일부_생략'] is True
+    assert counts['context_omitted_count'] == 0
+    assert counts['evidence_bytes'] <= 4096

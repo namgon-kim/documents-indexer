@@ -568,7 +568,8 @@ class NativeExtractor:
             location = {'kind': 'xlsx_range', 'sheet': sheet['name'], 'start': region['start'], 'end': region['end']}
             fragments = [{'row': positions[cell['address']][0], 'column': positions[cell['address']][1],
                           'text': search_value(cell), 'address': cell['address'],
-                          'hidden_merged': cell['hidden_merged']} for cell in selected]
+                          'hidden_merged': cell['hidden_merged'], 'merged_range': cell.get('merged_range')}
+                         for cell in selected]
             title = cells[region['title']]['display_text'] if region['title'] else None
             self.add('table' if region['kind'] in {'table', 'unknown'} else region['kind'],
                      text='\n'.join(part['text'] for part in fragments),

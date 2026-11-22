@@ -136,8 +136,8 @@ def validate(sheet, proposal, origin):
             row_counts = defaultdict(int)
             for key in members - {region.title}:
                 row_counts[positions[key][0]] += 1
-            if not row_counts or any(count != 2 for count in row_counts.values()):
-                raise ValueError('항목·값 영역의 각 행에는 두 셀이 필요합니다')
+            if not row_counts or any(count < 2 or count % 2 for count in row_counts.values()):
+                raise ValueError('항목·값 영역의 각 행에는 짝수 개의 셀이 필요합니다')
         seen.append(area)
         claimed.update(members)
         validated = {**region.model_dump(), 'origin': 'explicit' if table else origin,

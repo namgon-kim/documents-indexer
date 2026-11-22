@@ -408,7 +408,8 @@ def test_continued_table_search_returns_all_context_evidence(tmp_path):
         assert "2026년 / 27" in hit["search_text"]
         assert {url.split("?", 1)[0].rsplit("/", 1)[-1] for url in hit["evidence_urls"]} == {"e4"}
         assert [part["text"] for part in hit["source_segments"]] == ["연구비", "27"]
-        assert {url.rsplit("/", 1)[-1] for url in hit["context_urls"]} == {"e1", "e2", "e3"}
+        assert {url.split("?", 1)[0].rsplit("/", 1)[-1] for url in hit["context_urls"]} == {"e1", "e2", "e3", "e4"}
+        assert any('e2?table_cells=' in url for url in hit['context_urls'])
         assert {ref["page"] for ref in hit["source_refs"] if ref["role"] == "evidence"} == {2}
         assert {ref["page"] for ref in hit["source_refs"] if ref["role"] == "context"} == {1, 2}
         assert {ref["page"] for ref in hit["source_refs"]} == {1, 2}

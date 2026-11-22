@@ -1,3 +1,5 @@
+from bisect import bisect_right
+from collections import defaultdict
 from itertools import groupby
 
 from indexer.embedding_input import MAX_INPUT_BYTES, byte_size, context_prefix, render_embedding, split_text
@@ -19,7 +21,7 @@ def inferred_column_headers(cells, infer_first_row=False):
             for cell in following:
                 match = next((h for h in candidates if h.column == cell.column and cell.columns == 1), None)
                 if match:
-                    result[(cell.row, cell.column)] = match.search_text
+                    result[(cell.row, cell.column)] = match
     for parent in cells:
         if parent.columns != 1 or parent.rows < 2 or not parent.search_text:
             continue
@@ -33,7 +35,7 @@ def inferred_column_headers(cells, infer_first_row=False):
                 continue
             matching = [h for h in candidates if h.column == cell.column and h.columns == cell.columns]
             if len(matching) == 1:
-                result[(cell.row, cell.column)] = matching[0].search_text
+                result[(cell.row, cell.column)] = matching[0]
     return result
 
 
@@ -45,8 +47,35 @@ def table_parts(cells, inherited_headers=(), *, infer_first_row=False):
     if not rows:
         return [], False
     first_data_row = rows[0]
+    # A single complete unmerged header row has an unambiguous column mapping
+    # even when the author omitted HTML's optional scope attribute.
+    simple_header = (first_data_row == 1 and bool(headers)
+                     and all(h.row == 0 and h.rows == h.columns == 1
+                             and h.scope in {'', 'col'} for h in headers)
+                     and len({h.column for h in headers}) == len(headers)
+                     and {h.column for h in headers} == {c.column for c in cells if not c.header}
+                     and all(c.rows == c.columns == 1 for c in cells))
+    # A complete short row between longer data rows can introduce a new set of
+    # local headings (a common HTML rendering of a diagram). Keep it as data;
+    # the relationship to the following row is only a candidate.
+    by_row = defaultdict(list)
+    for item in cells:
+        if item.search_text:
+            by_row[item.row].append(item)
+    transitions = {}
+    for row in rows[1:]:
+        previous, current, following = by_row.get(row - 1, []), by_row[row], by_row.get(row + 1, [])
+        if (any(c.columns > 1 for c in local_columns)
+                and not any(c.scope in {'col', 'colgroup'} and c.columns == 1 for c in local_columns)
+                and len(current) >= 2 and len(current) == len(previous) == len(following)
+                and all(not c.header and c.rows == c.columns == 1 and len(c.search_text) <= 30 for c in current)
+                and {c.column for c in current} == {c.column for c in previous} == {c.column for c in following}
+                and any(len(c.search_text) > 30 for c in previous)
+                and any(len(c.search_text) > 30 for c in following)):
+            transitions[row] = {c.column: c for c in current}
+    transition_rows = sorted(transitions)
     row_values = {
-        row: cell.search_text
+        row: cell
         for cell in cells
         if cell.column == 0 and not cell.header and cell.search_text
         for row in range(cell.row, cell.row + cell.rows)
@@ -58,7 +87,7 @@ def table_parts(cells, inherited_headers=(), *, infer_first_row=False):
         and value.column > 0
     ))):
         row_headers = [
-            item.search_text
+            item
             for item in headers
             if item.row <= cell.row < item.row + item.rows
             and (
@@ -72,7 +101,7 @@ def table_parts(cells, inherited_headers=(), *, infer_first_row=False):
             )
         ]
         columns = [
-            item.search_text
+            item
             for item in local_columns
             if item.row < cell.row
             and item.column <= cell.column
@@ -80,7 +109,7 @@ def table_parts(cells, inherited_headers=(), *, infer_first_row=False):
         ]
         if not columns:
             columns = [
-                item.search_text
+                item
                 for item in inherited_headers
                 if item.column <= cell.column and cell.column + cell.columns <= item.column + item.columns
             ]
@@ -88,18 +117,42 @@ def table_parts(cells, inherited_headers=(), *, infer_first_row=False):
         if inferred_column:
             columns = [inferred_column]
             uncertain = True
-        if not row_headers and cell.column > 0 and cell.row in row_values:
+        index = bisect_right(transition_rows, cell.row)
+        transition = transition_rows[index - 1] if index else None
+        if transition is not None:
+            columns = [c for c in columns if c.columns > 1]
+            if cell.row > transition and cell.column in transitions[transition]:
+                columns.append(transitions[transition][cell.column])
+            uncertain = True
+        if (not row_headers and cell.column > 0 and cell.row in row_values
+                and transition is None and (len(row_values[cell.row].search_text) <= 60
+                                            or not any(c.columns > 1 for c in local_columns))):
             # Keep the literal first value from this source row alongside later values.
             row_headers = [row_values[cell.row]]
+            uncertain = True
         if not columns:
+            uncertain = True
+        relation_items = []
+        for kind, items in (("row", row_headers), ("column", columns)):
+            for source in items:
+                inherited = any(source is item for item in inherited_headers)
+                inferred = (not source.header or inherited or (
+                    source.scope not in {"row", "rowgroup", "col", "colgroup"}
+                    and not (kind == 'column' and simple_header and source in local_columns)))
+                relation_items.append({"kind": kind, "text": source.search_text, "row": source.row + 1,
+                                       "column": source.column + 1, "inherited": inherited,
+                                       "origin": "inferred" if inferred else "parser",
+                                       "status": "unverified" if inferred else "explicit"})
+        if any(item['status'] == 'unverified' for item in relation_items):
             uncertain = True
         output.append(
             {
-                "label": " / ".join(dict.fromkeys(row_headers + columns)),
+                "label": " / ".join(dict.fromkeys(item["text"] for item in relation_items)),
                 "text": cell.search_text,
                 "row": cell.row + 1,
                 "column": cell.column + 1,
-                "label_origin": "inferred" if inferred_column else "parser",
+                "label_origin": "inferred" if any(item['origin'] == 'inferred' for item in relation_items) else "parser",
+                "label_relations": relation_items,
             }
         )
     return output, uncertain
