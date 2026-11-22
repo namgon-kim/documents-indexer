@@ -34,3 +34,34 @@ def test_bm25_indexes_and_replaces_document(tmp_path):
     index.replace_document("doc", [{"chunk_id": "b", "text": "산학협력"}])
     assert index.search("교육혁신", 5) == []
     assert index.search("산학협력", 5)[0].chunk_id == "b"
+
+
+@pytest.mark.parametrize("method", ["dense", "bm25", "hybrid"])
+def test_independent_candidate_and_rerank_limits(method):
+    class Backend:
+        def __init__(self):
+            self.limits = []
+
+        def search(self, query, limit, document_id=None):
+            self.limits.append(limit)
+            return [SearchHit(str(i), 1.0) for i in range(limit)]
+
+    class Ranker:
+        def __init__(self):
+            self.calls = []
+
+        def rerank(self, query, candidates, limit):
+            self.calls.append((len(candidates), limit))
+            return candidates[:limit]
+
+    dense, sparse, ranker = Backend(), Backend(), Ranker()
+    counts = {}
+    result = SearchService(dense, sparse, ranker).search(
+        "query", method, 20, rerank=True, retrieval_top_n=50, rerank_top_n=10, counts=counts)
+    assert len(result) == 10 and ranker.calls == [(50, 10)]
+    assert all(limit == 50 for limit in dense.limits + sparse.limits)
+    assert counts["retrieved_count"] == counts["rerank_input_count"] == 50
+    assert counts["reranked_count"] == 10
+    result = SearchService(dense, sparse, ranker).search(
+        "query", method, 12, rerank=False, retrieval_top_n=37, rerank_top_n=12)
+    assert len(result) == 12 and len(ranker.calls) == 1

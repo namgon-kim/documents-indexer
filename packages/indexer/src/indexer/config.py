@@ -3,6 +3,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from indexer.search_engine import DEFAULT_RERANK_TOP_N, DEFAULT_RETRIEVAL_TOP_N
+
 
 def flag(key: str) -> bool:
     return os.getenv(key, "").lower() in {"1", "true", "yes"}
@@ -40,6 +42,8 @@ class Config:
     embedding_dimensions: int = 1024
     embedding_max_input_bytes: int = 3800
     embedding_batch_size: int = 24
+    retrieval_top_n: int = DEFAULT_RETRIEVAL_TOP_N
+    rerank_top_n: int = DEFAULT_RERANK_TOP_N
     reranker_provider: str = "disabled"
     reranker_base_url: str = "https://api.cohere.com/v2"
     reranker_api_key: str = ""
@@ -93,6 +97,8 @@ class Config:
             embedding_dimensions=int(os.getenv("EMBEDDING_DIMENSIONS", "1024")),
             embedding_max_input_bytes=int(os.getenv("EMBEDDING_MAX_INPUT_BYTES", "3800")),
             embedding_batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "24")),
+            retrieval_top_n=int(os.getenv("RETRIEVAL_TOP_N", str(DEFAULT_RETRIEVAL_TOP_N))),
+            rerank_top_n=int(os.getenv("RERANK_TOP_N", str(DEFAULT_RERANK_TOP_N))),
             reranker_provider=os.getenv("RERANKER_PROVIDER", "disabled"),
             reranker_base_url=os.getenv("RERANKER_BASE_URL", "https://api.cohere.com/v2"),
             reranker_api_key=os.getenv("RERANKER_API_KEY", ""),

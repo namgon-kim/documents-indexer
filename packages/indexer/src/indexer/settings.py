@@ -15,6 +15,7 @@ from indexer.config import Config, qdrant_http_url
 from indexer.contracts import ProcessingSettings
 from indexer.parsing.registry import provider_names
 from indexer.parsing.settings import parse_options
+from indexer.search_engine import MAX_RETRIEVAL_TOP_N
 
 RERANKER_PROVIDERS = ("disabled", "cohere")
 
@@ -37,6 +38,8 @@ class ServerSettings(BaseModel):
     embedding_dimensions: int = Field(ge=1, le=65536)
     embedding_max_input_bytes: int = Field(ge=256, le=1000000)
     embedding_batch_size: int = Field(ge=1, le=512)
+    retrieval_top_n: int = Field(ge=1, le=MAX_RETRIEVAL_TOP_N)
+    rerank_top_n: int = Field(ge=1, le=MAX_RETRIEVAL_TOP_N)
     reranker_provider: str
     reranker_base_url: str
     reranker_api_key: str = Field(max_length=4096)
@@ -98,6 +101,13 @@ class ServerSettings(BaseModel):
     def validate_parser_provider(cls, value):
         if value and value not in provider_names():
             raise ValueError("등록된 파서 제공자를 선택해 주세요")
+        return value
+
+    @field_validator("rerank_top_n")
+    @classmethod
+    def validate_rerank_top_n(cls, value, info):
+        if "retrieval_top_n" in info.data and value > info.data["retrieval_top_n"]:
+            raise ValueError("리랭킹 결과 수는 검색 후보 수 이하여야 합니다.")
         return value
 
     @field_validator("reranker_provider")

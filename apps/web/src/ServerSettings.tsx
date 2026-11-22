@@ -37,6 +37,8 @@ const groups: Group[] = [
     ["qdrant_url", "Qdrant 주소 (스킴 생략 시 HTTP, 비우면 로컬)", "text"], ["qdrant_key", "Qdrant API 키", "secret"],
   ] },
   { id: "rerank", title: "검색 재순위", description: "검색 후보의 순서를 다시 매깁니다. 사용하면 검색과 대화 화면에서 '재순위 적용'을 선택할 수 있습니다.", fields: [
+    ["retrieval_top_n", "검색 후보 수 (Top-N)", "number", "1~100개, 검색 방식별 후보 상한"],
+    ["rerank_top_n", "리랭킹 결과 수 (Top-N)", "number", "검색 후보 수 이하. 재순위를 켰을 때 적용"],
     ["reranker_provider", "재순위 제공자", "select"],
     ["reranker_base_url", "재순위 API 주소", "text"], ["reranker_api_key", "재순위 API 키", "secret"],
     ["reranker_model", "재순위 모델", "text"],
@@ -199,7 +201,7 @@ export function ServerSettings({session, chatOptions, chatModel, reasoningEffort
             <button type="button" className="text-button" disabled={disabled} onClick={() => { setSecrets(current => ({...current, [key]: ""})); change(key, ""); }}>비우기</button></div>
           : kind === "origins" ? <input id={"setting-" + key} key={(draft[key] as string[]).join(" ")} defaultValue={(draft[key] as string[]).join(" ")}
               onBlur={event => change(key, event.target.value.split(/\s+/).filter(Boolean))}/>
-          : <input id={"setting-" + key} disabled={disabled} type={kind === "number" || kind === "nullable-number" ? "number" : "text"} value={String(draft[key] ?? "")}
+          : <input id={"setting-" + key} disabled={disabled} min={["retrieval_top_n", "rerank_top_n"].includes(key) ? 1 : undefined} max={["retrieval_top_n", "rerank_top_n"].includes(key) ? 100 : undefined} step={kind === "number" ? 1 : undefined} type={kind === "number" || kind === "nullable-number" ? "number" : "text"} value={String(draft[key] ?? "")}
             onChange={event => change(key, kind === "nullable-number" ? (event.target.value === "" ? null : Number(event.target.value)) : kind === "number" ? (event.target.value === "" ? "" : Number(event.target.value)) : event.target.value)}/>}
         <button type="button" className="text-button" onClick={() => restore(key)}>환경 기본값</button>
       </div>; })}

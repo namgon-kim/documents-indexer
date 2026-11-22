@@ -6,7 +6,53 @@ from langchain_core.runnables import RunnableLambda
 
 from indexer.contracts import IndexerError, SearchRequest
 from indexer.embedding_input import byte_size, embedding_text
+from indexer.search_engine import MAX_RESULT_LIMIT
 from indexer.xlsx_query import NUMERIC, QueryPlan
+
+CHAT_EVIDENCE_BYTES = 32 * 1024
+CHAT_SOURCE_BYTES = 4096
+CHAT_CONTEXT_BYTES = 1536
+
+
+def _clip(text, size):
+    return text.encode("utf-8")[:size].decode("utf-8", "ignore")
+
+
+def _chat_evidence(hits, limit):
+    sources, context = [], []
+    # Leave room for list punctuation and a possible change from true to false on completeness flags.
+    remaining = CHAT_EVIDENCE_BYTES - 2 * MAX_RESULT_LIMIT - 2
+    clipped = False
+    for hit in hits[:limit]:
+        evidence = _clip(hit["search_text"], CHAT_SOURCE_BYTES)
+        extra = hit.get("context_text") or ""
+        excerpt = _clip(extra, CHAT_CONTEXT_BYTES) if extra != hit["search_text"] else ""
+        was_clipped = evidence != hit["search_text"] or (extra != hit["search_text"] and excerpt != extra)
+        refs = hit["source_refs"]
+        item = {"id": len(sources) + 1, "filename": hit["filename"],
+                "evidence_pages": sorted({ref["page"] for ref in refs if ref.get("page") is not None and ref.get("role", "evidence") == "evidence"}),
+                "context_pages": sorted({ref["page"] for ref in refs if ref.get("page") is not None and ref.get("role") == "context"}),
+                "text": evidence, "context": excerpt,
+                "이미지_관계": hit.get("visual_relation"),
+                "표의_분할내용_모두_포함": hit.get("table_expansion_complete"),
+                "XLSX_출처": [ref for ref in refs if ref.get("kind") in {"xlsx_cell", "xlsx_range"}][:8],
+                "XLSX_행_연결_후보": hit.get("xlsx_row_relations", [])[:10],
+                "XLSX_전체_표_조회": False if hit.get("xlsx_sheet") else None}
+        size = byte_size(json.dumps(item, ensure_ascii=False))
+        if size > remaining:
+            break
+        remaining -= size
+        context.append(item)
+        sources.append({**hit, "search_text": evidence, **({"evidence_truncated": True} if was_clipped else {})})
+        clipped |= was_clipped
+    limited = clipped or len(sources) < len(hits)
+    if limited:
+        for hit, item in zip(sources, context, strict=True):
+            if hit.get("table_expansion_complete"):
+                hit["table_expansion_complete"] = item["표의_분할내용_모두_포함"] = False
+    counts = {"evidence_count": len(sources), "evidence_limited": limited,
+              "evidence_bytes": byte_size(json.dumps(context, ensure_ascii=False))}
+    return sources, context, counts
 
 
 class RagChat:
@@ -147,19 +193,13 @@ class RagChat:
 
     def answer(self, inputs):
         request, result = inputs
-        sources = result["results"]
+        sources, context, counts = _chat_evidence(result["results"], request.top_k or MAX_RESULT_LIMIT)
+        diagnostics = {**result.get("search_counts", {}), **counts}
         if not sources:
-            return {"answer": "질문하신 정보를 찾을 수 없습니다.", "sources": [],
-                    "index_version": result["index_version"]}
-        context = [{"id": index, "filename": hit["filename"],
-                    "evidence_pages": sorted({ref["page"] for ref in hit["source_refs"] if ref.get("page") is not None and ref.get("role", "evidence") == "evidence"}),
-                    "context_pages": sorted({ref["page"] for ref in hit["source_refs"] if ref.get("page") is not None and ref.get("role") == "context"}),
-                    "text": hit["search_text"], "context": hit.get("context_text") or "",
-                    "이미지_관계": hit.get('visual_relation'),
-                    "표의_분할내용_모두_포함": hit.get("table_expansion_complete"),
-                    "XLSX_출처": [ref for ref in hit["source_refs"] if ref.get("kind") in {"xlsx_cell", "xlsx_range"}],
-                    "XLSX_행_연결_후보": hit.get("xlsx_row_relations", [])[:10],
-                    "XLSX_전체_표_조회": False if hit.get("xlsx_sheet") else None} for index, hit in enumerate(sources, 1)]
+            answer = ("검색 결과가 답변 근거 크기 한도를 초과했습니다." if result["results"]
+                      else "질문하신 정보를 찾을 수 없습니다.")
+            return {"answer": answer, "sources": [], "index_version": result["index_version"],
+                    "search_counts": diagnostics}
         messages = []
         for item in request.history:
             content = item.content
@@ -206,4 +246,5 @@ class RagChat:
             raise IndexerError("LLM_UNAVAILABLE", "답변 생성에 실패했습니다. 모델 연결 설정을 확인해 주세요.", 503) from error
         answer = content
         answer = re.sub(r"\[(\d+)\]", lambda match: match.group(0) if 1 <= int(match.group(1)) <= len(sources) else "[근거 확인 불가]", answer)
-        return {"answer": answer, "sources": sources, "index_version": result["index_version"]}
+        return {"answer": answer, "sources": sources, "index_version": result["index_version"],
+                "search_counts": diagnostics}

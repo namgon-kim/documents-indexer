@@ -32,6 +32,7 @@ from indexer.parsing.settings import parse_options
 from indexer.parsing.xlsx_analysis import StructureAnalyzer
 from indexer.published_retrieval import PublishedRetrieval
 from indexer.reranker import CohereReranker
+from indexer.search_engine import MAX_RESULT_LIMIT, MAX_RETRIEVAL_TOP_N
 from indexer.settings import (
     ServerSettings,
     apply_overrides,
@@ -64,7 +65,7 @@ class SettingsUpdate(BaseModel):
 class IngestionSearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
     method: Literal["bm25", "dense", "hybrid"] = "hybrid"
-    limit: int = Field(default=5, ge=1, le=20)
+    limit: int = Field(default=5, ge=1, le=MAX_RESULT_LIMIT, strict=True)
     document_id: UUID | None = None
     rerank: bool = False
     index_version: UUID | None = None
@@ -123,6 +124,9 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
     processing_defaults = {"target_chars": config.default_target_chars, "overlap_chars": config.default_overlap_chars,
                            "ocr_policy": config.default_ocr_policy, "dpi": config.default_dpi, "extraction_mode": "parser"}
 
+    def search_ranking(candidate):
+        return {"retrieval_top_n": candidate.retrieval_top_n, "rerank_top_n": candidate.rerank_top_n}
+
     def install_pipeline(app, candidate, *, recover=False):
         http = app.state.http
         def recreate_parser(snapshot):
@@ -158,7 +162,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         profiles = EmbeddingProfiles(candidate.data_dir, publisher, http)
         profiles.list()
         service.embedding_profiles = profiles
-        retrieval = PublishedRetrieval(publisher, service.storage)
+        retrieval = PublishedRetrieval(publisher, service.storage, ranking=search_ranking(candidate))
         if recover:
             service.recover()
         return service, publisher, profiles, retrieval
@@ -340,6 +344,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             "external_processing": config.external_processing,
             "search_methods": ["bm25", "dense", "hybrid"] if config.external_processing else ["bm25"],
             "rerank_available": rerank_available(request),
+            "search_ranking": {**search_ranking(config), "max_result_limit": MAX_RESULT_LIMIT},
             "profiles": [{"profile_id": config.embedding_profile, "name": config.embedding_document_model, "dimensions": config.embedding_dimensions}],
             "defaults": ProcessingSettings.model_validate(defaults).model_dump(),
             "chunk_profile_defaults": {**CHUNK_DEFAULTS, "general": {key: defaults[key] for key in ("target_chars", "overlap_chars")}},
@@ -671,7 +676,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                 manifest = selected.get_version(str(version))
                 if not manifest or manifest["embedding_profile"]["profile_id"] != selected.embedder.profile.profile_id:
                     raise ValueError("선택한 검색 버전과 임베딩 모델이 일치하지 않습니다")
-            return PublishedRetrieval(selected, service.storage)
+            return PublishedRetrieval(selected, service.storage, ranking=search_ranking(config))
         except ValidationError as error:
             raise IndexerError("SEARCH_UNAVAILABLE", "저장된 임베딩 모델 설정을 확인해 주세요.", 409) from error
         except ValueError as error:
@@ -941,7 +946,7 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             active = values(config) | {"llm_model": request.app.state.chat.config.llm_model,
                                        "llm_models": list(request.app.state.chat.config.llm_models)}
         return {"values": public_settings(saved), "defaults": public_settings(values(base_config)),
-                "choices": choices(), "restart_required": saved != active}
+                "choices": choices(), "max_retrieval_top_n": MAX_RETRIEVAL_TOP_N, "restart_required": saved != active}
 
     @app.put("/v1/settings", dependencies=[Depends(auth.require_settings)])
     def put_settings(body: SettingsUpdate, request: Request):
@@ -990,7 +995,14 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
                 if hasattr(request.app.state, "published_chat"):
                     request.app.state.published_chat.config = candidate
                 wake.set()
-        except (ValueError, ValidationError, TypeError) as error:
+        except ValidationError as error:
+            for violation in error.errors():
+                if violation["loc"] == ("retrieval_top_n",):
+                    raise IndexerError("INVALID_SETTINGS", f"검색 후보 수는 1~{MAX_RETRIEVAL_TOP_N} 사이의 정수여야 합니다.") from error
+                if violation["loc"] == ("rerank_top_n",):
+                    raise IndexerError("INVALID_SETTINGS", "리랭킹 결과 수는 1 이상의 정수이며 검색 후보 수 이하여야 합니다.") from error
+            raise IndexerError("INVALID_SETTINGS", "설정 값을 확인해 주세요.", 422) from error
+        except (ValueError, TypeError) as error:
             raise IndexerError("INVALID_SETTINGS", "설정 값을 확인해 주세요.", 422) from error
         return {"values": public_settings(saved), "restart_required": False}
 

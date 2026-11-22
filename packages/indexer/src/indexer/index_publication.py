@@ -17,7 +17,12 @@ from indexer.dense_index import DenseIndex
 from indexer.embedding_adaptation import embed_chunks
 from indexer.embedding_cache import EmbeddingCache
 from indexer.embedding_input import PREPROCESSING_VERSION
-from indexer.search_engine import SearchService
+from indexer.search_engine import (
+    DEFAULT_RERANK_TOP_N,
+    DEFAULT_RETRIEVAL_TOP_N,
+    MAX_RETRIEVAL_TOP_N,
+    SearchService,
+)
 
 
 def _office_source(chunks):
@@ -41,7 +46,13 @@ class AllowedChunks:
         self.retriever, self.allowed = retriever, allowed
 
     def search(self, query, limit, document_id=None):
-        return [hit for hit in self.retriever.search(query, 100, document_id) if hit.chunk_id in self.allowed][:limit]
+        hits = self.retriever.search(query, limit, document_id)
+        allowed = [hit for hit in hits if hit.chunk_id in self.allowed]
+        if len(allowed) < limit <= len(hits) and limit < MAX_RETRIEVAL_TOP_N:
+            # Deleted or stale entries can temporarily occupy the top ranks during cleanup.
+            hits = self.retriever.search(query, MAX_RETRIEVAL_TOP_N, document_id)
+            allowed = [hit for hit in hits if hit.chunk_id in self.allowed]
+        return allowed[:limit]
 
 
 class IndexPublisher:
@@ -204,11 +215,12 @@ class IndexPublisher:
             raise
 
     def search(self, query: str, method: str, limit: int = 5, document_id: str | None = None,
-               rerank: bool = False, version: str | None = None):
+               rerank: bool = False, version: str | None = None, *,
+               retrieval_top_n: int = DEFAULT_RETRIEVAL_TOP_N, rerank_top_n: int = DEFAULT_RERANK_TOP_N):
         with self.search_lock:
-            return self._search(query, method, limit, document_id, rerank, version)
+            return self._search(query, method, limit, document_id, rerank, version, retrieval_top_n, rerank_top_n)
 
-    def _search(self, query, method, limit, document_id, rerank, version):
+    def _search(self, query, method, limit, document_id, rerank, version, retrieval_top_n, rerank_top_n):
         manifest = self.get_version(version)
         if not manifest:
             raise ValueError("검색 가능한 색인이 없습니다")
@@ -221,9 +233,11 @@ class IndexPublisher:
         reranker = self.reranker_factory(lambda chunk_id: by_id[chunk_id]["text"]) if self.reranker_factory else None
         service = SearchService(AllowedChunks(DenseIndex(self.qdrant, manifest["collection"], self.embedder), by_id),
                                 AllowedChunks(BM25Index(folder / "bm25.sqlite3"), by_id), reranker)
-        hits = service.search(query, method, limit, document_id, rerank)
+        counts = {}
+        hits = service.search(query, method, limit, document_id, rerank,
+                              retrieval_top_n=retrieval_top_n, rerank_top_n=rerank_top_n, counts=counts)
         return {"index_version": manifest["version"], "method": method,
-                "reranked": rerank,
+                "reranked": rerank, "search_counts": counts,
                 "results": [{**by_id[hit.chunk_id], "score": hit.score} for hit in hits]}
 
     def delete_document(self, document_id: str):

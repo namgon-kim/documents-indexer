@@ -23,11 +23,14 @@ class CohereReranker:
                                           "documents": [self.load_text(hit.chunk_id) for hit in candidates],
                                           "top_n": min(limit, len(candidates))}, timeout=90)
         response.raise_for_status()
-        results = response.json().get("results")
+        payload = response.json()
+        results = payload.get("results") if isinstance(payload, dict) else None
         if not isinstance(results, list) or len(results) > min(limit, len(candidates)):
             raise ValueError("reranker 응답이 유효하지 않습니다")
         seen, hits = set(), []
         for item in results:
+            if not isinstance(item, dict):
+                raise TypeError("reranker 응답 항목이 유효하지 않습니다")
             index, score = item.get("index"), item.get("relevance_score")
             if type(index) is not int or not 0 <= index < len(candidates) or index in seen or type(score) not in (int, float) or not math.isfinite(score):
                 raise ValueError("reranker 응답 항목이 유효하지 않습니다")

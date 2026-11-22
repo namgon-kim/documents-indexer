@@ -3,6 +3,11 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+MAX_RETRIEVAL_TOP_N = 100
+MAX_RESULT_LIMIT = 20
+DEFAULT_RETRIEVAL_TOP_N = 25
+DEFAULT_RERANK_TOP_N = 5
+
 
 @dataclass(frozen=True)
 class SearchHit:
@@ -40,26 +45,46 @@ class SearchService:
         self.reranker = reranker
 
     def search(self, query: str, method: str, limit: int = 5, document_id: str | None = None,
-               rerank: bool = False) -> list[SearchHit]:
+               rerank: bool = False, *, retrieval_top_n: int = DEFAULT_RETRIEVAL_TOP_N,
+               rerank_top_n: int = DEFAULT_RERANK_TOP_N, counts: dict | None = None) -> list[SearchHit]:
         query = query.strip()
-        if not query or not 1 <= limit <= 100:
+        if not query or type(limit) is not int or not 1 <= limit <= MAX_RETRIEVAL_TOP_N:
             raise ValueError("검색어 또는 결과 수를 확인해 주세요")
+        if type(retrieval_top_n) is not int or not 1 <= retrieval_top_n <= MAX_RETRIEVAL_TOP_N:
+            raise ValueError("검색 후보 수를 확인해 주세요")
+        if type(rerank_top_n) is not int or not 1 <= rerank_top_n <= retrieval_top_n:
+            raise ValueError("리랭킹 결과 수는 검색 후보 수 이하여야 합니다")
         if method not in {"dense", "bm25", "hybrid"}:
             raise ValueError("지원하지 않는 검색 방식입니다")
         if rerank and self.reranker is None:
             raise ValueError("reranker가 설정되지 않았습니다")
-        candidates = min(limit * 5, 100)
+
         if method == "hybrid":
-            dense = self.dense.search(query, candidates, document_id)
-            sparse = self.bm25.search(query, candidates, document_id)
-            hits = reciprocal_rank_fusion([dense, sparse], candidates)
+            dense = self.dense.search(query, retrieval_top_n, document_id)
+            sparse = self.bm25.search(query, retrieval_top_n, document_id)
+            hits = reciprocal_rank_fusion([dense[:retrieval_top_n], sparse[:retrieval_top_n]], retrieval_top_n)
         else:
             retriever = self.dense if method == "dense" else self.bm25
-            hits = retriever.search(query, candidates, document_id)
-        if rerank:
-            result = self.reranker.rerank(query, hits, limit)
+            candidates = retriever.search(query, retrieval_top_n, document_id)
+            unique = {}
+            for hit in candidates[:retrieval_top_n]:
+                unique.setdefault(hit.chunk_id, hit)
+            hits = list(unique.values())
+        retrieved_count = len(hits)
+        rerank_input_count = retrieved_count if rerank else 0
+        reranked_count = 0
+        if rerank and hits:
+            take = min(rerank_top_n, retrieved_count)
+            result = self.reranker.rerank(query, hits, take)
             original = {hit.chunk_id for hit in hits}
-            if len(result) > limit or len({hit.chunk_id for hit in result}) != len(result) or any(hit.chunk_id not in original for hit in result):
+            if len(result) > take or len({hit.chunk_id for hit in result}) != len(result) or any(hit.chunk_id not in original for hit in result):
                 raise ValueError("reranker 응답에 유효하지 않은 후보가 있습니다")
-            return result
-        return hits[:limit]
+            hits = result
+            reranked_count = len(hits)
+
+        result_limit = min(limit, rerank_top_n if rerank else retrieval_top_n)
+        if counts is not None:
+            counts.update(retrieval_top_n=retrieval_top_n, rerank_top_n=rerank_top_n if rerank else None,
+                          result_limit=result_limit, retrieved_count=retrieved_count,
+                          rerank_input_count=rerank_input_count, reranked_count=reranked_count)
+        return hits[:result_limit]
