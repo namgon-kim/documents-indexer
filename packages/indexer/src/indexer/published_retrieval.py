@@ -27,6 +27,19 @@ class PublishedRetrieval:
         self.publisher, self.storage = publisher, storage
         self.ranking = ranking or {}
 
+    def _ranking_for_document(self, document_id):
+        """Use a wider fixed candidate pool only for an explicitly scoped XLSX."""
+        if document_id is None:
+            return self.ranking
+        try:
+            metadata = self.storage.load_document(str(document_id))
+        except (OSError, ValueError):
+            # Let the existing published-search path handle missing documents.
+            return self.ranking
+        if isinstance(metadata, dict) and metadata.get('format') == 'xlsx':
+            return {**self.ranking, 'retrieval_top_n': 50, 'rerank_top_n': 10}
+        return self.ranking
+
     @contextmanager
     def _xlsx_snapshot(self, document_id, version):
         with ExitStack() as stack:
@@ -335,7 +348,7 @@ class PublishedRetrieval:
                 request.query, request.method, request.top_k or MAX_RESULT_LIMIT,
                 str(request.document_id) if request.document_id else None,
                 request.rerank, str(request.index_version) if request.index_version else None,
-                **self.ranking)
+                **self._ranking_for_document(request.document_id))
             documents = {}
             elements_by_job = {}
             xlsx_relations_by_job = {}
