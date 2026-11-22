@@ -65,3 +65,32 @@ def test_independent_candidate_and_rerank_limits(method):
     result = SearchService(dense, sparse, ranker).search(
         "query", method, 12, rerank=False, retrieval_top_n=37, rerank_top_n=12)
     assert len(result) == 12 and len(ranker.calls) == 1
+
+
+def test_hybrid_rerank_receives_fused_lexical_candidate_without_extra_calls(tmp_path):
+    index = BM25Index(tmp_path / 'hybrid.sqlite')
+    index.replace_document('d', [{'chunk_id': f'noise-{i}', 'text': 'AI 일반 자료'} for i in range(8)] +
+                           [{'chunk_id': 'target', 'text': '학습지원시스템을 구축합니다'}])
+
+    class Dense:
+        def __init__(self):
+            self.calls = []
+        def search(self, query, limit, document_id=None):
+            self.calls.append((limit, document_id))
+            return []
+
+    class Ranker:
+        def __init__(self):
+            self.calls = []
+        def rerank(self, query, candidates, limit):
+            self.calls.append(([hit.chunk_id for hit in candidates], limit))
+            return candidates[:limit]
+
+    dense, ranker, counts = Dense(), Ranker(), {}
+    result = SearchService(dense, index, ranker).search(
+        'AI 학습지원시스템', 'hybrid', limit=3, document_id='d', rerank=True,
+        retrieval_top_n=5, rerank_top_n=3, counts=counts)
+    assert dense.calls == [(5, 'd')]
+    assert len(ranker.calls) == 1 and ranker.calls[0][1] == 3
+    assert 'target' in ranker.calls[0][0] and 'target' in [hit.chunk_id for hit in result]
+    assert counts['retrieved_count'] == counts['rerank_input_count'] == 5
