@@ -1,6 +1,7 @@
 import json
 import stat
 
+import pytest
 from fastapi.testclient import TestClient
 from indexer.config import Config
 from indexer.settings import apply_overrides
@@ -214,3 +215,15 @@ def test_can_enable_parser_without_restart(tmp_path):
         result = client.put("/v1/settings", json={"values": {"parser_provider": "upstage"}})
         assert result.status_code == 200, result.text
         assert client.get("/v1/processing-options").json()["ingestion_enabled"]
+
+
+def test_rerank_limit_and_evidence_budget_validation(tmp_path):
+    from indexer.settings import ServerSettings, values
+    from pydantic import ValidationError
+
+    defaults = values(Config(tmp_path))
+    assert ServerSettings.model_validate({**defaults, "retrieval_top_n": 50, "rerank_top_n": 20}).rerank_top_n == 20
+    with pytest.raises(ValidationError):
+        ServerSettings.model_validate({**defaults, "retrieval_top_n": 50, "rerank_top_n": 30})
+    with pytest.raises(ValidationError):
+        ServerSettings.model_validate({**defaults, "chat_evidence_bytes": 4095})

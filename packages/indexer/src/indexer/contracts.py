@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from indexer.search_engine import MAX_RESULT_LIMIT
+
 
 class IndexerError(Exception):
     def __init__(self, code: str, message: str, status: int = 422, *, retryable: bool = False):
@@ -42,7 +44,7 @@ class SearchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     query: str = Field(min_length=1, max_length=2000)
     profile_id: str | None = Field(default=None, min_length=1, max_length=64)
-    top_k: int = Field(default=5, ge=1, le=20)
+    top_k: int | None = Field(default=None, ge=1, le=MAX_RESULT_LIMIT, strict=True)
     document_id: UUID | None = None
     index_version: UUID | None = None
     method: Literal["bm25", "dense", "hybrid"] = "hybrid"
@@ -62,7 +64,7 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list, max_length=10)
     document_id: UUID | None = None
     index_version: UUID | None = None
-    top_k: int = Field(default=5, ge=1, le=20)
+    top_k: int | None = Field(default=None, ge=1, le=MAX_RESULT_LIMIT, strict=True)
     xlsx_full_table: bool = False
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = None
     model: str | None = Field(default=None, min_length=1, max_length=128)

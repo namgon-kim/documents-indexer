@@ -41,7 +41,7 @@ function App() {
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [query, setQuery] = useState("");
   const [xlsxFullTable, setXlsxFullTable] = useState(false);
-  const [resultLimit, setResultLimit] = useState(5);
+  const [resultLimit, setResultLimit] = useState("5");
   const [searchMethod, setSearchMethod] = useState<"hybrid" | "bm25" | "dense">("hybrid");
   const [rerank, setRerank] = useState(false);
   const [embeddingProfiles, setEmbeddingProfiles] = useState<EmbeddingProfile[]>([]);
@@ -203,11 +203,11 @@ function App() {
         ...(role === "assistant" && sources ? {citation_numbers: sources.map((_, index) => index + 1)} : {})})).slice(-10);
       setMessages(items => [...items, {role: "user", content: question}]);
       setQuery("");
-      const response = await api<{ answer: string; sources: Hit[]; index_version: string }>("/v1/ingest-chat", session, {
+      const response = await api<{ answer: string; sources: Hit[]; index_version: string; search_counts?: ChatMessage["search_counts"] }>("/v1/ingest-chat", session, {
         message: question, history: previous, ...(xlsxScope && xlsxFullTable ? {xlsx_full_table: true} : {}), ...(chatModel ? { model: chatModel } : {}), ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}), ...(scope ? { document_id: scope } : {}), ...(version ? { index_version: version } : {}),
         ...(options?.ingestion_enabled ? {method: searchMethod, rerank: rerank && Boolean(options.rerank_available), profile_id: embeddingProfile} : {}),
       });
-      setMessages(items => [...items, {role: "assistant", content: response.answer, sources: response.sources, index_version: response.index_version}]);
+      setMessages(items => [...items, {role: "assistant", content: response.answer, sources: response.sources, index_version: response.index_version, search_counts: response.search_counts}]);
     } catch (reason) { setQuery(query); setMessages(items => items.slice(0, -1)); showError(reason); }
     finally { setSearching(false); }
   }
@@ -215,10 +215,14 @@ function App() {
   async function searchDocuments(event: FormEvent) {
     event.preventDefault();
     if (!session || !query.trim()) return;
+    if (!/^[0-9]+$/.test(resultLimit) || Number(resultLimit) < 1 || Number(resultLimit) > 20) {
+      setError("표시 결과 수는 1~20 사이의 정수로 입력해 주세요.");
+      return;
+    }
     setSearching(true); setError(""); setResults(undefined); setExpanded(undefined);
     try {
       const response = await api<{results: Hit[]; index_version: string}>("/v1/retrieve", session, {
-        query: query.trim(), ...(options?.ingestion_enabled ? {limit: resultLimit, method: searchMethod, rerank: rerank && Boolean(options.rerank_available), profile_id: embeddingProfile} : {top_k: resultLimit}), ...(scope ? {document_id: scope} : {}),
+        query: query.trim(), ...(options?.ingestion_enabled ? {limit: Number(resultLimit), method: searchMethod, rerank: rerank && Boolean(options.rerank_available), profile_id: embeddingProfile} : {top_k: Number(resultLimit)}), ...(scope ? {document_id: scope} : {}),
         ...(version ? {index_version: version} : {}),
       });
       setResults(response.results); setSearchedVersion(response.index_version);
@@ -298,9 +302,8 @@ function App() {
           {options?.ingestion_enabled && <label>임베딩 모델 <select value={embeddingProfile} disabled={!embeddingProfiles.length || searching} onChange={event => changeEmbeddingProfile(event.target.value)}>{embeddingProfiles.map(item => <option key={item.profile_id} value={item.profile_id}>{item.name}{item.enabled ? "" : " · 새 문서 사용 중지"}</option>)}</select></label>}
           {options?.ingestion_enabled && <label>검색 방식 <select value={searchMethod} onChange={event => setSearchMethod(event.target.value as typeof searchMethod)}><option value="hybrid" disabled={!options.search_methods?.includes("hybrid") || selectedVersion?.dense_available === false}>Hybrid</option><option value="dense" disabled={!options.search_methods?.includes("dense") || selectedVersion?.dense_available === false}>Dense</option><option value="bm25">BM25</option></select></label>}
           {options?.ingestion_enabled && <label title={options.rerank_available ? undefined : "설정에서 재순위 제공자를 연결하면 사용할 수 있습니다"}><input type="checkbox" checked={rerank && Boolean(options.rerank_available)} disabled={!options.rerank_available} onChange={event => setRerank(event.target.checked)}/> 재순위 적용</label>}
-          <label>결과 수 <select value={resultLimit} onChange={event => setResultLimit(Number(event.target.value))}>
-            {[5, 10, 20].map(count => <option key={count} value={count}>{count}개</option>)}
-          </select></label>
+          <label>표시 결과 수 <input type="number" min={1} max={20} step={1} value={resultLimit}
+            onChange={event => setResultLimit(event.target.value)}/><small>서버 후보 수와 리랭킹 결과 수 이내에서 표시합니다.</small></label>
           <label>검색 버전 <select value={version} onChange={event => setVersion(event.target.value)}>
             <option value="">현재 검색 버전</option>
             {versions.map(item => <option key={item.index_version} value={item.index_version}>{new Date(item.created_at).toLocaleString("ko-KR")} · {item.status === "active" ? "현재" : "이전"} · {item.index_version.slice(0, 8)}{item.dense_available === false ? " · BM25만 가능" : ""}</option>)}

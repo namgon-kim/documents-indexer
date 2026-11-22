@@ -105,3 +105,26 @@ def test_pageless_native_neighbors_expand_only_with_same_scope(tmp_path):
     second['source_scope'] = 'section:two'
     (version / 'chunks.json').write_text(json.dumps([first, second]))
     assert retrieval.search(SearchRequest(query='첫', method='bm25'))['results'][0]['context_after'] == ''
+
+
+def test_reranked_search_expands_related_image_with_configured_ranking(tmp_path):
+    folder = tmp_path / 'v'
+    folder.mkdir()
+    base = {'chunk_id': 'base', 'document_id': 'd', 'job_id': 'j', 'kind': 'text',
+            'element_ids': ['e1'], 'page': None, 'text': '본문'}
+    ocr = {**base, 'chunk_id': 'ocr', 'element_ids': ['e3'], 'text': '그림 글자'}
+    (folder / 'chunks.json').write_text(json.dumps([base, ocr]))
+    document = tmp_path / 'd'
+    document.mkdir()
+    (document / 'document.json').write_text(json.dumps({'filename': 'test.docx', 'format': 'docx'}))
+    elements = [{'element_id': 'e1', 'related_images': [{'element_id': 'e2', 'type': 'same_container',
+                 'origin': 'source', 'status': 'unverified'}]},
+                {'element_id': 'e2', 'asset_id': 'a', 'visual_id': 'image-0'},
+                {'element_id': 'e3', 'source_origin': 'visual_analysis', 'visual_id': 'image-0'}]
+    storage = SimpleNamespace(document_dir=lambda _: document, load_job=lambda *_: elements)
+    publisher = SimpleNamespace(root=tmp_path, search=lambda *args, **kwargs: {
+        'index_version': 'v', 'results': [base], 'search_counts': {'result_limit': 1}})
+    hits = PublishedRetrieval(publisher, storage, ranking={'retrieval_top_n': 50, 'rerank_top_n': 1}).search(
+        SearchRequest(query='본문', method='bm25', rerank=True))['results']
+    assert [hit['chunk_id'] for hit in hits] == ['base', 'ocr']
+    assert hits[1]['visual_relation']['status'] == 'unverified'

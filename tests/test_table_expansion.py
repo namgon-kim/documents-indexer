@@ -61,7 +61,33 @@ def test_expanded_table_fragments_are_independent_chat_evidence(tmp_path):
             assert [entry['text'] for entry in sent] == ['본문 one', '본문 two']
             return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {'choices': [
                 {'message': {'role': 'assistant', 'content': '내용 [2]'}, 'finish_reason': 'stop'}]})
-    chat = RagChat(SimpleNamespace(llm_model='m', llm_base_url='http://localhost', llm_api_key='x', remote_timeout=1),
+    chat = RagChat(SimpleNamespace(llm_model='m', llm_base_url='http://localhost', llm_api_key='x', remote_timeout=1, chat_evidence_bytes=32768),
                    None, Client())
     answer = chat.answer((ChatRequest(message='계획'), results))
     assert answer['answer'] == '내용 [2]' and len(answer['sources']) == 2
+
+
+def test_reranked_search_expands_table_with_configured_ranking(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from indexer.contracts import SearchRequest
+
+    chunks = [table(str(index), part=index) for index in range(3)]
+    for chunk in chunks:
+        chunk.update(page=1, heading_path=[], heading_element_ids=[], coordinates=None)
+    folder = tmp_path / 'v1'
+    folder.mkdir()
+    (folder / 'chunks.json').write_text(json.dumps(chunks), encoding='utf-8')
+    document = tmp_path / 'd1'
+    document.mkdir()
+    (document / 'document.json').write_text(json.dumps({'filename': 'source.pdf', 'format': 'pdf'}))
+    def search(*args, **kwargs):
+        assert kwargs == {'retrieval_top_n': 50, 'rerank_top_n': 1}
+        return {'index_version': 'v1', 'results': [chunks[0]], 'search_counts': {'result_limit': 1}}
+    publisher = SimpleNamespace(root=tmp_path, search=search)
+    storage = SimpleNamespace(document_dir=lambda _: document, load_job=lambda *args: [{'element_id': 'e1', 'page': 1}])
+    hits = PublishedRetrieval(publisher, storage, ranking={'retrieval_top_n': 50, 'rerank_top_n': 1}).search(
+        SearchRequest(query='표', method='bm25', rerank=True))['results']
+    assert [hit['chunk_id'] for hit in hits] == ['0', '1', '2']
+    assert all(hit['table_expansion_complete'] for hit in hits)

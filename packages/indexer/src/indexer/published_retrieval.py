@@ -8,6 +8,7 @@ from openpyxl.utils import get_column_letter
 from qdrant_client.http.exceptions import ApiException
 
 from indexer.contracts import IndexerError
+from indexer.search_engine import MAX_RESULT_LIMIT
 from indexer.table_evidence import HTML_CELL_RANGE, html_table_evidence_urls
 from indexer.visual_relations import xlsx_anchor_matches
 from indexer.xlsx_access import CANDIDATE_LIMIT, open_workbook
@@ -16,8 +17,9 @@ from indexer.xlsx_structure import confirmed
 
 
 class PublishedRetrieval:
-    def __init__(self, publisher, storage):
+    def __init__(self, publisher, storage, *, ranking=None):
         self.publisher, self.storage = publisher, storage
+        self.ranking = ranking or {}
 
     @contextmanager
     def _xlsx_snapshot(self, document_id, version):
@@ -80,7 +82,7 @@ class PublishedRetrieval:
                     'element_id': refs[0]['element_id'], 'source_ranges': refs}
 
     @staticmethod
-    def _expand_table(results, indexed):
+    def _expand_table(results, indexed, limit=None):
         """Add bounded evidence from the same exact table, never an inferred continuation."""
         output = [dict(item) for item in results]
         seen = {item['chunk_id'] for item in output}
@@ -112,6 +114,8 @@ class PublishedRetrieval:
         budget = 9000
         added = 0
         for item in candidates:
+            if limit is not None and len(output) >= limit:
+                break
             length = len(item.get('text', ''))
             if not length or length > budget:
                 continue
@@ -134,15 +138,17 @@ class PublishedRetrieval:
 
     def _search(self, request):
         try:
-            result = self.publisher.search(request.query, request.method, request.top_k,
+            result = self.publisher.search(request.query, request.method, request.top_k or MAX_RESULT_LIMIT,
                                            str(request.document_id) if request.document_id else None,
-                                           request.rerank, str(request.index_version) if request.index_version else None)
+                                           request.rerank, str(request.index_version) if request.index_version else None,
+                                           **self.ranking)
             documents = {}
             elements_by_job = {}
             xlsx_relations_by_job = {}
             hits = []
             chunk_path = self.publisher.root / result["index_version"] / "chunks.json"
             indexed = {item["chunk_id"]: item for item in json.loads(chunk_path.read_text(encoding="utf-8"))}
+            counts = result.get("search_counts")
             pending = self._expand_table(result["results"], indexed)
             seen_chunks = {item['chunk_id'] for item in pending}
             expanded_visual_count, expanded_visual_chars = 0, 0
@@ -293,6 +299,8 @@ class PublishedRetrieval:
                              "related_images": related_images,
                              **({"xlsx_row_relations": row_relations} if row_relations else {}),
                              "source_refs": refs, "evidence_urls": urls, "context_urls": context_urls})
+            if counts is not None:
+                result["search_counts"] = {**counts, "ranked_count": len(result["results"]), "returned_count": len(hits)}
             return {**result, "results": hits}
         except ApiException as error:
             raise IndexerError("VECTOR_DB_UNAVAILABLE", "벡터 데이터베이스 연결 또는 설정을 확인해 주세요.", 503) from error
