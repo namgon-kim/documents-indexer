@@ -3,7 +3,7 @@ import json
 import tempfile
 import threading
 import zipfile
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
@@ -14,6 +14,7 @@ from fastapi import Depends, FastAPI, File, Form, Query, Request, Response, Uplo
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from indexer import diagnostics
 from indexer.artifact_store import ArtifactStore
 from indexer.auth_store import AuthStore
 from indexer.chat import RagChat
@@ -47,7 +48,7 @@ from indexer.table_evidence import read_html_table_evidence
 from indexer.xlsx_access import open_workbook
 from indexer.xlsx_query import JoinPreview, PublishedTableQuery
 from indexer.xlsx_structure import STRUCTURE_VERSION, SheetProposal
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from qdrant_client import QdrantClient
 from starlette.concurrency import run_in_threadpool
 
@@ -71,6 +72,30 @@ class IngestionSearchRequest(BaseModel):
     rerank: bool = False
     index_version: UUID | None = None
     profile_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class DiagnosticProbe(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    document_id: UUID
+    page: int = Field(ge=1)
+    row: int | None = Field(default=None, ge=1)
+    column: int | None = Field(default=None, ge=1)
+    contains_line: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(default_factory=list, max_length=10)
+
+    @field_validator('contains_line')
+    @classmethod
+    def nonempty_terms(cls, terms):
+        if any(not term.strip() for term in terms):
+            raise ValueError('빈 검사 단어는 사용할 수 없습니다')
+        return terms
+
+
+class DiagnosticSearchRequest(IngestionSearchRequest):
+    probes: list[DiagnosticProbe] = Field(default_factory=list, max_length=20)
+
+
+class DiagnosticChatRequest(ChatRequest):
+    probes: list[DiagnosticProbe] = Field(default_factory=list, max_length=20)
 
 
 class ReprocessRequest(BaseModel):
@@ -945,6 +970,37 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
         retrieval = selected_retrieval(request, body.profile_id, body.index_version)
         chat = request.app.state.published_chat
         return RagChat(chat.config, retrieval, chat.client).invoke(body)
+
+    @app.post('/v1/diagnostics/retrieve', dependencies=[Depends(auth.require_settings)])
+    def diagnostic_retrieve(request: Request, body: DiagnosticSearchRequest):
+        with diagnostics.capture_trace() as trace:
+            trace['mode'] = 'search'
+            result = retrieve_new(request, IngestionSearchRequest.model_validate(body.model_dump(exclude={'probes'})))
+            publisher = selected_retrieval(request, body.profile_id, body.index_version).publisher
+            trace['probes'] = diagnostics.probe_results(body.probes, result, trace, publisher, chat=False)
+        return {'index_version': result['index_version'], 'trace': trace}
+
+    @app.post('/v1/diagnostics/chat', dependencies=[Depends(auth.require_settings)])
+    def diagnostic_chat(request: Request, body: DiagnosticChatRequest):
+        with diagnostics.capture_trace() as trace:
+            trace['mode'] = 'chat'
+            result = ingestion_chat(request, ChatRequest.model_validate(body.model_dump(exclude={'probes'})))
+            publisher = selected_retrieval(request, body.profile_id, body.index_version).publisher
+            trace['probes'] = diagnostics.probe_results(body.probes, result, trace, publisher, chat=True)
+        return {'index_version': result['index_version'], 'trace': trace}
+
+    @app.get('/v1/diagnostics/artifacts/{document_id}/{job_id}', dependencies=[Depends(auth.require_settings)])
+    def diagnostic_artifacts(request: Request, document_id: UUID, job_id: UUID,
+                             index_version: UUID, profile_id: str | None = None):
+        service = getattr(request.app.state, 'ingestion', None)
+        if service is None:
+            raise IndexerError('INDEX_NOT_READY', '검색 색인이 설정되지 않았습니다.', 503)
+        publisher = service.publisher_for(profile_id)
+        if publisher is None:
+            raise IndexerError('INDEX_NOT_READY', '검색 색인이 설정되지 않았습니다.', 503)
+        guard = getattr(publisher, 'search_lock', None)
+        with guard if guard is not None else nullcontext():
+            return diagnostics.artifact_summary(service.storage, publisher, str(document_id), str(job_id), str(index_version))
 
     @app.get("/v1/chat/options", dependencies=[Depends(auth.require)])
     def chat_options(request: Request):

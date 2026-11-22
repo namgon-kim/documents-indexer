@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+from indexer import diagnostics
+
 MAX_RETRIEVAL_TOP_N = 100
 MAX_RESULT_LIMIT = 20
 DEFAULT_RETRIEVAL_TOP_N = 25
@@ -62,18 +64,24 @@ class SearchService:
         if method == "hybrid":
             dense = self.dense.search(query, retrieval_top_n, document_id)
             sparse = self.bm25.search(query, retrieval_top_n, document_id)
+            diagnostics.ranking('dense', dense)
+            diagnostics.ranking('sparse', sparse)
             hits = reciprocal_rank_fusion([dense[:retrieval_top_n], sparse[:retrieval_top_n]], retrieval_top_n)
         else:
             retriever = self.dense if method == "dense" else self.bm25
             candidates = retriever.search(query, retrieval_top_n, document_id)
+            diagnostics.ranking(method, candidates)
             unique = {}
             for hit in candidates[:retrieval_top_n]:
                 unique.setdefault(hit.chunk_id, hit)
             hits = list(unique.values())
+        diagnostics.ranking('fused_candidates', hits)
         retrieved_count = len(hits)
         rerank_input_count = retrieved_count if rerank else 0
         reranked_count = 0
         if rerank and hits:
+            model = getattr(self.reranker, 'model', None)
+            diagnostics.record('reranker', {'model': model if isinstance(model, str) else None})
             take = min(rerank_top_n, retrieved_count)
             result = self.reranker.rerank(query, hits, take)
             original = {hit.chunk_id for hit in hits}
@@ -81,10 +89,12 @@ class SearchService:
                 raise ValueError("reranker 응답에 유효하지 않은 후보가 있습니다")
             hits = result
             reranked_count = len(hits)
+            diagnostics.ranking('reranked', hits)
 
         result_limit = min(limit, rerank_top_n if rerank else retrieval_top_n)
         if counts is not None:
             counts.update(retrieval_top_n=retrieval_top_n, rerank_top_n=rerank_top_n if rerank else None,
                           result_limit=result_limit, retrieved_count=retrieved_count,
                           rerank_input_count=rerank_input_count, reranked_count=reranked_count)
+        diagnostics.ranking('ranked_selected', hits[:result_limit])
         return hits[:result_limit]

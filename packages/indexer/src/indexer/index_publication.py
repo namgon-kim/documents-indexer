@@ -233,9 +233,15 @@ class IndexPublisher:
         reranker = self.reranker_factory(lambda chunk_id: by_id[chunk_id]["text"]) if self.reranker_factory else None
         service = SearchService(AllowedChunks(DenseIndex(self.qdrant, manifest["collection"], self.embedder), by_id),
                                 AllowedChunks(BM25Index(folder / "bm25.sqlite3"), by_id), reranker)
+        from indexer import diagnostics
+        diagnostics.record('index', {'index_version': manifest['version'], 'method': method,
+                                     'retrieval_top_n': retrieval_top_n, 'rerank_top_n': rerank_top_n if rerank else None,
+                                     'requested_limit': limit, 'rerank': rerank,
+                                     'embedding_profile_id': manifest.get('embedding_profile', {}).get('profile_id')})
         counts = {}
         hits = service.search(query, method, limit, document_id, rerank,
                               retrieval_top_n=retrieval_top_n, rerank_top_n=rerank_top_n, counts=counts)
+        diagnostics.filter_rankings(set(by_id))
         return {"index_version": manifest["version"], "method": method,
                 "reranked": rerank, "search_counts": counts,
                 "results": [{**by_id[hit.chunk_id], "score": hit.score} for hit in hits]}

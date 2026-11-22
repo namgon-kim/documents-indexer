@@ -10,6 +10,7 @@ import httpx
 from openpyxl.utils import get_column_letter
 from qdrant_client.http.exceptions import ApiException
 
+from indexer import diagnostics
 from indexer.bm25_index import BM25Index
 from indexer.contracts import IndexerError
 from indexer.parsing.normalization import cells_from, parse_table_html
@@ -158,6 +159,8 @@ class PublishedRetrieval:
 
                 lookup = {item['chunk_id']: item for item in pool}
                 ranker = self.publisher.reranker_factory(lambda key: lookup[key]['text'])
+                model = getattr(ranker, 'model', None)
+                diagnostics.record('reranker', {'model': model if isinstance(model, str) else None})
                 rerank_take = min(self.ranking.get('rerank_top_n', 5), len(pool))
                 try:
                     ordered = ranker.rerank(request.query, [SearchHit(item['chunk_id'], 1.0 / (i + 1))
@@ -184,6 +187,11 @@ class PublishedRetrieval:
                      'pages_with_chunks': present, 'pages_without_chunks': [p for p in pages if p not in present],
                      'selected_pages': sorted({item['page'] for item in selected}),
                      'all_page_chunks_selected': len(selected) == len(chunks)}
+            diagnostics.record('index', {'index_version': manifest['version'], 'method': 'pdf_page_bm25',
+                                         'requested_limit': result_limit, 'requested_pages': pages,
+                                         'retrieval_top_n': candidate_limit, 'rerank': request.rerank,
+                                         'embedding_profile_id': manifest.get('embedding_profile', {}).get('profile_id')})
+            diagnostics.chunks('page_candidates', pool)
             result = {'index_version': manifest['version'], 'method': 'pdf_page_bm25',
                       'reranked': request.rerank, 'page_scope': scope, 'results': selected,
                       'search_counts': {'retrieval_top_n': candidate_limit, 'result_limit': result_limit,
@@ -204,9 +212,11 @@ class PublishedRetrieval:
             return None
 
         anchors = {}
+        anchor_status = 'no_table_anchor' if output else 'no_search_results'
         for item in output:
             if key := group(item):
                 anchors.setdefault(key, (item, item['chunk_id']))
+                anchor_status = 'selected_table'
         if not anchors and output:
             hit = output[0]
             if hit.get('document_id') and hit.get('job_id') and hit.get('heading_element_ids') and hit.get('page') is not None:
@@ -215,7 +225,11 @@ class PublishedRetrieval:
                            and item.get('job_id') == hit.get('job_id') and item.get('page') == hit.get('page')
                            and item.get('heading_path') == hit.get('heading_path')
                            and item.get('heading_element_ids') == hit.get('heading_element_ids')]
-                if len({group(item) for item in matches}) == 1:
+                group_count = len({group(item) for item in matches})
+                if group_count > 1:
+                    anchor_status = 'ambiguous_table_context'
+                if group_count == 1:
+                    anchor_status = 'unique_heading_context'
                     matches.sort(key=lambda item: (item.get('part_number', 0), item['chunk_id']))
                     anchors[group(matches[0])] = (matches[0], hit['chunk_id'])
         grouped = defaultdict(list)
@@ -229,15 +243,20 @@ class PublishedRetrieval:
                                  key=lambda item: (abs(item.get('part_number', 0) - anchor.get('part_number', 0)),
                                                    item.get('part_number', 0), item['chunk_id'])))
         budget, added = 9000, 0
+        decisions = {} if diagnostics.active() else None
         # Share the existing global expansion budget across independently retrieved tables.
         while added < 3 and any(queues.values()) and (limit is None or len(output) < limit):
             for key, candidates in queues.items():
                 while candidates:
                     item = candidates.popleft()
                     if allowed_pages is not None and item.get('page') not in allowed_pages:
+                        if decisions is not None:
+                            decisions[item['chunk_id']] = 'outside_page_scope'
                         continue
                     length = len(item.get('text', ''))
                     if not length or length > budget:
+                        if decisions is not None:
+                            decisions[item['chunk_id']] = 'empty' if not length else 'character_budget'
                         continue
                     output.append({**item, 'expanded_from': anchors[key][1], 'expansion_reason': 'same_source_table'})
                     seen.add(item['chunk_id'])
@@ -250,6 +269,18 @@ class PublishedRetrieval:
             key = group(item)
             if key in anchors:
                 item['table_expansion_complete'] = all(candidate['chunk_id'] in seen for candidate in grouped[key])
+        if decisions is not None:
+            initial = {item['chunk_id'] for item in results}
+            candidates = [item for group_items in grouped.values() for item in group_items]
+            diagnostics.record('table_expansion_decisions', {
+                'anchor_status': anchor_status,
+                'anchor_chunk_ids': [anchor['chunk_id'] for anchor, _ in anchors.values()],
+                'candidate_count': len(candidates), 'truncated': len(candidates) > 1000,
+                'candidates': [{'chunk_id': item['chunk_id'], 'reason': (
+                    'already_selected' if item['chunk_id'] in initial else
+                    'added' if item['chunk_id'] in seen else
+                    decisions.get(item['chunk_id'], 'expansion_limit'))} for item in candidates[:1000]],
+                'candidate_rule': 'same_document_job_and_single_table_element'})
         return output
 
     @staticmethod
@@ -314,8 +345,11 @@ class PublishedRetrieval:
             counts = result.get("search_counts")
             scope = result.get('page_scope')
             allowed_pages = set(scope['requested_pages']) if scope else None
+            diagnostics.chunks("selected", result["results"])
             pending = self._expand_table(result["results"], indexed, allowed_pages=allowed_pages)
+            diagnostics.chunks("after_table_expansion", pending)
             pending = self._expand_text_elements(pending, indexed, allowed_pages=allowed_pages)
+            diagnostics.chunks("after_text_expansion", pending)
             seen_chunks = {item['chunk_id'] for item in pending}
             expanded_visual_count, expanded_visual_chars = 0, 0
             for chunk in pending:
@@ -506,6 +540,7 @@ class PublishedRetrieval:
                                        'all_indexed_chunks_returned': ids <= returned_chunks})
                 if scopes:
                     hit['element_scopes'] = scopes
+            diagnostics.chunks("retrieval_returned", hits)
             if counts is not None:
                 result["search_counts"] = {**counts, "ranked_count": len(result["results"]), "returned_count": len(hits)}
             if scope is not None:

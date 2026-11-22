@@ -4,6 +4,7 @@ import re
 import sqlite3
 from pathlib import Path
 
+from indexer import diagnostics
 from indexer.embedding_input import embedding_text
 from indexer.search_engine import SearchHit, reciprocal_rank_fusion
 
@@ -32,6 +33,7 @@ class BM25Index:
         query = embedding_text(query) if self.has_substrings else query
         terms = re.findall(r"[^\W_]+", query, flags=re.UNICODE)
         if not terms:
+            diagnostics.ranking('bm25_final', [])
             return []
         if self.has_substrings:
             terms = list(dict.fromkeys(terms))
@@ -47,16 +49,21 @@ class BM25Index:
 
         with sqlite3.connect(self.path) as db:
             exact = run(db, 'chunks', ' OR '.join('"' + term + '"' for term in terms))
+            diagnostics.ranking('bm25_unicode61', [hit for hit, _ in exact])
             # Preserve the historical index's tokenizer and raw score contract.
             if not self.has_substrings:
-                return [hit for hit, _ in exact]
+                result = [hit for hit, _ in exact]
+                diagnostics.ranking('bm25_final', result)
+                return result
             channels = [exact]
             long = [term for term in terms if len(term) >= 3]
             short = [term for term in terms if len(term) < 3]
             if long:
                 channels.append(run(db, 'substrings', ' OR '.join('"' + term + '"' for term in long)))
+                diagnostics.ranking('bm25_trigram', [hit for hit, _ in channels[-1]])
             if short:
                 channels.append(run(db, 'chunks', ' OR '.join('"' + term + '"*' for term in short)))
+                diagnostics.ranking('bm25_prefix', [hit for hit, _ in channels[-1]])
 
         # FTS scores from different tokenizers are not comparable. Fuse ranks,
         # then prioritize how much of the query is actually present in each
@@ -65,6 +72,7 @@ class BM25Index:
         # adding incomparable raw BM25 values. This is a ranking heuristic.
         texts = {hit.chunk_id: text for channel in channels for hit, text in channel}
         if not texts:
+            diagnostics.ranking('bm25_final', [])
             return []
         ranks = reciprocal_rank_fusion([[hit for hit, _ in channel] for channel in channels], len(texts))
         total = sum(len(term) for term in terms)
@@ -90,4 +98,6 @@ class BM25Index:
             covered = sum(len(terms[index]) for index in covered_terms[hit.chunk_id])
             score = covered / total + hit.score / 100
             scored.append(SearchHit(hit.chunk_id, score))
-        return sorted(scored, key=lambda hit: (-hit.score, hit.chunk_id))[:limit]
+        result = sorted(scored, key=lambda hit: (-hit.score, hit.chunk_id))[:limit]
+        diagnostics.ranking('bm25_final', result)
+        return result
