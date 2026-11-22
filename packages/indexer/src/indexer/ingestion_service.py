@@ -87,6 +87,37 @@ class IngestionService:
         self.publisher = publisher
         self.embedding_profiles = None
 
+    def _deleted_documents(self):
+        return self.publisher.deleted_documents() if self.publisher and hasattr(self.publisher, 'deleted_documents') else set()
+
+    def _ensure_not_deleted(self, document_id):
+        if document_id in self._deleted_documents():
+            raise ValueError('삭제 중이거나 삭제된 문서입니다')
+
+    @staticmethod
+    def _job_requires_copy(publisher, document_id, job_id):
+        if not publisher:
+            return False
+        if hasattr(publisher, 'job_may_be_referenced'):
+            return publisher.job_may_be_referenced(document_id, job_id, include_unattributed=False)
+        return bool(hasattr(publisher, 'job_is_indexed') and publisher.job_is_indexed(document_id, job_id))
+
+    def _restore_draft_snapshot(self, document_id, job_id, edit_id, error):
+        if not re.fullmatch(r'[0-9a-f]{32}', str(edit_id)):
+            raise ValueError('검토 작업의 기준 기록을 확인할 수 없습니다')
+        folder = self.storage.document_dir(document_id) / 'jobs' / job_id
+        snapshot = folder / 'draft-edits' / edit_id
+        previous = json.loads((snapshot / 'processing.json').read_text(encoding='utf-8'))
+        for name in ('parser_elements', 'parser_initial_elements', 'parser_result', 'elements', 'chunks'):
+            path = snapshot / (name + '.json')
+            if path.exists():
+                self.storage.save_job(document_id, job_id, name, json.loads(path.read_text(encoding='utf-8')))
+            else:
+                (folder / (name + '.json')).unlink(missing_ok=True)
+        # Publish the restored status last so interrupted restoration is repeatable.
+        self.storage.save_job(document_id, job_id, 'processing', {**previous, 'error': error,
+            'last_image_failure': error, 'pending_review': True})
+
     def _graph(self, parser):
         return make_graph(parser, self._parsed, self._represented, self._quality, self.max_pages, self.retry_pages,
                           self._provider_event, self._progress, self._inspected, self._embed_node, self._index_node,
@@ -227,7 +258,10 @@ class IngestionService:
             with source.open("rb") as stream:
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
             size = source.stat().st_size
+            deleted = self._deleted_documents()
             for existing in self.storage.list_documents():
+                if existing['document_id'] in deleted:
+                    continue
                 original = self.storage.document_dir(existing["document_id"]) / ("source." + existing["format"])
                 if existing.get("sha256") == digest and original.is_file() and original.stat().st_size == size:
                     raise DuplicateDocument(existing)
@@ -394,7 +428,7 @@ class IngestionService:
         if any(value == 'reuse' and key not in existing_analysis for key, value in selected.items()):
             raise ValueError('재사용할 이미지 분석 결과가 없습니다')
         base_publisher = self.publisher_for(base.get('embedding_profile_id'))
-        published = bool(base_publisher and hasattr(base_publisher, 'job_is_indexed') and base_publisher.job_is_indexed(document_id, base_job_id))
+        published = self._job_requires_copy(base_publisher, document_id, base_job_id)
         draft = bool((base.get('pending_review') or (not base.get('index_version') and
                      (base.get('can_accept_partial') or base.get('can_accept_content_changes')))) and not published)
         action_parser = self._job_parser(document_id, base_job_id, base) if draft else self.parser
@@ -497,14 +531,13 @@ class IngestionService:
             if active_chunks and all(chunk.get("job_id") == job_id for chunk in active_chunks):
                 return {"publication": {"partial": partial, "changes": [], "preserve": False,
                                         "active_version": None, "manifest": active, "already_published": True}}
-        if (state.get("resume_index") and self.publisher and hasattr(self.publisher, "job_is_indexed")
-            and self.publisher.job_is_indexed(document_id, job_id)):
+        if state.get("resume_index") and self._job_requires_copy(publisher, document_id, job_id):
             raise ValueError("이미 게시된 작업입니다. 새 작업에서 검색 준비를 요청해 주세요")
         changes = (self.content_loss(publisher, active, document_id, state["normalized"])
                    if publisher and status.get('mode') not in {'image_actions', 'draft_image_actions'} else [])
         preserve = bool(partial or (active and document_id in active.get("document_ids", []) and changes))
         if not state["chunks"] and not partial:
-            raise ValueError("검색할 내용이 없습니다")
+            raise IndexerError('NO_SEARCHABLE_CONTENT', '검색할 내용이 없습니다. 원본이나 추출 설정을 확인하고 새 작업으로 다시 읽어 주세요.', 422)
         data = {"partial": partial, "changes": changes, "preserve": preserve,
                 "active_version": active.get("version") if preserve and active else None,
                 'existing_document': bool(active and document_id in active.get('document_ids', []))}
@@ -540,18 +573,29 @@ class IngestionService:
             data["manifest"] = publisher.commit(data.pop("prepared")) if "prepared" in data else publisher.publish(document_id, state["chunks"])
         return {"publication": data}
 
-    def run_job(self, document_id: str, job_id: str):
-        document = self.storage.load_document(document_id)
-        stored = self.storage.document_dir(document_id) / ("source." + document["format"])
+    def claim_job(self, document_id: str, job_id: str):
+        self._ensure_not_deleted(document_id)
+        self.storage.load_document(document_id)
         status = self.storage.load_job(document_id, job_id, "processing")
         if status.get("status") != "queued":
             raise ValueError("대기 중인 작업이 아닙니다")
-        if (status.get("recovery_mode") in {"initial", "retry"} and self.publisher
-            and hasattr(self.publisher, "job_is_indexed") and self.publisher.job_is_indexed(document_id, job_id)):
+        if (status.get("recovery_mode") in {"initial", "retry"}
+            and self._job_requires_copy(self.publisher, document_id, job_id)):
             raise ValueError("이미 게시된 작업은 새 작업으로 이어서 처리해야 합니다")
-        profile, settings = status.get("profile"), status.get("settings") or {}
-        status = {**status, "status": "processing", "stage": "representing" if status.get("mode") == "rechunk" else "parsing"}
+        claim = uuid4().hex
+        status = {**status, "status": "processing", "stage": "representing" if status.get("mode") == "rechunk" else "parsing", 'claim_id': claim}
         self.storage.save_job(document_id, job_id, "processing", status)
+        return claim
+
+    def run_job(self, document_id: str, job_id: str, *, claim_id=None):
+        claim_id = claim_id or self.claim_job(document_id, job_id)
+        self._ensure_not_deleted(document_id)
+        document = self.storage.load_document(document_id)
+        stored = self.storage.document_dir(document_id) / ("source." + document["format"])
+        status = self.storage.load_job(document_id, job_id, "processing")
+        if status.get('status') != 'processing' or status.get('claim_id') != claim_id:
+            raise ValueError('작업 예약을 확인할 수 없습니다')
+        profile, settings = status.get("profile"), status.get("settings") or {}
         try:
             try:
                 publisher = self.publisher_for(status.get("embedding_profile_id"), for_ingest=True)
@@ -661,6 +705,10 @@ class IngestionService:
                       "can_accept_partial": bool(partial and preserve and state["chunks"] and publisher),
                       'can_publish_draft': bool(preserve and not partial and state['chunks'] and publisher and status.get('force_review')),
                       "can_resume": bool(resumable_attempt), "recovery_mode": resumable_attempt, "progress": None, "error": None}
+            if partial and not state['chunks']:
+                status.update(pending_review=False, can_accept_partial=False, can_publish_draft=False,
+                              error={'code': 'NO_SEARCHABLE_CONTENT',
+                                     'message': '현재 검색할 내용이 없습니다. 미완료 처리를 이어서 확인하거나 새 작업으로 다시 읽어 주세요.'})
             if manifest:
                 status["index_version"] = manifest["version"]
             self.storage.save_job(document_id, job_id, "processing", status)
@@ -694,30 +742,25 @@ class IngestionService:
                           and resumable_provider_checkpoint(checkpoint, attempt, native_visual=can_resume_native_visual(status))
                           and status.get("stage") in {"parsing", "retrying", "quality"})
             error_info = {"code": error_code, "message": message}
+            if error_code == 'NO_SEARCHABLE_CONTENT':
+                status = {**status, 'stage': 'completed'}
             if http_status is not None:
                 error_info["http_status"] = http_status
             if status.get('mode') == 'draft_image_actions' and re.fullmatch(r'[0-9a-f]{32}', str(status.get('image_snapshot', ''))):
-                folder = self.storage.document_dir(document_id) / 'jobs' / job_id
-                snapshot = folder / 'draft-edits' / status['image_snapshot']
-                for name in ('parser_elements', 'parser_initial_elements', 'parser_result', 'elements', 'chunks'):
-                    path = snapshot / (name + '.json')
-                    if path.exists():
-                        self.storage.save_job(document_id, job_id, name, json.loads(path.read_text(encoding='utf-8')))
-                previous = json.loads((snapshot / 'processing.json').read_text(encoding='utf-8'))
-                self.storage.save_job(document_id, job_id, 'processing', {**previous, 'error': error_info,
-                    'last_image_failure': error_info, 'pending_review': True})
+                self._restore_draft_snapshot(document_id, job_id, status['image_snapshot'], error_info)
                 raise IngestionFailure(document_id, job_id) from error
             self.storage.save_job(document_id, job_id, "processing", {**status, "status": "failed", "can_resume": can_resume,
                                    "recovery_mode": attempt if can_resume else None, "error": error_info})
             raise IngestionFailure(document_id, job_id) from error
 
-    def process_next(self):
+    def claim_next(self, *, exclude_documents=()):
         for document in self.storage.list_documents():
+            if document['document_id'] in exclude_documents or document['document_id'] in self._deleted_documents():
+                continue
             for job in self.storage.list_jobs(document["document_id"]):
                 if job.get("status") == "queued":
-                    if (job.get("recovery_mode") in {"initial", "retry"} and self.publisher
-                        and hasattr(self.publisher, "job_is_indexed")
-                        and self.publisher.job_is_indexed(document["document_id"], job["job_id"])):
+                    if (job.get("recovery_mode") in {"initial", "retry"}
+                        and self._job_requires_copy(self.publisher, document["document_id"], job["job_id"])):
                         self.storage.save_job(document["document_id"], job["job_id"], "processing", {
                             **job, "status": "partial", "stage": "completed", "can_resume": True})
                         try:
@@ -727,18 +770,44 @@ class IngestionService:
                             self.storage.save_job(document["document_id"], job["job_id"], "processing", {
                                 **current, "can_resume": False, "error": {"message": str(error)}})
                         return True
-                    try:
-                        self.run_job(document["document_id"], job["job_id"])
-                    except IngestionFailure:
-                        pass
-                    return True
-        return False
+                    return (document['document_id'], job['job_id'], self.claim_job(document['document_id'], job['job_id']))
+        return None
 
-    def recover(self):
+    def process_next(self):
+        claimed = self.claim_next()
+        if isinstance(claimed, tuple):
+            try:
+                self.run_job(claimed[0], claimed[1], claim_id=claimed[2])
+            except IngestionFailure:
+                pass
+        return bool(claimed)
+
+    def recover(self, *, exclude_jobs=(), exclude_documents=()):
         for document in self.storage.list_documents():
             document_id = document["document_id"]
+            if document_id in exclude_documents:
+                continue
+            if document_id in self._deleted_documents():
+                continue
             for job in self.storage.list_jobs(document_id):
+                if (document_id, job['job_id']) in exclude_jobs:
+                    continue
                 stored = self.storage.load_job(document_id, job['job_id'], 'processing')
+                if stored.get('mode') == 'draft_image_actions' and stored.get('status') == 'processing':
+                    self._restore_draft_snapshot(document_id, job['job_id'], stored.get('image_snapshot'),
+                        {'code': 'DRAFT_INTERRUPTED', 'message': '이미지 수정 중 서버가 중단되어 이전 검토 상태를 복원했습니다.'})
+                    continue
+                intent = stored.get('publication_intent')
+                if intent and stored.get('status') == 'partial':
+                    try:
+                        publisher = self.publisher_for(stored.get('embedding_profile_id'), for_ingest=True)
+                        active = publisher.active() if publisher else None
+                        if active and hasattr(publisher, 'find_publication') and publisher.find_publication(intent.get('id')):
+                            self.accept_content_changes(document_id, job['job_id'], accept_partial=intent['accept_partial'])
+                            continue
+                    except (ValueError, FileNotFoundError, KeyError, IngestionFailure):
+                        LOG.warning(json.dumps({'event': 'publication_recovery_deferred', 'document_id': document_id,
+                                                'job_id': job['job_id']}))
                 normalized = normalize_review_status(stored)
                 if (normalized is not stored and job.get('mode') == 'draft_image_actions'
                     and job.get('status') == 'partial' and job.get('pending_review')
@@ -787,9 +856,8 @@ class IngestionService:
                             resumable, recovery_mode = True, "index"
                         except (ValueError, FileNotFoundError):
                             pass
-                    published_parse = (resumable and recovery_mode in {"initial", "retry"} and self.publisher
-                                       and hasattr(self.publisher, "job_is_indexed")
-                                       and self.publisher.job_is_indexed(document_id, job["job_id"]))
+                    published_parse = (resumable and recovery_mode in {"initial", "retry"}
+                                       and self._job_requires_copy(self.publisher, document_id, job["job_id"]))
                     self.storage.save_job(document_id, job["job_id"], "processing", {
                         **job, "status": "partial" if published_parse else "queued" if resumable else "failed",
                         "stage": "completed" if published_parse else job.get("stage"), "recovery_mode": recovery_mode,
@@ -803,6 +871,7 @@ class IngestionService:
                                 **current, "can_resume": False, "error": {"message": str(error)}})
 
     def resume_processing(self, document_id: str, job_id: str):
+        self._ensure_not_deleted(document_id)
         status = self.storage.load_job(document_id, job_id, "processing")
         if status.get("status") not in {"failed", "partial"} or not status.get("can_resume"):
             raise ValueError("이 작업은 저장된 처리 기록에서 재개할 수 없습니다")
@@ -816,8 +885,7 @@ class IngestionService:
         checkpoint = self.storage.provider_checkpoint(document_id, job_id, attempt) if attempt else {}
         if not resumable_provider_checkpoint(checkpoint, attempt, native_visual=can_resume_native_visual(status)):
             raise ValueError("저장된 처리 요청을 확인할 수 없습니다")
-        published = bool(self.publisher and hasattr(self.publisher, "job_is_indexed")
-                         and self.publisher.job_is_indexed(document_id, job_id))
+        published = self._job_requires_copy(publisher, document_id, job_id)
         resumed = {**status, "status": "queued", "stage": "queued", "progress": None,
                    "previous_error": status.get("error") or status.get("previous_error"),
                    "error": None, "can_resume": False, "can_accept_content_changes": False,
@@ -845,7 +913,8 @@ class IngestionService:
 
     def delete_document(self, document_id: str):
         document = self.storage.load_document(document_id)
-        if any(job.get("status") in {"queued", "processing"} for job in self.storage.list_jobs(document_id)):
+        if (document_id not in self._deleted_documents() and
+                any(job.get("status") in {"queued", "processing"} for job in self.storage.list_jobs(document_id))):
             raise ValueError("진행 중인 작업이 있어 삭제할 수 없습니다")
         if self.publisher:
             self.publisher.delete_document(document_id)
@@ -873,7 +942,9 @@ class IngestionService:
             raise ValueError("진행 중인 작업이 있어 삭제할 수 없습니다")
         if len(jobs) < 2:
             raise ValueError("마지막 작업은 삭제할 수 없습니다. 문서 삭제를 이용해 주세요")
-        if self.publisher and self.publisher.job_is_indexed(document_id, job_id):
+        if self.publisher and (self.publisher.job_may_be_referenced(document_id, job_id)
+                               if hasattr(self.publisher, 'job_may_be_referenced')
+                               else self.publisher.job_is_indexed(document_id, job_id)):
             raise ValueError("검색 버전에서 참조하는 작업은 삭제할 수 없습니다")
         shutil.rmtree(self.storage.document_dir(document_id) / "jobs" / job_id)
 
@@ -909,8 +980,18 @@ class IngestionService:
             for change in status["content_changes"]]}
 
     def accept_content_changes(self, document_id, job_id, *, accept_partial=False):
+        self._ensure_not_deleted(document_id)
         stored_status = self.storage.load_job(document_id, job_id, "processing")
         status = normalize_review_status(stored_status)
+        legacy_normalized = status is not stored_status
+        if (status.get('content_changes_accepted') and status.get('index_version')
+                and status.get('partial_accepted', False) == accept_partial):
+            publisher = self.publisher_for(status.get('embedding_profile_id'), for_ingest=True)
+            manifest = publisher.get_version(status['index_version']) if hasattr(publisher, 'get_version') else None
+            if manifest and hasattr(publisher, 'document_chunks'):
+                published = publisher.document_chunks(document_id, manifest)
+                if published and all(chunk.get('job_id') == job_id for chunk in published):
+                    return {'document_id': document_id, 'job_id': job_id, **status}
         allowed = (status.get("can_accept_partial") if accept_partial else
                    status.get("can_accept_content_changes") or status.get('can_publish_draft'))
         if not allowed or status.get("status") != "partial":
@@ -921,31 +1002,56 @@ class IngestionService:
         if self.embedding_profiles and status.get("embedding_contract") != publisher.embedding_contract():
             raise ValueError("임베딩 설정이 변경되어 새 작업이 필요합니다")
         active = publisher.active()
-        if (active.get('version') if active else None) != status.get("comparison_index_version"):
+        intent = status.get('publication_intent')
+        if intent and intent.get('accept_partial') != accept_partial:
+            raise ValueError('이전 게시 요청과 다른 승인 방식입니다')
+        published_manifest = (publisher.find_publication(intent.get('id')) if intent and active
+                              and hasattr(publisher, 'find_publication') else None)
+        already_published = bool(published_manifest)
+        if not already_published and (active.get('version') if active else None) != status.get("comparison_index_version"):
             raise ValueError("비교한 검색 버전이 변경되었습니다. 새 작업으로 다시 확인해 주세요")
         chunks = self.storage.load_job(document_id, job_id, "chunks")
         elements = self.storage.load_job(document_id, job_id, 'elements')
         if unresolved_visuals(elements):
             raise ValueError('확인이 필요한 이미지의 처리 방식을 모두 선택해 주세요')
-        try:
-            manifest = publisher.publish(document_id, chunks)
-        except Exception as error:
-            raise IngestionFailure(document_id, job_id) from error
+        if already_published:
+            published_chunks = publisher.document_chunks(document_id, published_manifest)
+            if not published_chunks or any(chunk.get('job_id') != job_id for chunk in published_chunks):
+                raise ValueError('게시된 작업의 출처를 확인할 수 없습니다')
+            manifest = published_manifest
+        else:
+            if hasattr(publisher, '_published_versions'):
+                if not intent:
+                    intent = {'id': str(uuid4()), 'accept_partial': accept_partial}
+                    status = {**status, 'publication_intent': intent}
+                    self.storage.save_job(document_id, job_id, 'processing', status)
+                kwargs = {'publication_id': intent['id']}
+            else:
+                kwargs = {}
+            try:
+                manifest = publisher.publish(document_id, chunks, **kwargs)
+            except Exception as error:
+                raise IngestionFailure(document_id, job_id) from error
         coverage = status.get('coverage') or {}
         remains_partial = bool(coverage.get('provider_incomplete') or coverage.get('missing_pages')
                                or coverage.get('unavailable_pages') or (coverage.get('unknown_scope') and
                                    self.storage.load_document(document_id).get('format') == 'pdf'))
-        resolved_legacy_notice = status is not stored_status and not remains_partial
+        resolved_legacy_notice = legacy_normalized and not remains_partial
         status = {**status, "status": "partial" if accept_partial and not resolved_legacy_notice else "completed", "stage": "completed", "existing_index_retained": False,
                   "can_accept_partial": False, "partial_accepted": accept_partial, 'pending_review': False, 'can_publish_draft': False,
                   "can_resume": status.get("can_resume", False),
                   "can_accept_content_changes": False, "content_changes_accepted": True,
                   "index_version": manifest["version"], "error": None}
+        status.pop('publication_intent', None)
         self.storage.save_job(document_id, job_id, "processing", status)
         return {"document_id": document_id, "job_id": job_id, **status}
 
     def resume_index(self, document_id: str, job_id: str):
+        self._ensure_not_deleted(document_id)
         status = self.storage.load_job(document_id, job_id, "processing")
+        if any(job.get('status') in {'queued', 'processing'} and job['job_id'] != job_id
+               for job in self.storage.list_jobs(document_id)):
+            raise ValueError('이 문서의 다른 작업이 진행 중입니다')
         publisher = self.publisher_for(status.get("embedding_profile_id"), for_ingest=True)
         if status.get("status") != "failed" or status.get("stage") not in {"embedding", "indexing"} or not publisher:
             raise ValueError("저장된 청크에서 재개할 수 없는 작업입니다")

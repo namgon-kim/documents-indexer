@@ -6,7 +6,7 @@ export type ProcessState = {
   coverage?: {missing_pages: number[]; warnings?: string[]; attempts?: {mode: string; pages: number[] | null}[]};
   existing_index_retained?: boolean;
   pending_review?: boolean;
-  error?: {message: string};
+  error?: {message: string; code?: string};
 };
 type StepState = "upcoming" | "waiting" | "active" | "done" | "reused" | "warn" | "failed" | "skipped";
 type Tone = "ok" | "done" | "warn" | "danger" | "neutral";
@@ -55,6 +55,12 @@ export function describeProgress(job: ProcessState): View {
   const view: View = {steps: steps.map(() => ({state: "upcoming", detail: ""})), percent: 0, tone: "ok", running: false, compact: false, label: "", detail: "", note: ""};
   const done = (index: number) => { view.steps[index] = rechunk && index < reusedSteps ? {state: "reused", detail: "재사용"} : {state: "done", detail: "완료"}; };
 
+  if (job.error?.code === "NO_SEARCHABLE_CONTENT") {
+    for (let index = 0; index <= 3; index++) done(index);
+    view.steps[4] = view.steps[5] = {state: "skipped", detail: "검색 내용 없음"};
+    return {...view, percent: ranges.embedding[0], tone: "warn", label: "검색할 내용 없음",
+      detail: missing ? `${missing}쪽을 읽지 못함` : "검색 준비 안 됨", note: job.error.message, noteTone: "warn"};
+  }
   if (job.status === "completed") {
     steps.forEach((_, index) => done(index));
     return {...view, percent: 100, tone: "done", compact: true, label: "처리 완료", detail: rechunk ? "읽은 내용으로 다시 준비함" : `${steps.length}단계 완료`};
