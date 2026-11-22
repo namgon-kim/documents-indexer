@@ -15,9 +15,17 @@ def _chat_evidence(hits, limit, budget=32768):
     """Fit ranked evidence in a serialized UTF-8 byte budget."""
     sources, context = [], []
     # A completeness flag can grow from true to false when a later item is omitted.
-    fit_budget = max(0, budget - min(limit, len(hits)))
+    fit_budget = max(0, budget - limit)
     truncated = context_omitted = 0
-    for hit in hits[:limit]:
+    encoded = lambda items: byte_size(json.dumps(items, ensure_ascii=False))
+    ordered = [hit for hit in hits if hit.get('expansion_reason') != 'same_source_element']
+    ordered += [hit for hit in hits if hit.get('expansion_reason') == 'same_source_element']
+    chosen = ordered[:limit]
+    primary = [hit for hit in chosen if hit.get('expansion_reason') != 'same_source_element']
+    supplementary = [hit for hit in chosen if hit.get('expansion_reason') == 'same_source_element']
+
+    def add(hit, *, allow_truncation):
+        nonlocal truncated
         refs = hit["source_refs"]
         item = {"id": len(sources) + 1, "filename": hit["filename"],
                 "evidence_pages": sorted({ref["page"] for ref in refs if ref.get("page") is not None and ref.get("role", "evidence") == "evidence"}),
@@ -28,13 +36,16 @@ def _chat_evidence(hits, limit, budget=32768):
                 "XLSX_출처": [ref for ref in refs if ref.get("kind") in {"xlsx_cell", "xlsx_range"}][:8],
                 "XLSX_행_연결_후보": hit.get("xlsx_row_relations", [])[:10],
                 "XLSX_전체_표_조회": False if hit.get("xlsx_sheet") else None}
+        if hit.get('element_scopes'):
+            # Reserve a compact per-evidence status without exceeding the byte budget.
+            item['원본_요소_색인_조각_전체_포함'] = False
         if hit.get('table_segments'):
             # Reserve only a small marker until all ranked evidence is fitted.
             item['표_라벨_관계'] = None
             item['표_라벨_관계_일부_생략'] = True
-        encoded = lambda items: byte_size(json.dumps(items, ensure_ascii=False))
         if encoded([*context, item]) > fit_budget:
-            # Fit a prefix measured in JSON-encoded UTF-8 bytes, including escaping.
+            if not allow_truncation:
+                return
             full_text = item["text"]
             low, high = 1, len(full_text)
             best = ""
@@ -47,15 +58,17 @@ def _chat_evidence(hits, limit, budget=32768):
                 else:
                     high = middle - 1
             if not best.strip():
-                continue
+                return
             item["text"] = best
             truncated += 1
             sources.append({**hit, "search_text": best, "evidence_truncated": True})
         else:
             sources.append(dict(hit))
         context.append(item)
-    omitted = len(hits) - len(sources)
-    # Fill spare capacity with interpretation context after fitting the ranked evidence.
+
+    for hit in primary:
+        add(hit, allow_truncation=True)
+    # Interpretation context of ranked and previously supported evidence has priority.
     for hit, item in zip(sources, context, strict=True):
         extra = hit.get("context_text") or ""
         if hit.get("evidence_truncated"):
@@ -65,7 +78,7 @@ def _chat_evidence(hits, limit, budget=32768):
         if not extra or extra == hit["search_text"]:
             continue
         item["context"] = extra
-        if byte_size(json.dumps(context, ensure_ascii=False)) > fit_budget:
+        if encoded(context) > fit_budget:
             item["context"] = ""
             context_omitted += 1
     # Add whole relationships only after evidence and interpretation context fit.
@@ -86,16 +99,75 @@ def _chat_evidence(hits, limit, budget=32768):
             selected.append(entry)
         item['표_라벨_관계_일부_생략'] = (len(selected) < len(labeled) or any(
             len(part.get('label_relations') or []) > 8 for part in labeled[:len(selected)]))
+    primary_count = len(sources)
+    for hit in supplementary:
+        add(hit, allow_truncation=False)
+    for hit, item in zip(sources[primary_count:], context[primary_count:], strict=True):
+        extra = hit.get('context_text') or ''
+        if not extra or extra == hit['search_text']:
+            continue
+        item['context'] = extra
+        if encoded(context) > fit_budget:
+            item['context'] = ''
+            context_omitted += 1
+    omitted = len(hits) - len(sources)
     limited = bool(omitted or truncated or context_omitted)
-    if limited:
-        for hit, item in zip(sources, context, strict=True):
-            if hit.get("table_expansion_complete"):
-                hit["table_expansion_complete"] = item["표의_분할내용_모두_포함"] = False
+    for hit, item in zip(sources, context, strict=True):
+        if not hit.get('table_expansion_complete'):
+            continue
+        scopes = hit.get('element_scopes') or []
+        if len(scopes) == 1 and hit.get('chunk_id'):
+            eid = scopes[0]['element_id']
+            related = [source for source in sources if source.get('document_id') == hit.get('document_id')
+                       and source.get('job_id') == hit.get('job_id') and eid in source.get('element_ids', [])]
+            complete = (len({source['chunk_id'] for source in related}) == scopes[0]['indexed_chunks']
+                        and not any(source.get('evidence_truncated') for source in related))
+        else:
+            # Older artifacts lack per-element provenance; preserve the conservative behavior.
+            complete = not limited
+        if not complete:
+            hit["table_expansion_complete"] = item["표의_분할내용_모두_포함"] = False
     counts = {"evidence_count": len(sources), "evidence_omitted_count": omitted,
               "evidence_truncated_count": truncated, "context_omitted_count": context_omitted,
               "evidence_limited": limited, "evidence_budget_bytes": budget,
               "evidence_bytes": byte_size(json.dumps(context, ensure_ascii=False))}
     return sources, context, counts
+
+
+def _coverage(hits, sources, method='ranked_search'):
+    """Summarize indexed fragments, without asserting extraction or document completeness."""
+    groups = {}
+    for hit in hits:
+        for scope in hit.get('element_scopes', []):
+            key = (hit.get('document_id'), hit.get('job_id'), scope['element_id'])
+            entry = groups.setdefault(key, {'indexed_chunks': scope['indexed_chunks'], 'model_chunks': set(),
+                                            'truncated': False})
+            for source in sources:
+                if (source.get('document_id'), source.get('job_id'), source.get('chunk_id')) == (
+                        hit.get('document_id'), hit.get('job_id'), hit.get('chunk_id')):
+                    if source.get('evidence_truncated'):
+                        entry['truncated'] = True
+                    else:
+                        entry['model_chunks'].add(hit['chunk_id'])
+    for source in sources:
+        model_scopes = []
+        for scope in source.get('element_scopes', []):
+            key = (source.get('document_id'), source.get('job_id'), scope['element_id'])
+            group = groups[key]
+            model_scopes.append({'element_id': scope['element_id'], 'indexed_chunks': group['indexed_chunks'],
+                                 'model_chunks': len(group['model_chunks']), 'truncated': group['truncated'],
+                                 'all_indexed_chunks_in_model': (not group['truncated'] and
+                                                                  len(group['model_chunks']) == group['indexed_chunks'])})
+        if model_scopes:
+            source['model_element_scopes'] = model_scopes
+    partial = sum(1 for item in groups.values()
+                  if item['truncated'] or len(item['model_chunks']) < item['indexed_chunks'])
+    return {'method': method, 'scope_complete': None, 'scope_verification': 'unknown',
+            'source_completeness': 'unknown', 'element_count': len(groups),
+            'partial_element_count': partial, 'retrieved_chunks': len(hits),
+            'model_chunks': len(sources), 'truncated_chunks': sum(bool(hit.get('evidence_truncated')) for hit in sources),
+            'unknown_element_scope_count': sum(not hit.get('element_scopes') for hit in hits),
+            'reason': 'ranked_search_does_not_verify_target_scope'}
 
 
 class RagChat:
@@ -242,6 +314,18 @@ class RagChat:
         request, result = inputs
         sources, context, counts = _chat_evidence(result["results"], MAX_RESULT_LIMIT + 5, self.config.chat_evidence_bytes)
         diagnostics = {**result.get("search_counts", {}), **counts}
+        coverage = _coverage(result["results"], sources, result.get("method", "ranked_search"))
+        # The status belongs to each model evidence item, not only to API sources.
+        for source, item in zip(sources, context, strict=True):
+            scopes = source.get('model_element_scopes', [])
+            if scopes:
+                item['원본_요소_색인_조각_전체_포함'] = all(
+                    scope['all_indexed_chunks_in_model'] for scope in scopes)
+                item['원본_요소_범위'] = scopes
+                if byte_size(json.dumps(context, ensure_ascii=False)) > self.config.chat_evidence_bytes:
+                    del item['원본_요소_범위']
+        counts['evidence_bytes'] = byte_size(json.dumps(context, ensure_ascii=False))
+        diagnostics['evidence_bytes'] = counts['evidence_bytes']
         page_scope = dict(result['page_scope']) if result.get('page_scope') else None
         if page_scope is not None:
             page_scope['pages_in_model_context'] = sorted({ref['page'] for source in sources
@@ -257,7 +341,7 @@ class RagChat:
                       "검색 결과가 답변 근거 크기 한도를 초과했습니다." if result["results"]
                       else "질문하신 정보를 찾을 수 없습니다.")
             return {"answer": answer, "sources": [], "index_version": result["index_version"],
-                    "search_counts": diagnostics, **({'page_scope': page_scope} if page_scope else {})}
+                    "search_counts": diagnostics, "coverage": coverage, **({'page_scope': page_scope} if page_scope else {})}
         messages = []
         for item in request.history:
             content = item.content
@@ -269,7 +353,7 @@ class RagChat:
             if content.strip():
                 messages.append({"role": item.role, "content": content})
         messages.append({"role": "user", "content": json.dumps({"질문": request.message, "근거_제한": counts,
-                         "PDF_물리쪽_조회": page_scope, "검색된 문서": context}, ensure_ascii=False)})
+                         "PDF_물리쪽_조회": page_scope, "조회_범위": coverage, "검색된 문서": context}, ensure_ascii=False)})
         instructions = ("검색 근거를 바탕으로 사용자의 질문에 한국어로 친절하고 자연스러운 대화체로 안내하세요. "
                             "질문에 필요한 정보를 이해하기 쉽게 설명하고, 확인할 수 없는 내용은 정보를 찾을 수 없다고 알려주세요. "
                             "관련 근거가 있는 내용에는 해당 근거의 id를 [1]과 같은 인용 번호로 표시하세요. "
@@ -278,6 +362,9 @@ class RagChat:
                             "각 항목의 text를 인용 근거로 쓰고 context는 해석용 문맥으로만 사용하세요. "
                             "표 라벨 관계 정보가 추정이라고 표시하면 그 점을 고려하고, 정보가 없거나 생략된 사실만으로 관계가 틀렸다고 판단하지 마세요. 원문과 문맥을 함께 살펴 답변하세요. "
                             "근거 제한 정보에서 생략이나 문맥 제외가 있으면 이를 답변에 밝히고 전체 목록이나 완전한 집계라고 주장하지 마세요. "
+                            "각 근거의 원본 요소 조각 포함 상태가 false면 해당 근거의 원본 요소는 일부만 전달되었습니다. "
+                            "검색된 원본 요소의 색인 조각을 모두 보았더라도 질문 대상 표, 목록, 여러 페이지나 문서 전체의 완전성을 뜻하지 않습니다. "
+                            "조회 범위가 확정되지 않은 전체 개수, 목록, 합계나 분포는 전체 결과라고 단정하지 말고 확인된 부분과 미확인 범위를 구별하세요. "
                             "표의 분할내용이 모두 포함되지 않았다면 전체 내용을 확인했다고 주장하지 마세요. "
                             "PDF 물리쪽 조회에서 검색 가능한 청크가 없거나 일부만 제공되면 그 쪽 전체에 정보가 없다고 단정하지 마세요. "
                             "추출된 모든 청크를 보더라도 원문 페이지의 추출 완전성이 확인되지 않으면 원문에 정보가 없다고 단정하지 마세요. "
@@ -311,4 +398,4 @@ class RagChat:
         answer = content
         answer = re.sub(r"\[(\d+)\]", lambda match: match.group(0) if 1 <= int(match.group(1)) <= len(sources) else "[근거 확인 불가]", answer)
         return {"answer": answer, "sources": sources, "index_version": result["index_version"],
-                "search_counts": diagnostics, **({'page_scope': page_scope} if page_scope else {})}
+                "search_counts": diagnostics, "coverage": coverage, **({'page_scope': page_scope} if page_scope else {})}

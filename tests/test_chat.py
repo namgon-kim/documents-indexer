@@ -211,3 +211,127 @@ def test_pdf_page_lookup_does_not_apply_unused_embedding_input_limit(tmp_path):
     request = ChatRequest(message='PDF 9쪽 ' + '가' * 200, method='hybrid')
     chat.retrieve(request)
     assert seen[0][1] == [9] and seen[0][0].query == request.message
+
+
+def test_completeness_tracks_source_fragments_and_budget_without_filtering():
+    from indexer.chat import _chat_evidence, _coverage
+
+    scope = {'element_id': 'list', 'indexed_chunks': 3, 'returned_chunks': 2,
+             'all_indexed_chunks_returned': False}
+    hits = [{'chunk_id': str(i), 'document_id': 'd', 'job_id': 'j', 'element_ids': ['list'],
+             'element_scopes': [scope], 'filename': 'doc', 'source_refs': [], 'search_text': text}
+            for i, text in enumerate(['first', 'second'])]
+    sources, _, _ = _chat_evidence(hits, 25, 4096)
+    coverage = _coverage(hits, sources)
+    assert [source['search_text'] for source in sources] == ['first', 'second']
+    assert coverage['partial_element_count'] == 1
+    assert coverage['source_completeness'] == 'unknown' and not coverage['scope_complete']
+    scope['indexed_chunks'] = 2
+    assert _coverage(hits, sources)['partial_element_count'] == 0
+    assert not _coverage(hits, sources)['scope_complete']
+    assert _coverage(hits, sources[:1])['partial_element_count'] == 1
+    assert _coverage(hits, [{**sources[0], 'evidence_truncated': True}, sources[1]])['partial_element_count'] == 1
+
+
+def test_chat_transmits_coverage_and_preserves_unknown_legacy_provenance(tmp_path):
+    hit = {'filename': 'old', 'source_refs': [], 'search_text': '목록의 일부'}
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
+    def provider(request):
+        payload = json.loads(json.loads(request.content)['messages'][-1]['content'])
+        assert payload['조회_범위']['scope_verification'] == 'unknown'
+        assert payload['조회_범위']['unknown_element_scope_count'] == 1
+        assert not payload['조회_범위']['scope_complete']
+        return httpx.Response(200, json={'choices': [{'message': {'content': '확인된 항목 [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
+            ChatRequest(message='전체 항목을 보여 줘'))
+    assert result['sources'] == [hit] and result['coverage']['method'] == 'ranked_search'
+
+
+def test_unrelated_budget_omission_does_not_mark_complete_table_partial():
+    from indexer.chat import _chat_evidence, _coverage
+
+    scope = {'element_id': 'table', 'indexed_chunks': 1, 'returned_chunks': 1,
+             'all_indexed_chunks_returned': True}
+    table = {'chunk_id': 'table', 'document_id': 'd', 'job_id': 'j', 'element_ids': ['table'],
+             'element_scopes': [scope], 'filename': 'doc', 'source_refs': [], 'search_text': 'A',
+             'table_expansion_complete': True}
+    other = {'chunk_id': 'other', 'document_id': 'd', 'job_id': 'j', 'element_ids': ['other'],
+             'filename': 'doc', 'source_refs': [], 'search_text': 'B' * 9000}
+    sources, context, counts = _chat_evidence([table, other], 1, 4096)
+    coverage = _coverage([table, other], sources)
+    assert counts['evidence_omitted_count'] == 1
+    assert context[0]['표의_분할내용_모두_포함'] is True
+    assert sources[0]['model_element_scopes'][0]['all_indexed_chunks_in_model']
+    assert coverage['scope_complete'] is None
+
+
+def test_model_evidence_identifies_each_partial_source_within_budget(tmp_path):
+    scopes = [{'element_id': 'complete', 'indexed_chunks': 1},
+              {'element_id': 'partial', 'indexed_chunks': 2}]
+    hits = [{'chunk_id': str(i), 'document_id': 'd', 'job_id': 'j', 'element_ids': [scope['element_id']],
+             'element_scopes': [scope], 'filename': 'doc', 'source_refs': [], 'search_text': f'목록 {i}'}
+            for i, scope in enumerate(scopes)]
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': hits})
+    def provider(request):
+        content = json.loads(json.loads(request.content)['messages'][-1]['content'])
+        items = content['검색된 문서']
+        assert items[0]['원본_요소_색인_조각_전체_포함'] is True
+        assert items[1]['원본_요소_색인_조각_전체_포함'] is False
+        assert items[1]['원본_요소_범위'][0]['indexed_chunks'] == 2
+        return httpx.Response(200, json={'choices': [{'message': {'content': '일부 근거 [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake', chat_evidence_bytes=4096),
+                         retrieval, client).invoke(ChatRequest(message='목록을 설명해 줘'))
+    assert result['search_counts']['evidence_bytes'] <= 4096
+    assert result['coverage']['partial_element_count'] == 1
+
+
+def test_model_scope_markers_remain_within_tight_evidence_budget(tmp_path):
+    scopes = [{'element_id': f'e{i}', 'indexed_chunks': 2} for i in range(3)]
+    hits = [{'chunk_id': str(i), 'document_id': 'd', 'job_id': 'j', 'element_ids': [scope['element_id']],
+             'element_scopes': [scope], 'filename': 'doc', 'source_refs': [], 'search_text': '가' * 800}
+            for i, scope in enumerate(scopes)]
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': hits})
+    def provider(request):
+        payload = json.loads(json.loads(request.content)['messages'][-1]['content'])
+        items = payload['검색된 문서']
+        assert items and all(item['원본_요소_색인_조각_전체_포함'] is False for item in items)
+        assert len(json.dumps(items, ensure_ascii=False).encode('utf-8')) <= 4096
+        return httpx.Response(200, json={'choices': [{'message': {'content': '일부 [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake', chat_evidence_bytes=4096),
+                         retrieval, client).invoke(ChatRequest(message='정리'))
+    assert result['search_counts']['evidence_bytes'] <= 4096
+
+
+def test_text_expansion_does_not_displace_ranked_visual_or_interpretation_context():
+    from indexer.chat import _chat_evidence
+
+    ranked = {'chunk_id': 'ranked', 'filename': 'doc', 'source_refs': [], 'search_text': 'A' * 700,
+              'context_text': 'context ' * 70,
+              'table_segments': [{'row': 1, 'column': 1, 'label': 'header',
+                                  'label_relations': [{'kind': 'column', 'text': 'header'}]}]}
+    visual = {'chunk_id': 'visual', 'filename': 'doc', 'source_refs': [], 'search_text': 'V' * 500,
+              'expansion_reason': 'related_image_analysis'}
+    expanded = {'chunk_id': 'expanded', 'filename': 'doc', 'source_refs': [], 'search_text': 'X' * 3000,
+                'expansion_reason': 'same_source_element'}
+    base_sources, base_context, _ = _chat_evidence([ranked, visual], 25, 4096)
+    sources, context, counts = _chat_evidence([ranked, expanded, visual], 25, 4096)
+    assert [hit['chunk_id'] for hit in sources] == [hit['chunk_id'] for hit in base_sources]
+    assert context == base_context
+    assert counts['evidence_omitted_count'] == 1
+    assert counts['evidence_bytes'] <= 4096
+
+
+def test_small_text_expansion_uses_spare_evidence_budget():
+    from indexer.chat import _chat_evidence
+
+    ranked = {'chunk_id': 'ranked', 'filename': 'doc', 'source_refs': [], 'search_text': 'A',
+              'context_text': 'surrounding context'}
+    expanded = {'chunk_id': 'expanded', 'filename': 'doc', 'source_refs': [], 'search_text': 'additional',
+                'expansion_reason': 'same_source_element'}
+    sources, context, counts = _chat_evidence([ranked, expanded], 25, 4096)
+    assert [hit['chunk_id'] for hit in sources] == ['ranked', 'expanded']
+    assert context[0]['context'] == 'surrounding context'
+    assert counts['evidence_omitted_count'] == 0

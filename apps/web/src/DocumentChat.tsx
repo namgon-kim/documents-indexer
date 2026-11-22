@@ -5,7 +5,7 @@ import type { Session } from "./api";
 import { VisualAssets } from "./VisualAssets";
 import { TableRelations } from "./TableRelations";
 
-export type ChatMessage = {role: "user" | "assistant"; content: string; sources?: Hit[]; index_version?: string; page_scope?: {requested_pages: number[]; pages_without_chunks: number[]; all_page_chunks_selected: boolean}; search_counts?: {evidence_limited: boolean; evidence_omitted_count: number; context_omitted_count: number; evidence_truncated_count: number}};
+export type ChatMessage = {role: "user" | "assistant"; content: string; sources?: Hit[]; index_version?: string; coverage?: {scope_verification: string; scope_complete: boolean | null; partial_element_count: number}; page_scope?: {requested_pages: number[]; pages_without_chunks: number[]; all_page_chunks_selected: boolean}; search_counts?: {evidence_limited: boolean; evidence_omitted_count: number; context_omitted_count: number; evidence_truncated_count: number}};
 type Props = {
   session: Session;
   messages: ChatMessage[]; searching: boolean; query: string; canSend: boolean;
@@ -89,6 +89,8 @@ export function DocumentChat(props: Props) {
         ? <div className="chat-row user" key={index}><div className="chat-stack"><p className="chat-bubble">{message.content}</p></div></div>
         : <div className="chat-row assistant" key={index}><span className="chat-bot" aria-hidden="true">{documentIcon}</span><div className="chat-stack">
           <p className="chat-bubble">{withCitations(message.content, message.sources?.length ?? 0, number => cite(index, number))}</p>
+          {(message.coverage?.partial_element_count ?? 0) > 0 && <p className="hint" role="status">일부 원본 요소의 색인 조각이 답변 근거에 모두 포함되지 않았습니다. 전체 범위와 원문을 확인해 주세요.</p>}
+          {message.coverage && <details className="hint"><summary>조회 범위 확인</summary><p>원문 추출과 질문 대상 전체 범위의 완전성은 확인되지 않았습니다.</p></details>}
           {message.page_scope && <p className="hint" role="status">PDF 물리쪽 {message.page_scope.requested_pages.join(", ")} · 페이지 내 BM25 조회 · 인쇄 쪽 번호와 다를 수 있으며 원문 추출 완전성은 미확인입니다.{!message.page_scope.all_page_chunks_selected ? " 일부 청크만 답변 근거로 선택됐습니다." : ""}{message.page_scope.pages_without_chunks.length ? ` 검색 가능한 청크 없음: ${message.page_scope.pages_without_chunks.join(", ")}쪽 (원본·추출 상태 확인 필요).` : ""}</p>}
           {message.search_counts?.evidence_limited && <p className="hint" role="status">답변 근거 예산으로 검색 근거 {message.search_counts.evidence_omitted_count}개와 문맥 {message.search_counts.context_omitted_count}개가 제외됐고, 근거 {message.search_counts.evidence_truncated_count}개는 일부만 사용됐습니다.</p>}
           {!!message.sources?.length && <div className={"chat-sources" + (open.includes(index) ? " is-open" : "")}>
