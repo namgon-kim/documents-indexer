@@ -1,8 +1,9 @@
 """Parse and normalize citation IDs without interpreting their meaning."""
 import re
 
-# Textual brackets remain document text; malformed numeric lists are rejected.
-CITATION = re.compile(r'\[([\d,\-\s]+)\]')
+# Require a digit before interpreting brackets as a citation. Textual and
+# Markdown checkbox brackets remain text; malformed numeric lists are rejected.
+CITATION = re.compile(r'\[((?=[\d,\-\s]*\d)[\d,\-\s]+)\]')
 MAX_CITATIONS = 100
 
 
