@@ -335,3 +335,19 @@ def test_small_text_expansion_uses_spare_evidence_budget():
     assert [hit['chunk_id'] for hit in sources] == ['ranked', 'expanded']
     assert context[0]['context'] == 'surrounding context'
     assert counts['evidence_omitted_count'] == 0
+
+
+def test_generated_claim_audit_uses_model_input_and_returns_review_cue(tmp_path):
+    hit = {'filename': 'doc', 'source_refs': [], 'search_text': '인원이 5명에서 7명으로 증가했습니다.'}
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
+    calls = []
+    def provider(request):
+        calls.append(request)
+        return httpx.Response(200, json={'choices': [{'message': {'content': '인원이 7명에서 5명으로 감소했습니다. [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
+            ChatRequest(message='인원 변화가 어떻게 되나요?'))
+    assert len(calls) == 1 and len(result['sources']) == 1
+    assert result['answer_verification']['warnings'][0]['code'] == 'possible_reversed_direction'
+    assert result['answer_verification']['status'] == 'review_suggested'
+    assert '7명에서 5명' in result['answer']
