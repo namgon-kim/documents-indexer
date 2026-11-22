@@ -222,12 +222,35 @@ _CONTEXT_REFERENCE = re.compile(
     # A determiner must be a separate word: 이스트, 그린, 저축 and 이익
     # are not references merely because they start with a demonstrative.
     r'(?:해당|그|이|저)\s+[가-힣A-Za-z]+(?=$|[^가-힣A-Za-z])|(?:첫|두|세|네)\s*번째|\b(?:it|they|them|those|these|previous|former|latter)\b)', re.IGNORECASE)
+_LOCAL_CLAUSE = re.compile(r'\d|(?:은|는|이|가|을|를|의|에서)(?=\s|[,.:;])|\b(?:is|are|was|were|has|have)\b', re.IGNORECASE)
+_NUMERIC_REFERENCE = frozenset({'수치', '값', '숫자', '비율', '금액', '인원', '건수', '차이', '결과', '합계', '변화'})
+_MEASURED_VALUE = re.compile(r'\d[\d,.]*(?![\d,.])(?!\s*(?:년|월|일|분기))')
+
+
+def _local_reference(question, match):
+    """Recognize a reference with a substantive antecedent in this question.
+
+    Keep ambiguous references contextual: a short preface such as '가격 말고'
+    does not establish what '그 서비스' denotes.
+    """
+    prefix = question[:match.start()].strip()
+    words = re.findall(r'[가-힣A-Za-z0-9]+', prefix)
+    if len(words) < 3 or not _LOCAL_CLAUSE.search(prefix):
+        return False
+    reference = match.group().strip()
+    if nominal := re.fullmatch(r'(?:해당|그|이|저)\s+([가-힣A-Za-z]+)', reference):
+        name = re.sub(r'(?:에서|으로|은|는|이|가|의|을|를|에|와|과|도|만)$', '', nominal.group(1))
+        if len(name) >= 2 and name in prefix:
+            return True
+        return bool(_MEASURED_VALUE.search(prefix) and name in _NUMERIC_REFERENCE)
+    return bool(reference in {'이것', '그것', '이거', '그거'} and _MEASURED_VALUE.search(prefix))
 
 
 def _needs_retrieval_context(question):
     # Short standalone questions can omit their subject, so retain history
     # when the intent cannot be resolved locally.
-    return bool(_CONTEXT_REFERENCE.search(question) or _GENERIC_FOLLOWUP.fullmatch(question)
+    references = list(_CONTEXT_REFERENCE.finditer(question))
+    return bool(any(not _local_reference(question, match) for match in references) or _GENERIC_FOLLOWUP.fullmatch(question)
                 or re.fullmatch(r'[가-힣A-Za-z]{1,8}(?:은|는|이|가|을|를)?[?？]', question))
 
 
@@ -381,8 +404,10 @@ class RagChat:
         limit = getattr(profile, "max_input_bytes", self.config.embedding_max_input_bytes)
         if not lexical_only and byte_size(question) > limit:
             raise IndexerError("QUERY_TOO_LONG", "현재 질문이 임베딩 입력 제한을 넘었습니다. 질문을 줄여 주세요.", 422)
-        previous = _retrieval_history(request.history, question) if _needs_retrieval_context(question) else []
+        needs_context = _needs_retrieval_context(question)
+        previous = _retrieval_history(request.history, question) if needs_context else []
         query = question
+        history_used_count = 0
         for item in reversed(previous):
             chars = 2000 - len(query) - 1
             budget = limit - byte_size(query) - 1 if not lexical_only else 8000
@@ -397,6 +422,13 @@ class RagChat:
             prefix = context_prefix(item, budget).strip()
             if prefix:
                 query = prefix + "\n" + query
+                history_used_count += 1
+        diagnostics.record('retrieval_query', {
+            'history_messages_available': len(request.history), 'history_items_selected': len(previous),
+            'history_items_used': history_used_count,
+            'history_used': query != question, 'context_dependency_detected': needs_context,
+            'question_bytes': byte_size(question), 'query_bytes': byte_size(query),
+        })
         search_request = SearchRequest(query=query, document_id=request.document_id,
                                        index_version=request.index_version, top_k=request.top_k,
                                        method=request.method, rerank=request.rerank,
