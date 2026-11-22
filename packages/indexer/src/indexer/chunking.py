@@ -6,7 +6,7 @@ from html import unescape
 from itertools import groupby, pairwise
 from uuid import NAMESPACE_URL, uuid5
 
-from openpyxl.utils.cell import coordinate_to_tuple
+from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
 from indexer.element_scope import same_scope, source_scope
 from indexer.embedding_input import (
@@ -107,6 +107,37 @@ def normalize_elements(raw_elements: list[dict], *, source_format: str | None = 
     return elements
 
 
+def _span(cell):
+    if cell.get('merged_range'):
+        return range_boundaries(cell['merged_range'])
+    return cell['column'], cell['row'], cell['column'], cell['row']
+
+
+def _header_paths(header_keys, cells):
+    """Map each column to its header cells from top to bottom, using merged spans."""
+    paths = defaultdict(list)
+    bottom = 0
+    for key in sorted(header_keys, key=lambda key: (_span(cells[key])[1], cells[key]['column'])):
+        left, _, right, last = _span(cells[key])
+        bottom = max(bottom, last)
+        for col in range(left, right + 1):
+            paths[col].append(cells[key])
+    return paths, bottom
+
+
+def _row_groups(cells, header_row):
+    """Rows covered by a single-column merge in the data area, mapped to its anchor."""
+    groups = defaultdict(list)
+    for cell in cells.values():
+        if cell['hidden_merged'] or not cell.get('merged_range') or cell['row'] <= header_row:
+            continue
+        left, top, right, bottom = range_boundaries(cell['merged_range'])
+        if left == right and bottom > top and cell['text'].strip():
+            for row in range(top + 1, bottom + 1):
+                groups[row].append(cell)
+    return groups
+
+
 def make_chunks(document_id: str, job_id: str, elements: list[dict], target_chars: int = 1200,
                 overlap_chars: int = 120, profile: str = "general", max_bytes: int = MAX_INPUT_BYTES) -> list[dict]:
     if not 400 <= target_chars <= 4000 or not 0 <= overlap_chars <= min(400, target_chars // 4):
@@ -119,7 +150,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
     title_context = set()
     for index, current in enumerate(elements):
         title = current.get('xlsx_region')
-        if not title or title['kind'] != 'title' or not confirmed(title):
+        if not title or title['kind'] != 'title':
             continue
         _, left = coordinate_to_tuple(title['start'])
         bottom, right = coordinate_to_tuple(title['end'])
@@ -141,7 +172,8 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 matches.append((following['element_id'], distance == 1 and row <= bottom + 2))
         for element_id, direct in matches:
             linked_titles[element_id] = (current, direct and len(matches) == 1)
-        if len(matches) == 1 and matches[0][1]:
+        # An inferred title is search context for the body but keeps its own chunk.
+        if len(matches) == 1 and matches[0][1] and confirmed(title):
             title_context.add(current['element_id'])
     relationships = table_relationships(elements)
     caption_tables = defaultdict(list)
@@ -239,10 +271,14 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 continue
             linked_title, direct_title = linked_titles.get(element['element_id'], (None, False))
             cells = {item['address']: item for item in region['cells']}
-            header_keys = region['headers'] if confirmed(region) else []
-            labels = {cells[key]['column']: cells[key] for key in header_keys}
-            header_row = max((cells[key]['row'] for key in header_keys), default=0)
-            title = region['title_text'] if confirmed(region) else None
+            # Inferred headers and titles come from source cells, so they serve as
+            # search context. Their relations stay unverified until the structure is
+            # confirmed, and only confirmed tables are offered to typed queries.
+            context_status = 'verified' if confirmed(region) else 'unverified'
+            header_keys = [key for key in region['headers'] if key in cells]
+            paths, header_row = _header_paths(header_keys, cells)
+            row_groups = _row_groups(cells, header_row)
+            title = region['title_text']
             if linked_title:
                 title = linked_title['xlsx_region']['title_text']
             prefix = context_prefix(' > '.join(dict.fromkeys(filter(None, [heading, title]))),
@@ -268,23 +304,30 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                 row_labels[value['address']] = label
                             else:
                                 ambiguous_pairs = True
+            grouped_rows = set()
             for item in sorted(cells.values(), key=lambda cell: (cell['row'], cell['column'])):
                 if not item['text'].strip():
                     continue
-                label = ''
-                label_source = None
-                if item['row'] > header_row and not item['hidden_merged']:
-                    label_source = labels.get(item['column'])
-                    if (region['kind'] == 'key_value' and confirmed(region)
-                            and item['address'] != region['title']):
-                        label_source = row_labels.get(item['address'])
-                if label_source:
-                    label = label_source['text']
-                relations = ([{'kind': 'row' if region['kind'] == 'key_value' else 'column',
-                               'text': label, 'element_id': element['element_id'], 'sheet': region['sheet'],
-                               'address': label_source['address'], 'origin': region['origin'],
-                               'status': 'unverified' if region['kind'] == 'key_value' else 'verified'}]
-                             if label_source else [])
+                sources, kind = [], 'column'
+                if item['row'] > header_row and not item['hidden_merged'] and item['address'] != region['title']:
+                    sources = paths.get(item['column'], [])
+                    if region['kind'] == 'key_value' and confirmed(region):
+                        sources, kind = ([row_labels[item['address']]] if item['address'] in row_labels else []), 'row'
+                relations = [{'kind': kind, 'text': source['text'], 'element_id': element['element_id'],
+                              'sheet': region['sheet'], 'address': source['address'], 'origin': region['origin'],
+                              'status': 'unverified' if kind == 'row' else context_status} for source in sources]
+                label = ' > '.join(source['text'] for source in sources)
+                groups = [] if item['row'] in grouped_rows else [
+                    group for group in row_groups.get(item['row'], []) if group['column'] != item['column']]
+                if groups:
+                    # A merged group label belongs to the whole row; add it once.
+                    grouped_rows.add(item['row'])
+                    context = [' '.join(filter(None, [' > '.join(s['text'] for s in paths.get(group['column'], [])),
+                                                      group['text']])) for group in groups]
+                    label = ' / '.join(filter(None, [*context, label]))
+                    relations = [{'kind': 'group', 'text': group['text'], 'element_id': element['element_id'],
+                                  'sheet': region['sheet'], 'address': group['address'], 'origin': region['origin'],
+                                  'status': context_status} for group in groups] + relations
                 parts.append({**item, 'label': label, 'label_origin': region['origin'] if label else 'source',
                               'label_relations': relations})
             rows = (list(row) for _, row in groupby(parts, key=lambda item: item['row'])) if profile == 'spreadsheet' else [parts]
@@ -295,7 +338,8 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 kind = region['kind'] if region['kind'] in {'title', 'code', 'key_value'} else 'table'
                 append_chunk('\n'.join(filter(None, [prefix, *(item['text'] for item in segments)])),
                              [element], number, kind, element['heading_path'], {
-                                 'representation_version': 'xlsx-structure-v5', 'xlsx_region_start': region['start'],
+                                 'representation_version': 'xlsx-structure-v6', 'xlsx_region_start': region['start'],
+                                 'xlsx_context_status': context_status,
                                  'xlsx_region_kind': region['kind'], 'xlsx_sheet': region['sheet'],
                                  'xlsx_context_cells': list(dict.fromkeys(key for key in [region['title'] if title else None, *header_keys,
                                      *(rel['address'] for part in group for rel in part['label_relations'])] if key)),

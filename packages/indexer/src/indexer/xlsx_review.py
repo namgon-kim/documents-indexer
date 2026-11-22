@@ -23,6 +23,9 @@ def sheet_detail(sheet):
     detail['charts'] = [{key: item.get(key) for key in ('title', 'type', 'start', 'end')} for item in sheet['charts']]
     if suggestion := sheet.get('suggested_review'):
         detail['suggested_review'] = {**suggestion, 'regions': [region_summary(item) for item in suggestion['regions']]}
+    if stale := sheet.get('stale_review'):
+        # A review that no longer matches the source, kept so the user can redo it.
+        detail['stale_review'] = stale
     return {**sheet_summary(sheet), **detail}
 
 

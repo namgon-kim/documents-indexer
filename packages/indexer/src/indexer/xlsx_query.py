@@ -1,8 +1,9 @@
 """Evaluate bounded, typed query plans over complete verified XLSX table ranges."""
 
 import math
+import unicodedata
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal, localcontext
 from typing import Literal
@@ -13,11 +14,13 @@ from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from indexer.contracts import IndexerError
+from indexer.parsing.xlsx_format import value_category
 from indexer.xlsx_structure import (
     STRUCTURE_VERSION,
     address,
     confirmed,
     contains,
+    header_layout,
     occupied,
     row_candidates,
     verification,
@@ -25,9 +28,13 @@ from indexer.xlsx_structure import (
 
 Scalar = str | bool | int | float
 NUMERIC = {'sum', 'average', 'min', 'max'}
+# Aggregates whose value changes when the same source row is read more than once.
+DUPLICATE_SENSITIVE = {'sum', 'average', 'distribution'}
 COLUMN = r'^[A-Z]{1,3}$'
 TABLE_START = r'^[A-Z]{1,3}[1-9][0-9]{0,6}$'
 Side = Literal['left', 'right']
+# Excel stores and compares numbers with 15 significant decimal digits.
+EXCEL_DIGITS = 15
 
 
 class TableFilter(BaseModel):
@@ -36,11 +43,16 @@ class TableFilter(BaseModel):
     side: Side = 'left'
     operator: Literal['eq', 'ne', 'lt', 'lte', 'gt', 'gte', 'contains', 'is_blank', 'not_blank']
     value: Scalar | None = None
+    # How a blank cell answers a value comparison. Without a choice, a blank cell
+    # fails eq, range and contains tests, while `ne` leaves it undecided.
+    blanks: Literal['include', 'exclude'] | None = None
 
     @model_validator(mode='after')
     def check_value(self):
         if (self.operator in {'is_blank', 'not_blank'}) != (self.value is None):
             raise ValueError('필터 연산자에 맞는 값을 지정해 주세요')
+        if self.blanks is not None and self.operator in {'is_blank', 'not_blank'}:
+            raise ValueError('빈 셀 조건에는 빈 셀 처리 방식을 따로 지정하지 않습니다')
         if isinstance(self.value, str) and len(self.value) > 1000:
             raise ValueError('필터 값이 너무 깁니다')
         return self
@@ -59,6 +71,9 @@ class QueryPlan(BaseModel):
     include_hidden_rows: bool = True
     offset: int = Field(default=0, ge=0, le=5000)
     limit: int = Field(default=100, ge=1, le=100)
+    # With a join: 'pairs' aggregates each joined row pair, 'left_rows'/'right_rows'
+    # count each source row once, and 'auto' uses pairs but reports duplicated values.
+    aggregate_unit: Literal['auto', 'pairs', 'left_rows', 'right_rows'] = 'auto'
 
     @model_validator(mode='after')
     def check_column(self):
@@ -144,11 +159,38 @@ def _kind(value_type):
     return 'number' if value_type in {'integer', 'number', 'duration'} else value_type
 
 
+def number_key(value):
+    """Compare integers exactly and binary floats at Excel's decimal precision."""
+    number = Decimal(str(value))
+    if isinstance(value, int):
+        return number
+    return Decimal(format(number, f'.{EXCEL_DIGITS}g'))
+
+
+def text_key(value):
+    return unicodedata.normalize('NFKC', value).strip().casefold()
+
+
+def _compare(relation, actual, expected):
+    if relation == 'eq':
+        return actual == expected
+    if relation == 'ne':
+        return actual != expected
+    if relation == 'lt':
+        return actual < expected
+    if relation == 'lte':
+        return actual <= expected
+    if relation == 'gt':
+        return actual > expected
+    return actual >= expected
+
+
 def _prepare_filter(rule, types):
+    """Return predicate(value, kind) -> (True | False | None, issue)."""
     value = rule.value
     relation = rule.operator
     if relation in {'is_blank', 'not_blank'}:
-        return lambda cell_value, _: (cell_value is None) == (relation == 'is_blank')
+        return lambda cell_value, _: ((cell_value is None) == (relation == 'is_blank'), None)
     if relation == 'contains' and (not isinstance(value, str) or 'string' not in types):
         raise ValueError('포함 필터에는 문자열 열과 값이 필요합니다')
     if isinstance(value, bool) and relation not in {'eq', 'ne'}:
@@ -157,8 +199,10 @@ def _prepare_filter(rule, types):
     for kind in types:
         if relation == 'contains' and kind != 'string':
             continue
-        if kind == 'boolean' and isinstance(value, bool) or kind == 'string' and isinstance(value, str) or kind == 'number' and type(value) in {float, int} and (type(value) is int or math.isfinite(value)):
+        if kind == 'boolean' and isinstance(value, bool) or kind == 'string' and isinstance(value, str):
             convert[kind] = value
+        elif kind == 'number' and type(value) in {float, int} and (type(value) is int or math.isfinite(value)):
+            convert[kind] = number_key(value)
         elif kind in TEMPORAL and isinstance(value, str):
             try:
                 parsed = TEMPORAL[kind].fromisoformat(value)
@@ -170,25 +214,44 @@ def _prepare_filter(rule, types):
         raise ValueError('필터 값의 타입이 표의 열과 일치하지 않습니다')
 
     def matches(cell_value, kind):
+        if kind == 'null':
+            if rule.blanks is not None:
+                return rule.blanks == 'include', None
+            # A blank cell is certainly not equal to, inside or within a range of a
+            # value. Whether it should count as "different" depends on the question.
+            return (None, 'blank_filter_value') if relation == 'ne' else (False, None)
         if kind not in convert:
-            return False if kind == 'null' else None
+            return None, 'filter_type_mismatch'
         expected = convert[kind]
-        actual = TEMPORAL[kind].fromisoformat(cell_value) if kind in TEMPORAL else cell_value
+        if kind in TEMPORAL:
+            actual = TEMPORAL[kind].fromisoformat(cell_value)
+        elif kind == 'number':
+            actual = number_key(cell_value)
+        else:
+            actual = cell_value
         if relation == 'contains':
-            return expected.casefold() in actual.casefold()
-        if relation == 'eq':
-            return actual == expected
-        if relation == 'ne':
-            return actual != expected
-        if relation == 'lt':
-            return actual < expected
-        if relation == 'lte':
-            return actual <= expected
-        if relation == 'gt':
-            return actual > expected
-        return actual >= expected
+            return text_key(expected) in text_key(actual), None
+        decision = _compare(relation, actual, expected)
+        if kind == 'string' and relation in {'eq', 'ne'} and actual != expected and text_key(actual) == text_key(expected):
+            # Values that differ only in case, width or surrounding spaces are
+            # neither silently matched nor silently excluded.
+            return None, 'text_variant'
+        return decision, None
 
     return matches
+
+
+def header_bottom(region, merged_ranges):
+    """The last row of the header band, including merged header cells."""
+    headers = set(region['headers'])
+    if not headers:
+        return None
+    rows = [coordinate_to_tuple(key)[0] for key in headers]
+    for ref in merged_ranges:
+        left, top, _, bottom = range_boundaries(ref)
+        if address(top, left) in headers:
+            rows.append(bottom)
+    return max(rows)
 
 
 def verified_tables(raw):
@@ -201,15 +264,34 @@ def verified_tables(raw):
         if not sheet['regions']:
             continue
         cells = occupied(sheet)
+        merged = {ref: range_boundaries(ref) for ref in sheet['merged_ranges']}
         for region in sheet['regions']:
             if region['kind'] == 'table' and confirmed(region):
-                left, _, right, _ = range_boundaries(f"{region['start']}:{region['end']}")
+                area = range_boundaries(f"{region['start']}:{region['end']}")
+                left, _, right, bottom = area
                 columns = {get_column_letter(col): None for col in range(left, right + 1)}
-                for key in region['headers']:
-                    columns[get_column_letter(coordinate_to_tuple(key)[1])] = cells[key]['display_text']
+                header_end = header_bottom(region, sheet['merged_ranges']) or 0
+                try:
+                    paths = header_layout(region['headers'], cells, merged, area)[2] if region['headers'] else {}
+                except ValueError:
+                    paths = {coordinate_to_tuple(key)[1]: [key] for key in region['headers']}
+                for col, path in paths.items():
+                    if path:
+                        columns[get_column_letter(col)] = ' > '.join(cells[key]['display_text'] for key in path)
+                formats = defaultdict(Counter)
+                last = bottom - region.get('totals_rows', 0)
+                for key, cell in cells.items():
+                    row, col = coordinate_to_tuple(key)
+                    if contains(area, (row, col)) and header_end < row <= last and key != region['title']:
+                        kind = cell['cached_value_type'] if cell['formula'] else cell['value_type']
+                        category = cell.get('value_category') or value_category(cell['number_format'], kind)
+                        if category not in {'null', 'error'}:
+                            formats[get_column_letter(col)][category] += 1
                 catalog.append({'sheet': sheet['name'], 'start': region['start'], 'end': region['end'],
                                 'title': cells[region['title']]['display_text'] if region['title'] else region['table_name'],
-                                'columns': columns, 'verification': verification(region)})
+                                'columns': columns, 'verification': verification(region),
+                                # Stored value kinds guide typed filters, e.g. 25% is stored as 0.25.
+                                'column_formats': {col: counts.most_common(1)[0][0] for col, counts in formats.items()}})
     return catalog
 
 
@@ -224,6 +306,10 @@ class TableData:
     populated: set
     hidden: set
     available_rows: set
+    # Cells covered by a vertical merge in the data area read the merge's value.
+    derived: dict = field(default_factory=dict)
+    # Table-level conditions that make results incomplete, e.g. unclear totals rows.
+    notes: Counter = field(default_factory=Counter)
 
     def column(self, key):
         number = column_index_from_string(key)
@@ -244,7 +330,8 @@ class TableData:
         for col in range(self.left, self.right + 1):
             value, kind, issue = self.get(row, col)
             record[get_column_letter(col)] = {'value': value if issue is None else None, 'type': kind,
-                                              'source': address(row, col), 'issue': issue}
+                                              'source': address(row, col), 'issue': issue,
+                                              **({'merged_from': self.derived[row, col]} if (row, col) in self.derived else {})}
         return record
 
 
@@ -277,10 +364,23 @@ def _read_table(raw, sheet_name, region_start, include_hidden, selected=None):
         raise ValueError('Excel에 등록된 표 또는 사용자가 확인한 표를 지정해 주세요')
     area = range_boundaries(f"{region['start']}:{region['end']}")
     left, top, right, bottom = area
-    start = max((coordinate_to_tuple(key)[0] + 1 for key in region['headers']), default=top)
+    band = header_bottom(region, sheet['merged_ranges'])
+    start = band + 1 if band is not None else top
     if region['title'] and coordinate_to_tuple(region['title'])[0] == start:
         start += 1
-    end = bottom - region['totals_rows']
+    notes = Counter()
+    totals = region.get('totals_rows', 0)
+    basis = region.get('totals_rows_basis', 'legacy' if totals else 'none')
+    if totals and basis != 'declared':
+        # Older artifacts derived a totals row from `totalsRowShown`; do not
+        # silently drop a possible data row without the declared count.
+        notes['totals_rows_unverified'] += 1
+    if basis == 'inconsistent':
+        notes['totals_rows_inconsistent'] += 1
+    if totals > max(0, bottom - start + 1):
+        notes['totals_rows_inconsistent'] += 1
+        totals = 0
+    end = bottom - totals
     data_area = left, start, right, end
     columns = None if selected is None or isinstance(raw, dict) else {column_index_from_string(key) for key in selected}
     if columns is not None and any(not left <= column <= right for column in columns):
@@ -304,24 +404,36 @@ def _read_table(raw, sheet_name, region_start, include_hidden, selected=None):
             available_rows.add(row)
         if issue in {None, 'excel_error'}:
             values[key] = value, kind
+    derived = {}
     for ref in sheet['merged_ranges']:
         a, b, c, d = range_boundaries(ref)
-        if contains(area, (b, a)):
-            for row in range(max(start, b), min(d, end) + 1):
-                for col in range(a, c + 1):
-                    if (row, col) != (b, a) and (columns is None or col in columns):
-                        problems.setdefault((row, col), 'covered_merge')
+        if not contains(area, (b, a)):
+            continue
+        # A single-column merge inside the data rows is a group label for the rows
+        # it spans. Other merges leave their covered cells without a value.
+        group = a == c and d > b and start <= b <= end and (b, a) in values and (b, a) not in problems
+        for row in range(max(start, b), min(d, end) + 1):
+            for col in range(a, c + 1):
+                if (row, col) == (b, a) or (columns is not None and col not in columns):
+                    continue
+                if group and (row, col) not in values and (row, col) not in problems:
+                    values[row, col] = values[b, a]
+                    derived[row, col] = address(b, a)
+                else:
+                    problems.setdefault((row, col), 'covered_merge')
     hidden = {row for row in sheet['hidden_rows'] if start <= row <= end}
     skipped = 0 if include_hidden else len(hidden)
     scope = {'sheet': sheet_name, 'start': region['start'], 'end': region['end'], 'verification': verification(region),
              'first_data_row': start if start <= end else None, 'last_data_row': end if start <= end else None,
              'populated_rows': len(populated), 'scanned_rows': max(0, end - start + 1) - skipped,
              'hidden_rows_excluded': skipped, 'includes_hidden_rows': include_hidden,
+             'totals_rows_excluded': totals, 'totals_rows_basis': basis, 'merged_group_cells': len(derived),
              'hidden_columns': [get_column_letter(col) for col in range(left, right + 1)
                                 if any(item['start'] is not None and item['end'] is not None
                                        and item['start'] <= col <= item['end'] for item in sheet['hidden_column_ranges'])],
              'excluded_cells': sorted(key for key in sheet['excluded'] if contains(area, coordinate_to_tuple(key)))}
-    return TableData(scope, left, right, values, problems, populated, set() if include_hidden else hidden, available_rows)
+    return TableData(scope, left, right, values, problems, populated, set() if include_hidden else hidden, available_rows,
+                     derived, notes)
 
 
 def join_candidates(raw, sheet, start, right_sheet, right_start):
@@ -508,40 +620,88 @@ def execute(raw, plan):
     if plan.operation == 'date_range' and (kinds := types(target)) and not kinds & {'date', 'datetime'}:
         raise ValueError('날짜 범위는 날짜 또는 일시 열에서 조회해 주세요')
 
-    matched, unknown, missing, blanks = 0, 0, 0, 0
-    rows, temporal, numbers = [], [], []
-    issues, distribution, group_counts = Counter(), Counter(), Counter()
-    group_numbers = defaultdict(list)
-    for pair in pairs:
-        evaluations = []
+    unit = plan.aggregate_unit
+    if not join and unit in {'pairs', 'right_rows'}:
+        raise ValueError('연결한 표가 있을 때 지정할 수 있는 집계 기준입니다')
+    if join and plan.operation == 'rows' and unit in {'left_rows', 'right_rows'}:
+        raise ValueError('행 목록은 연결된 행 쌍 기준으로 조회해 주세요')
+    resolved = ('pairs' if unit in {'auto', 'pairs'} else unit) if join else 'rows'
+
+    def evaluate(pair):
+        outcome, notes = True, []
         for selector, predicate in filters:
             value, kind, issue = read(pair, selector)
-            decision = None if issue else predicate(value, kind)
-            evaluations.append((decision, issue or 'filter_type_mismatch'))
-        if any(decision is False for decision, _ in evaluations):
+            decision, note = (None, issue) if issue else predicate(value, kind)
+            if decision is False:
+                return False, []
+            if decision is None:
+                outcome = None
+                notes.append(note or 'filter_type_mismatch')
+        return outcome, notes
+
+    # A unit is one aggregated item: a source row without a join, a joined pair,
+    # or one source row with all of its joined pairs.
+    units = []
+    if resolved in {'rows', 'pairs'}:
+        for pair in pairs:
+            outcome, notes = evaluate(pair)
+            units.append((pair, [pair] if outcome else [], outcome, notes))
+    else:
+        index = 0 if resolved == 'left_rows' else 1
+        grouped = defaultdict(list)
+        for pair in pairs:
+            grouped[pair[index]].append(pair)
+        for row in sorted(grouped):
+            evaluated = [(pair, *evaluate(pair)) for pair in grouped[row]]
+            passing = [pair for pair, outcome, _ in evaluated if outcome]
+            undecided = [notes for _, outcome, notes in evaluated if outcome is None]
+            outcome = True if passing else None if undecided else False
+            units.append((row, passing, outcome, [note for notes in undecided for note in notes] if not passing else []))
+    unit_side = 'right' if resolved == 'right_rows' else 'left'
+
+    def unit_value(item, passing, selector):
+        side, col = selector
+        if resolved in {'rows', 'pairs'}:
+            return read(item, selector), (side, item[0 if side == 'left' else 1])
+        if side == unit_side:
+            return tables[side].get(item, col), (side, item)
+        others = {pair[0 if side == 'left' else 1] for pair in passing}
+        if len(others) != 1:
+            # One source row joined to several rows has no single value on the other side.
+            return (None, 'null', 'multiple_join_values'), None
+        other = next(iter(others))
+        return tables[side].get(other, col), (side, other)
+
+    matched, unknown, missing, blanks = 0, 0, 0, 0
+    rows, temporal, numbers = [], [], []
+    issues, distribution, group_counts, used = Counter(), Counter(), Counter(), Counter()
+    group_numbers = defaultdict(list)
+    for item, passing, outcome, notes in units:
+        if outcome is False:
             continue
-        if any(decision is None for decision, _ in evaluations):
+        if outcome is None:
             unknown += 1
-            issues.update(issue for decision, issue in evaluations if decision is None)
+            issues.update(notes)
             continue
-        if plan.operation == 'count' and pair[0] not in left.available_rows:
+        anchor = item if resolved in {'left_rows', 'right_rows'} else item[0]
+        if plan.operation == 'count' and anchor not in tables[unit_side].available_rows:
             unknown += 1
             issues['unavailable_row'] += 1
             continue
         matched += 1
         if join_details:
-            join_details['matched_pairs'].append({'left_row': pair[0], 'right_row': pair[1]})
+            join_details['matched_pairs'].extend({'left_row': a, 'right_row': b} for a, b in passing)
         if plan.operation == 'rows' and plan.offset < matched <= plan.offset + plan.limit:
-            record = left.record(pair[0])
-            entry = {'row': pair[0], 'cells': record}
+            record = left.record(item[0])
+            entry = {'row': item[0], 'cells': record}
             issues.update(cell['issue'] for cell in record.values() if cell['issue'])
             if join_details:
-                entry['right_row'], entry['right_cells'] = pair[1], right.record(pair[1])
+                entry['right_row'], entry['right_cells'] = item[1], right.record(item[1])
                 issues.update(cell['issue'] for cell in entry['right_cells'].values() if cell['issue'])
             rows.append(entry)
         group_key = None
         if group:
-            value, kind, issue = read(pair, group)
+            (value, kind, issue), _ = unit_value(item, passing, group)
             if issue:
                 issues[issue] += 1
             else:
@@ -549,7 +709,9 @@ def execute(raw, plan):
                 group_counts[group_key] += 1
         if not target:
             continue
-        value, kind, issue = read(pair, target)
+        (value, kind, issue), source = unit_value(item, passing, target)
+        if source and not issue and kind != 'null':
+            used[source] += 1
         if issue:
             issues[issue] += 1
             missing += 1
@@ -567,7 +729,14 @@ def execute(raw, plan):
             issues['non_numeric' if plan.operation in NUMERIC else 'non_date'] += 1
             missing += 1
 
-    result = {'matched_rows': matched}
+    duplicated = sum(count > 1 for count in used.values())
+    if duplicated and unit == 'auto' and plan.operation in DUPLICATE_SENSITIVE:
+        # The same source value entered the aggregate through several joined pairs.
+        # Choose 'pairs' to aggregate per relation or a row unit to count it once.
+        issues['duplicated_join_values'] += duplicated
+    for table in tables.values():
+        issues.update(table.notes)
+    result = {'matched_rows': matched, 'aggregate_unit': resolved}
     if plan.operation == 'distribution':
         buckets = distribution.most_common(plan.limit)
         result.update(distribution=[{'type': kind, 'value': value, 'count': count} for (kind, value), count in buckets],

@@ -15,7 +15,7 @@ from indexer.xlsx_query import typed_table_cell, verified_tables
 from indexer.xlsx_review import cell_projection, sheet_detail, sheet_summary, window_response
 from indexer.xlsx_structure import STRUCTURE_VERSION, identity_rows, occupied
 
-INDEX_VERSION = 3
+INDEX_VERSION = 4
 CANDIDATE_LIMIT = 5000
 
 

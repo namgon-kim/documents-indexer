@@ -11,7 +11,8 @@ type Cell = {address: string; display_text: string; hidden_merged: boolean; merg
 type SheetSummary = {name: string; visibility: string; bounds: [number, number, number, number]};
 type Sheet = SheetSummary & {regions: Region[]; excluded: Record<string, string>;
   charts: {title: string | null; type: string}[]; boundary_candidates: {axis: string; after: number}[];
-  analysis_status?: string; suggested_review?: {regions: Region[]; excluded: Record<string, string>}};
+  analysis_status?: string; suggested_review?: {regions: Region[]; excluded: Record<string, string>};
+  stale_review?: {regions: Region[]; excluded: Record<string, string>; reason: string}};
 type Grid = {cells: Cell[]; row: number; column: number; last_row: number; last_column: number};
 const GRID_ROWS = 10;
 const GRID_COLUMNS = 8;
@@ -41,6 +42,7 @@ const analysis: Record<string, string> = {
   reviewed: "사용자 검토", cached: "저장된 모델 분석", analyzed: "모델 분석 완료", analyzed_uncached: "모델 분석 완료 · 캐시 저장 실패", disabled: "로컬 추정",
   input_limit: "모델 입력 한도 초과", sheet_limit: "모델 호출 시트 한도 도달", invalid_response: "모델 결과 검증 실패",
   incomplete: "모델 응답 미완료", review_required: "모델의 셀 제외 제안 검토 필요", provider_error: "모델 호출 실패", cache_unavailable: "분석 캐시 사용 불가",
+  review_reset: "검토 초기화 · 로컬 추정",
 };
 const newRegion: Region = {start: "", end: "", kind: "unknown", headers: [], title: null, uncertain: true};
 
@@ -133,6 +135,18 @@ export function XlsxStructure({session, documentId, jobId, disabled, onChanged}:
     } finally { setBusy(false); }
   }
 
+  async function reset() {
+    if (!sheet) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api<{job_id: string}>(url + "/reset", session, {sheets: [sheet.name]});
+      onChanged(result.job_id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "검토를 초기화하지 못했습니다.");
+    } finally { setBusy(false); }
+  }
+
   function update(position: number, fields: Partial<Region>) {
     setRegions(current => current.map((item, index) => index === position ? {...item, ...fields} : item));
   }
@@ -151,8 +165,15 @@ export function XlsxStructure({session, documentId, jobId, disabled, onChanged}:
       {sheet.analysis_status && <p>{analysis[sheet.analysis_status] ?? sheet.analysis_status}</p>}
       {!!sheet.charts.length && <p>차트 · {sheet.charts.map(item => item.title || item.type).join(", ")}</p>}
       {!!sheet.boundary_candidates.length && <p>경계 후보 · {sheet.boundary_candidates.map(item => `${item.axis === "row" ? "행" : "열"} ${item.after} 뒤`).join(", ")}</p>}
-      <p>시작·끝 셀은 범위에 포함됩니다. 표 헤더 주소는 열마다 하나씩 쉼표로 구분하세요.</p>
+      {sheet.stale_review && <p role="status">이전 검토가 새 원본과 맞지 않아 적용하지 않았습니다 · {sheet.stale_review.reason}</p>}
+      <p>시작·끝 셀은 범위에 포함됩니다. 표 헤더 주소는 쉼표로 구분하세요. 여러 행의 헤더와 병합된 헤더는 위쪽 행부터 모두 지정합니다.</p>
       <fieldset disabled={disabled || busy}>
+        {sheet.stale_review && <button type="button" className="secondary" onClick={() => {
+          setRegions(sheet.stale_review!.regions.map(region => ({...region, uncertain: true})));
+          setExcluded(sheet.stale_review!.excluded);
+        }}>이전 검토 불러오기</button>}
+        {sheet.analysis_status === "reviewed" && <button type="button" className="secondary"
+          onClick={() => void reset()}>이 시트 검토 초기화 후 새 작업 만들기</button>}
         {sheet.suggested_review && <button type="button" className="secondary" onClick={() => {
           setRegions(sheet.suggested_review!.regions.map(region => region.verification === "llm_validated"
             ? {...region, uncertain: true} : region));
