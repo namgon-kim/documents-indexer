@@ -26,8 +26,8 @@ def run_chat(tmp_path, history, question, response, *, enabled=True, method='hyb
     return searches[0].query, calls, trace['stages']['retrieval_query']
 
 
-def encoded(independent, query, reference=''):
-    return json.dumps({'independent': independent, 'query': query, 'resolved_reference': reference}, ensure_ascii=False)
+def encoded(independent, query):
+    return json.dumps({'independent': independent, 'query': query}, ensure_ascii=False)
 
 
 def test_independent_question_is_preserved_even_if_model_changes_it(tmp_path):
@@ -39,40 +39,64 @@ def test_independent_question_is_preserved_even_if_model_changes_it(tmp_path):
     assert question not in json.dumps(trace, ensure_ascii=False)
 
 
-def test_contextual_question_is_resolved_from_history(tmp_path):
-    history = [ChatMessage(role='user', content='나래 시스템을 소개해줘'),
-               ChatMessage(role='assistant', content='나래 시스템은 문서 관리 서비스입니다. [1]', citation_numbers=[1])]
-    question = '그 시스템의 주요 기능은?'
-    query, calls, trace = run_chat(tmp_path, history, question,
-                                   encoded(False, '나래 시스템의 주요 기능은?', '나래 시스템'))
-    assert query == '나래 시스템의 주요 기능은?' and len(calls) == 1
+def test_prompt_specifies_context_scope_and_preserves_relations(tmp_path):
+    history = [ChatMessage(role='user', content='나래 시스템 소개')]
+    _, calls, _ = run_chat(tmp_path, history, '그 기능은?', encoded(False, '나래 시스템 기능은?'))
+    prompt = calls[0]['messages'][0]['content']
+    for requirement in ('현재 질문만으로', '대상, 수치, 단위, 조건, 시점, 비교 방향, 순서와 의미적 관계',
+                        '필요하지 않은 내용', '확실하게 확인할 수 없으면', '추측하지 말고'):
+        assert requirement in prompt
+
+
+def test_contextual_pronoun_can_be_replaced_by_its_referent(tmp_path):
+    history = [ChatMessage(role='user', content='나래 서비스를 소개해줘'),
+               ChatMessage(role='assistant', content='나래 서비스는 문서 관리 서비스입니다. [1]', citation_numbers=[1])]
+    query, calls, trace = run_chat(tmp_path, history, '그것의 특징은?',
+                                   encoded(False, '나래 서비스의 특징은?'))
+    assert query == '나래 서비스의 특징은?' and len(calls) == 1
     assert trace['rewrite_status'] == 'rewritten' and trace['history_used']
     assert '[1]' not in calls[0]['messages'][1]['content']
 
 
-def test_ordinal_reference_uses_a_target_actually_in_the_history(tmp_path):
+def test_ordinal_reference_can_be_rewritten(tmp_path):
     history = [ChatMessage(role='assistant', content='1. 알파 서비스\n2. 베타 서비스')]
-    query, _, trace = run_chat(tmp_path, history, '두 번째 항목은?',
-                               encoded(False, '베타 서비스 항목은?', '베타 서비스'))
+    query, _, trace = run_chat(tmp_path, history, '두 번째 항목은?', encoded(False, '베타 서비스 항목은?'))
     assert query == '베타 서비스 항목은?' and trace['rewrite_status'] == 'rewritten'
 
 
+def test_rewriter_can_select_only_relevant_context(tmp_path):
+    history = [ChatMessage(role='assistant', content='나래 시스템과 별도의 교통 정보가 있습니다.')]
+    query, _, trace = run_chat(tmp_path, history, '그 시스템의 기능은?', encoded(False, '나래 시스템의 기능은?'))
+    assert query == '나래 시스템의 기능은?' and '교통' not in query
+    assert trace['rewrite_status'] == 'rewritten'
+
+
 @pytest.mark.parametrize('result', [
-    encoded(False, '나래 서비스의 예산 10억원은?', '나래 서비스'),
-    encoded(False, '나래 서비스의 예산 11만원은?', '나래 서비스'),
-    encoded(False, '가짜 서비스의 예산 10만원은?', '가짜 서비스'),
-    encoded(False, '나래 서비스의 예산 10만원과 보안은?', '나래 서비스'),
-    encoded(False, '나래 서비스의 예산 10만원과 X-22는?', '나래 서비스'),
     '{bad json',
-    json.dumps({'independent': False, 'query': 'missing reference'}),
+    json.dumps({'independent': False}),
+    json.dumps({'independent': 'false', 'query': '나래'}),
+    json.dumps({'independent': False, 'query': None}),
+    json.dumps({'independent': False, 'query': '   '}),
+    json.dumps({'independent': False, 'query': '유효하지 않은\x00검색어'}, ensure_ascii=False),
+    json.dumps({'independent': False, 'query': '가' * 2001}, ensure_ascii=False),
+    json.dumps({'independent': False, 'query': '가' * 1400}, ensure_ascii=False),
     httpx.ReadTimeout('timeout'),
 ])
-def test_untrusted_rewrite_falls_back_to_original(tmp_path, result):
-    question = '그 서비스의 예산 10만원은?'
+def test_invalid_model_response_falls_back_to_original(tmp_path, result):
+    question = '그 서비스의 예산은?'
     history = [ChatMessage(role='assistant', content='나래 서비스의 예산은 공개됩니다.')]
     query, _, trace = run_chat(tmp_path, history, question, result)
     assert query == question and not trace['history_used']
-    assert trace['rewrite_status'] in {'failed', 'invalid_response', 'validation_failed'}
+    assert trace['rewrite_status'] in {'failed', 'invalid_response'}
+
+
+def test_code_checks_format_not_semantic_truth(tmp_path):
+    # A syntactically valid model response is not a verification of its meaning.
+    history = [ChatMessage(role='assistant', content='나래 시스템과 교통 정보')]
+    question = '그 시스템은 100건에 200건을 추가했나요?'
+    changed = '나래 시스템은 200건에 100건을 추가했나요?'
+    query, _, trace = run_chat(tmp_path, history, question, encoded(False, changed))
+    assert query == changed and trace['rewrite_status'] == 'rewritten'
 
 
 def test_no_call_without_history_or_when_disabled(tmp_path):
@@ -103,7 +127,7 @@ def test_opt_in_search_and_rerank_use_rewritten_query_and_original_answer_questi
     def provider(request):
         payload = json.loads(request.content)
         calls.append(payload)
-        text = (encoded(False, '나래 시스템의 주요 기능은?', '나래 시스템') if len(calls) == 1 else '기능 설명 [1]')
+        text = encoded(False, '나래 시스템의 주요 기능은?') if len(calls) == 1 else '기능 설명 [1]'
         return httpx.Response(200, json={'choices': [{'message': {'content': text}}]})
     config = Config(tmp_path, external_processing=True, llm_api_key='key', chat_query_rewrite_enabled=True)
     with httpx.Client(transport=httpx.MockTransport(provider)) as client:
@@ -126,22 +150,6 @@ def test_rewrite_setting_persists_and_can_be_disabled(tmp_path):
     assert not apply_overrides(config).chat_query_rewrite_enabled
 
 
-def test_model_cannot_change_currency_even_if_other_currency_is_in_history(tmp_path):
-    question = '그 서비스의 예산 10만원은?'
-    history = [ChatMessage(role='assistant', content='나래 서비스 및 만엔 환율 정보')]
-    result = encoded(False, '나래 서비스의 예산 10만엔은?', '나래 서비스')
-    query, _, trace = run_chat(tmp_path, history, question, result)
-    assert query == question and trace['rewrite_status'] == 'validation_failed'
-
-
-def test_rewrite_does_not_replace_a_named_target_with_a_similar_one(tmp_path):
-    question = '그 서비스의 민원정보는?'
-    history = [ChatMessage(role='assistant', content='나래 서비스는 민원정보와 민원관리 기능을 제공합니다.')]
-    query, _, trace = run_chat(tmp_path, history, question,
-                               encoded(False, '나래 서비스의 민원관리는?', '나래 서비스'))
-    assert query == question and trace['rewrite_status'] == 'validation_failed'
-
-
 def test_rewrite_failure_is_visible_in_chat_response(tmp_path):
     retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': []})
     def provider(request):
@@ -155,11 +163,9 @@ def test_rewrite_failure_is_visible_in_chat_response(tmp_path):
 
 
 def test_truncated_rewrite_is_not_used(tmp_path):
-    calls = []
     def provider(request):
-        calls.append(request)
         return httpx.Response(200, json={'choices': [{'finish_reason': 'length', 'message': {
-            'content': encoded(False, '나래 시스템의 주요 기능은?', '나래 시스템')}}]})
+            'content': encoded(False, '나래 시스템의 주요 기능은?')}}]})
     seen = []
     retrieval = SimpleNamespace(search=lambda request: seen.append(request) or {'index_version': 'v', 'results': []})
     config = Config(tmp_path, external_processing=True, llm_api_key='key', chat_query_rewrite_enabled=True)
