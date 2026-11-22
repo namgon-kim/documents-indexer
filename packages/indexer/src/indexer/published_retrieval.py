@@ -8,6 +8,7 @@ from openpyxl.utils import get_column_letter
 from qdrant_client.http.exceptions import ApiException
 
 from indexer.contracts import IndexerError
+from indexer.parsing.normalization import cells_from, parse_table_html
 from indexer.search_engine import MAX_RESULT_LIMIT
 from indexer.table_evidence import HTML_CELL_RANGE, html_table_evidence_urls
 from indexer.visual_relations import xlsx_anchor_matches
@@ -274,6 +275,23 @@ class PublishedRetrieval:
                                         for start in range(0, len(xlsx_context), 100))
                 if chunk.get("source_range_quality") == HTML_CELL_RANGE and len(urls) == 1:
                     urls = html_table_evidence_urls(urls[0], chunk["source_segments"])
+                    label_ranges, label_cells = {}, {}
+                    for segment in chunk.get('table_segments', []):
+                        for rel in segment.get('label_relations', []):
+                            eid = rel.get('element_id')
+                            if eid not in label_cells:
+                                source = elements_by_job[key].get(eid, {})
+                                table = parse_table_html(source.get('html') or '').find('table')
+                                label_cells[eid] = ({(c.row + 1, c.column + 1): c for c in cells_from(table)}
+                                                    if table is not None and not table.find('table') else {})
+                            cell = label_cells[eid].get((rel.get('row'), rel.get('column')))
+                            if cell:
+                                label_ranges.setdefault(eid, set()).add((rel['row'], rel['column'], len(cell.text)))
+                    for eid, ranges in label_ranges.items():
+                        segments = [{'row': row, 'column': col, 'start': 0, 'end': end}
+                                    for row, col, end in sorted(ranges)]
+                        base = f'/v1/ingest/{document_id}/jobs/{job_id}/elements/{eid}'
+                        context_urls.extend(url for url in html_table_evidence_urls(base, segments) if url not in context_urls)
                 before_text = (before.get("body_text") or before["text"])[-600:] if before else ""
                 after_text = (after.get("body_text") or after["text"])[:600] if after else ""
                 context_text = "\n".join(filter(None, [chunk.get("heading_text"), before_text,

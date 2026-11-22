@@ -271,3 +271,44 @@ def test_paddle_headings_keep_context_through_chunks(tmp_path):
     for text, path in expected.items():
         chunk = next(item for item in chunks if text in item['body_text'])
         assert chunk['heading_path'] == path
+
+
+def test_table_local_subheadings_keep_source_relations_when_split():
+    html = ('<table><tr><th colspan="2">의견수렴</th><th colspan="2">조정</th></tr>'
+            '<tr><th>학생</th><th>교직원</th><th>공청회</th><th>전략</th></tr>'
+            '<tr>' + ''.join('<td>' + value * 15 + '</td>' for value in ('학생내용', '교직원내용', '공청회내용', '전략내용')) + '</tr>'
+            '<tr><td>산업체</td><td>지역사회</td><td>사업 조정</td><td>성과공유회</td></tr>'
+            '<tr>' + ''.join('<td>' + value * 15 + '</td>' for value in ('산업체내용', '지역사회내용', '사업내용', '공유내용')) + '</tr></table>')
+    elements = normalize_elements([{'category': 'table', 'page': 8, 'content': {'html': html}}])
+    chunks = make_chunks('d', 'j', elements, 400, 0)
+    segment = next(s for c in chunks for s in c['table_segments'] if '산업체내용' in s['value'])
+    assert '산업체' in segment['label'] and '학생' not in segment['label']
+    assert any(r['row'] == 4 and r['column'] == 1 and r['status'] == 'unverified'
+               and r['element_id'] == elements[0]['element_id'] for r in segment['label_relations'])
+    adapted = [part for c in chunks for part in (split_chunk(c, 256) if len(c['text'].encode()) > 256 else [c])]
+    assert any(r['row'] == 4 and r['column'] == 1 for c in adapted for s in c['table_segments']
+               if '산업체내용' in s['value'] for r in s['label_relations'])
+
+
+def test_row_label_relation_is_marked_as_inferred():
+    html = '<table><tr><th scope="col">대상</th><th scope="col">방법</th></tr><tr><td>학생</td><td>설문</td></tr></table>'
+    elements = normalize_elements([{'category': 'table', 'page': 1, 'content': {'html': html}}])
+    chunks = make_chunks('d', 'j', elements, 400, 0)
+    part = next(s for c in chunks for s in c['table_segments'] if s['value'] == '설문')
+    assert part['label_origin'] == 'inferred'
+    assert any(r['kind'] == 'row' and r['row'] == 2 and r['column'] == 1 and r['status'] == 'unverified'
+               for r in part['label_relations'])
+
+
+def test_poc_q14_saved_parser_table_has_local_candidate_headers():
+    from pathlib import Path
+
+    html = (Path(__file__).parent / 'fixtures' / 'poc_q14_table.html').read_text(encoding='utf8')
+    elements = normalize_elements([{'category': 'table', 'page': 8, 'content': {'html': html}}])
+    chunks = make_chunks('d', 'j', elements, 1000, 150)
+    parts = [part for chunk in chunks for part in chunk['table_segments']]
+    industry = next(part for part in parts if '현장실습 만족도 조사, 학과 교육과정위원회' in part['value'])
+    assert '산업체' in industry['label'] and '학생' not in industry['label']
+    assert any(rel['text'] == '산업체' and rel['row'] == 4 and rel['status'] == 'unverified'
+               for rel in industry['label_relations'])
+    assert all(not (part['value'] == '지역사회' and '산업체' in part['label']) for part in parts)

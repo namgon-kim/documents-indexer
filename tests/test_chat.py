@@ -112,3 +112,23 @@ def test_large_first_evidence_is_utf8_safe_and_cited(tmp_path):
     assert result["sources"][0]["evidence_truncated"]
     assert result["answer"] == "근거 일부 [1]"
     assert result["search_counts"]["evidence_bytes"] <= 4096
+
+
+def test_chat_passes_inferred_table_relations_and_accepts_legacy_hits(tmp_path):
+    relation = {'kind': 'row', 'text': '학생', 'element_id': 'e1', 'row': 2, 'column': 1,
+                'origin': 'inferred', 'status': 'unverified'}
+    hits = [{'filename': 'doc', 'source_refs': [], 'search_text': '학생 / 설문',
+             'table_segments': [{'row': 2, 'column': 2, 'label': '학생', 'label_relations': [relation]}]},
+            {'filename': 'old', 'source_refs': [], 'search_text': '이전 청크',
+             'table_segments': [{'row': 1, 'column': 1, 'label': '옛 라벨'}]}]
+    retrieval = SimpleNamespace(search=lambda _: {'results': hits, 'index_version': 'v'})
+    def provider(request):
+        body = json.loads(request.content)
+        items = json.loads(body['messages'][-1]['content'])['검색된 문서']
+        assert items[0]['표_라벨_관계'][0]['relations'][0] == relation
+        assert items[1]['표_라벨_관계'][0]['relations'] is None
+        assert '관계를 확정하지 마세요' in body['messages'][0]['content']
+        return httpx.Response(200, json={'choices': [{'message': {'content': '답변 [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
+            ChatRequest(message='질문'))

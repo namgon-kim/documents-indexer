@@ -95,6 +95,7 @@ export interface Hit {
   source_refs: { page?: number; kind: string; role?: "evidence" | "context"; table_rows?: [number, number]; status?: string; cells?: string[]; sheet?: string; cell?: string; start?: string; end?: string; slide?: number; section?: string | number; block?: number; paragraph?: number }[];
   evidence_urls: string[];
   context_urls?: string[];
+  table_segments?: {row: number; column: number; address?: string; label?: string; label_relations?: {text: string; row?: number; column?: number; address?: string; status: string}[]}[];
   related_images?: VisualItem[];
   source_url: string;
   quality: string;

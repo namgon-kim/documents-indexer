@@ -697,3 +697,40 @@ def test_legacy_candidate_page_skips_duplicate_groups_without_losing_order(tmp_p
         assert all(item['matching_rows'] == [100, 100] and item['ambiguous'] for item in page)
         page, _ = workbook.candidate_page('Table0', 'A1', 'Table1', 'A1', 4999, 100)
         assert len(page) == 1
+
+
+def test_reviewed_key_value_keeps_label_cell_after_embedding_split(tmp_path):
+    path = tmp_path / 'key-value.xlsx'
+    book = Workbook()
+    sheet = book.active
+    sheet['A1'], sheet['B1'] = '기준 버전', 'v1.94.0 ' * 150
+    book.save(path)
+    review = {'Sheet': {'regions': [region('A1', 'B1', kind='key_value')], 'excluded': {}}}
+    state = make_graph(None).invoke({'path': str(path), 'document_id': 'd', 'job_id': 'j',
+                                    'settings': SETTINGS, 'xlsx_review': review})
+    chunks = [c for c in state['chunks'] if any(s['address'] == 'B1' for s in c.get('table_segments', []))]
+    assert chunks
+    for chunk in chunks:
+        part = next(s for s in chunk['table_segments'] if s['address'] == 'B1')
+        assert part['label_relations'][0]['address'] == 'A1'
+        assert part['label_relations'][0]['status'] == 'unverified'
+        assert 'A1' in chunk['xlsx_context_cells']
+        if len(chunk['text'].encode()) > 256:
+            for split in split_chunk(chunk, 256):
+                assert all(s['label_relations'][0]['address'] == 'A1'
+                           for s in split['table_segments'] if s['address'] == 'B1')
+
+
+def test_reviewed_horizontal_key_value_pairs_do_not_share_labels(tmp_path):
+    path = tmp_path / 'pairs.xlsx'
+    book = Workbook()
+    sheet = book.active
+    sheet.append(['검토 기준', '공식 문서', '기준 버전', 'v1.94.0', '원본 항목', 77])
+    book.save(path)
+    review = {'Sheet': {'regions': [region('A1', 'F1', kind='key_value')], 'excluded': {}}}
+    state = make_graph(None).invoke({'path': str(path), 'document_id': 'd', 'job_id': 'j',
+                                    'settings': SETTINGS, 'xlsx_review': review})
+    parts = {s['address']: s for c in state['chunks'] for s in c.get('table_segments', [])}
+    assert [(parts[key]['label'], parts[key]['label_relations'][0]['address']) for key in ('B1', 'D1', 'F1')] == [
+        ('검토 기준', 'A1'), ('기준 버전', 'C1'), ('원본 항목', 'E1')]
+    assert not parts['C1']['label']

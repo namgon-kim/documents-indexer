@@ -7,6 +7,7 @@ import { ServerSettings } from "./ServerSettings";
 import { IngestionDocuments } from "./IngestionDocuments";
 import { DocumentChat } from "./DocumentChat";
 import { VisualAssets } from "./VisualAssets";
+import { TableRelations } from "./TableRelations";
 import type { ChatMessage } from "./DocumentChat";
 import indukLogo from "./assets/induk-logo.svg";
 import "./style.css";
@@ -322,6 +323,7 @@ function App() {
           <strong>{hit.filename.normalize("NFC")}</strong>
           <p className="hint">문서 {hit.document_id.slice(0, 8)} · 작업 {hit.job_id.slice(0, 8)} · {locationLabel(hit)}{hit.quality === "unverified" ? " · 구조 확인 필요" : ""}{hit.heading_path_origin === "inferred" ? " · 제목 계층 추정" : ""}</p>
           <p className="result-text">{hit.search_text}</p>
+          <TableRelations hit={hit}/>
           {!!hit.related_images?.length && session && <VisualAssets items={hit.related_images} session={session}/>}
           {(hit.context_before || hit.context_after) && <details><summary>앞뒤 문맥 보기</summary>{hit.context_before && <p className="result-text">앞 · {hit.context_before}</p>}{hit.context_after && <p className="result-text">뒤 · {hit.context_after}</p>}</details>}
           <button className="secondary" onClick={() => void viewEvidence(hit)}>근거 원문 보기</button>

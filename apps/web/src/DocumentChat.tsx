@@ -3,6 +3,7 @@ import type { FormEvent, ReactNode } from "react";
 import type { Hit } from "./api";
 import type { Session } from "./api";
 import { VisualAssets } from "./VisualAssets";
+import { TableRelations } from "./TableRelations";
 
 export type ChatMessage = {role: "user" | "assistant"; content: string; sources?: Hit[]; index_version?: string; search_counts?: {evidence_limited: boolean; evidence_omitted_count: number; context_omitted_count: number; evidence_truncated_count: number}};
 type Props = {
@@ -102,6 +103,7 @@ export function DocumentChat(props: Props) {
                 <header><b>[{number + 1}]</b><strong>{hit.filename.normalize("NFC")}</strong></header>
                 <p className="chat-source-location">{locationLabel(hit)}{hit.quality === "unverified" ? " · 구조 확인 필요" : ""}{hit.heading_path_origin === "inferred" ? " · 제목 계층 추정" : ""}</p>
                 <p className="chat-source-text">{hit.search_text}</p>
+          <TableRelations hit={hit}/>
                 {!!hit.related_images?.length && <VisualAssets items={hit.related_images} session={props.session}/>}
                 {(hit.context_before || hit.context_after) && <details><summary>앞뒤 문맥 보기</summary>
                   {hit.context_before && <p className="result-text">앞 · {hit.context_before}</p>}{hit.context_after && <p className="result-text">뒤 · {hit.context_after}</p>}</details>}
