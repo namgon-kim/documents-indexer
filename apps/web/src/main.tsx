@@ -202,7 +202,7 @@ function App() {
     try {
       const question = query.trim();
       const previous = messages.map(({role, content, sources}) => ({role, content: content.slice(0, 4000),
-        ...(role === "assistant" && sources ? {citation_numbers: sources.map((_, index) => index + 1)} : {})})).slice(-10);
+        ...(role === "assistant" && sources ? {citation_numbers: sources.map((_, index) => index + 1)} : {})})).slice(-50);
       setMessages(items => [...items, {role: "user", content: question}]);
       setQuery("");
       const response = await api<{ answer: string; sources: Hit[]; index_version: string; search_counts?: ChatMessage["search_counts"]; answer_verification?: ChatMessage["answer_verification"]; coverage?: ChatMessage["coverage"]; page_scope?: ChatMessage["page_scope"] }>("/v1/ingest-chat", session, {

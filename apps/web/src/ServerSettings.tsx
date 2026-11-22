@@ -46,6 +46,7 @@ const groups: Group[] = [
   ] },
   { id: "chat", title: "대화 모델", description: "대화에 사용할 모델을 선택하고 서버에서 제공할 모델 목록을 관리합니다.", fields: [
     ["llm_base_url", "LLM 기본 주소", "text"], ["llm_api_key", "LLM API 키", "secret"],
+    ["llm_context_tokens", "대화 모델 문맥 한도 (토큰)", "number", "8,192~2,000,000. 사용 가능한 모델 중 가장 작은 문맥 한도. 출력 공간을 남기며 입력은 보수적으로 추정합니다."],
   ] },
   { id: "xlsx", title: "Excel 구조 분석", description: "직접 추출에서 미확정 시트의 셀 값을 LLM으로 전송합니다. 외부 처리 허용과 LLM 연결이 필요하며, 실패 시 로컬 구조를 사용합니다.", fields: [
     ["xlsx_structure_enabled", "Excel 구조 모델 사용", "bool"],

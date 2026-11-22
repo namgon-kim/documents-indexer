@@ -12,6 +12,7 @@ _ROMAN_HEADING = re.compile(rf'^\s*{_ROMAN}(?:[.)]\s*|\s+)\S')
 _CHAPTER_HEADING = re.compile(r'^\s*제\s*\d+\s*[장편부](?:\s|[.)]|$)')
 _YEAR_TITLE = re.compile(r'^\s*(?:19|20)\d{2}\s+\S')
 _NUMBERED = re.compile(r'^\s*(\d{1,3}(?:\.\d{1,3})*)(?:\.(?=\s|$)|(?=\s|$))')
+_HYPHEN_NUMBERED = re.compile(r'^\s*(\d{1,3}(?:-\d{1,3})+)(?:[.)](?=\s|$)|(?=\s|$))')
 _SUBITEM = re.compile(r'^\s*(?:(\d+)\)|([가-힣])\.)(?:\s|$)')
 
 
@@ -21,7 +22,7 @@ class HeadingMarker:
     key: str | None = None
 
 
-def heading_marker(text, *, is_first=False, parser_label=None):
+def heading_marker(text, *, is_first=False, parser_label=None, hyphen_keys=()):
     """Classify only structural markers; unmatched text remains ambiguous."""
     if parser_label == 'doc_title':
         return HeadingMarker('root')
@@ -31,6 +32,10 @@ def heading_marker(text, *, is_first=False, parser_label=None):
         return HeadingMarker('root')
     if match := _SUBITEM.match(text):
         return HeadingMarker('subitem', 'number' if match.group(1) else 'korean')
+    if match := _HYPHEN_NUMBERED.match(text):
+        key = match.group(1)
+        if key in hyphen_keys:
+            return HeadingMarker('number', key.replace('-', '.'))
     if match := _NUMBERED.match(text):
         return HeadingMarker('number', match.group(1))
     return HeadingMarker('ambiguous')
@@ -43,10 +48,23 @@ def apply_flat_hierarchy(elements, *, preserve_explicit=False):
     sibling discards ambiguous descendants and resumes from its numbered parent.
     """
     stack = []
+    numbers = {match.group(1) for item in elements if item.get('kind') == 'heading'
+               if (match := _HYPHEN_NUMBERED.match(item.get('text', '')))}
+    hyphen_keys = set()
+    for number in numbers:
+        parent = number.rpartition('-')[0]
+        # A sibling sequence is evidence at any depth. Exclude year-like
+        # prefixes so a set of date headings is not mistaken for numbering.
+        if int(number.split('-')[0]) < 1000 and (parent in numbers or any(
+                other != number and other.rpartition('-')[0] == parent for other in numbers)):
+            hyphen_keys.add(number)
+            if parent in numbers:
+                hyphen_keys.add(parent)
     first_heading = True
     for item in elements:
         if item['kind'] == 'heading':
-            marker = heading_marker(item['text'], is_first=first_heading, parser_label=item.get('parser_label'))
+            marker = heading_marker(item['text'], is_first=first_heading, parser_label=item.get('parser_label'),
+                                    hyphen_keys=hyphen_keys)
             first_heading = False
             level = item.get('heading_level', 1)
             number_key = marker.key if marker.kind == 'number' else None

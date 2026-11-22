@@ -6,7 +6,7 @@ from uuid import NAMESPACE_URL, uuid5
 import httpx
 
 from indexer.contracts import IndexerError
-from indexer.embedding_input import byte_size, context_prefix, embedding_text, split_text
+from indexer.embedding_input import byte_size, embedding_text, heading_prefix, split_text
 from indexer.office_locations import set_xlsx_chunk_evidence
 from indexer.representation import table_groups
 from indexer.table_evidence import HTML_CELL_RANGE, set_html_table_evidence
@@ -40,7 +40,7 @@ def split_chunk(chunk, max_bytes):
     if segments:
         body = "\n".join(segment['text'] for segment in segments)
         original_prefix = text.removesuffix(body).rstrip()
-        prefix = context_prefix(original_prefix, max_bytes // 3)
+        prefix = heading_prefix(original_prefix.split(' > '), max_bytes // 3)
         source_parts = [{**segment, "row": segment["row"], "column": segment["column"],
                          "label": segment.get("label", ""), "text": segment.get("value", segment["text"]),
                          "label_origin": segment.get("label_origin", "parser")}
@@ -61,7 +61,7 @@ def split_chunk(chunk, max_bytes):
         # absent from heading_text. Preserve them when embedding resplits it.
         prefix = (text.removesuffix(body).rstrip() if chunk.get('source_range_quality') == 'normalized_element_text'
                   and text.endswith(body) else chunk.get('heading_text') or '')
-        heading = context_prefix(prefix, max_bytes // 3)
+        heading = heading_prefix(prefix.split(' > '), max_bytes // 3)
         available = max_bytes - byte_size(heading) - (1 if heading else 0)
         parts = [("\n".join(filter(None, [heading, value])), None) for value in
                  split_text(body, chars=max(1, len(body)), max_bytes=available)]
