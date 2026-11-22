@@ -351,3 +351,15 @@ def test_generated_claim_audit_uses_model_input_and_returns_review_cue(tmp_path)
     assert result['answer_verification']['warnings'][0]['code'] == 'possible_reversed_direction'
     assert result['answer_verification']['status'] == 'review_suggested'
     assert '7명에서 5명' in result['answer']
+
+
+def test_chat_flags_invalid_citation_before_redacting_it(tmp_path):
+    hit = {'filename': 'doc', 'source_refs': [], 'search_text': '인원 7명'}
+    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
+    def provider(_):
+        return httpx.Response(200, json={'choices': [{'message': {'content': '인원은 7명입니다. [5]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
+            ChatRequest(message='인원은?'))
+    assert '[근거 확인 불가]' in result['answer']
+    assert 'invalid_citation' in {warning['code'] for warning in result['answer_verification']['warnings']}

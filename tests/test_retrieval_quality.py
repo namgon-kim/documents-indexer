@@ -99,7 +99,8 @@ def test_chat_history_citations_and_invalid_new_citations(tmp_path):
         chat = RagChat(config, retrieval, client)
         answer = chat.invoke(ChatRequest(message="질문", history=[ChatMessage(role="user", content="사용자 [1] 원문"),
             ChatMessage(role="assistant", content="기존 답변 [1]", citation_numbers=[1])]))
-    assert answer["answer"] == "새 답 [1] 잘못된 [근거 확인 불가]"
+    assert answer["answer"].startswith("새 답 [1] 잘못된 [근거 확인 불가]")
+    assert answer["answer_verification"]["warnings"][0]["code"] == "invalid_citation"
 
 
 def test_embedding_progress_separates_current_document_from_corpus():
