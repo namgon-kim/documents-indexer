@@ -9,7 +9,15 @@ from uuid import NAMESPACE_URL, uuid5
 from openpyxl.utils.cell import coordinate_to_tuple
 
 from indexer.element_scope import same_scope, source_scope
-from indexer.embedding_input import MAX_INPUT_BYTES, byte_size, context_prefix, embedding_text, split_text
+from indexer.embedding_input import (
+    MAX_INPUT_BYTES,
+    byte_size,
+    context_prefix,
+    embedding_text,
+    split_text,
+    split_text_ranges,
+)
+from indexer.figure_text import figure_search_text
 from indexer.heading_hierarchy import apply_flat_hierarchy
 from indexer.inspection import is_page_label
 from indexer.office_locations import set_xlsx_chunk_evidence
@@ -50,11 +58,7 @@ def normalize_elements(raw_elements: list[dict]) -> list[dict]:
                     "\n".join(" / ".join([*item["ancestors"], item["text"]]) for item in items))
         kind = raw.get("category") if isinstance(raw.get("category"), str) else "other"
         if kind in {"figure", "chart", "image"}:
-            alternatives = [str(image.get("alt", "")).strip() for image in soup.find_all("img")]
-            provider_text = unescape(content.get("text") or "").strip()
-            for extra in [provider_text, *alternatives]:
-                if extra and extra not in text:
-                    text = "\n".join(filter(None, (text, extra)))
+            text = figure_search_text(soup, content.get("text"))
         heading = soup.find(re.compile(r"^h[1-6]$"))
         if kind.startswith("heading") or heading:
             subtype = raw.get("sub_category")
@@ -380,13 +384,16 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             flush()
             relation = figures[element["element_id"]]
             prefix = context_prefix(" > ".join(filter(None, [heading, relation["caption"]])), min(800, target_chars // 2, max_bytes // 3))
-            for part_number, part in enumerate(split_text(text, chars=max(1, target_chars - len(prefix) - 1),
-                                                           max_bytes=max_bytes - byte_size(prefix) - 1,
-                                                           overlap=overlap_chars)):
+            for part_number, (part, start, end) in enumerate(split_text_ranges(
+                    text, chars=max(1, target_chars - len(prefix) - 1),
+                    max_bytes=max_bytes - byte_size(prefix) - 1, overlap=overlap_chars)):
                 append_chunk("\n".join(filter(None, [prefix, part])), [element], part_number, "figure", element["heading_path"],
                              {"context_element_ids": [relation["caption_id"]], "relations": [{"type": "caption",
                               "origin": "inferred", "status": "unverified", "element_id": relation["caption_id"]}],
-                              "quality": "unverified"}, body_prefix=prefix)
+                              "quality": "unverified", "representation_version": "figure-structure-v2"}, body_prefix=prefix)
+                chunks[-1]['source_segments'] = [{'element_id': element['element_id'], 'order': element['order'],
+                                                  'text': part, 'start': start, 'end': end}]
+                chunks[-1]['source_range_quality'] = 'normalized_element_text'
             continue
         can_group = (kind in {"paragraph", "text", "list", "list_item", "other"} and source_scope(element) is not None
                      and profile != "spreadsheet" and (profile != 'slides' or bool(element.get('container_id')))
@@ -401,16 +408,21 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
         if can_group and len(text) <= budget and byte_size("\n".join(filter(None, [heading, text]))) <= max_bytes:
             pending.append(element)
             continue
-        groups = split_text(text, chars=budget, max_bytes=max_bytes - byte_size(heading) - 1,
-                            overlap=overlap_chars)
+        groups = split_text_ranges(text, chars=budget, max_bytes=max_bytes - byte_size(heading) - 1,
+                                   overlap=overlap_chars)
         extra = {"representation_version": TABLE_REPRESENTATION} if table else None
         if tables := caption_tables.get(element["element_id"]):
             extra = {"context_element_ids": tables,
                      "relations": [{"type": "caption_of", "origin": "inferred", "status": "unverified",
                                     "element_id": table_id} for table_id in tables]}
-        for part_number, part in enumerate(groups):
+        for part_number, (part, start, end) in enumerate(groups):
             append_chunk("\n".join(filter(None, (heading, part))), [element], part_number,
                          kind if kind in {"figure", "chart", "table"} else "text", element["heading_path"], extra)
+            if kind in {'figure', 'chart', 'image'}:
+                chunks[-1]['representation_version'] = 'figure-structure-v2'
+                chunks[-1]['source_segments'] = [{'element_id': element['element_id'], 'order': element['order'],
+                                                  'text': part, 'start': start, 'end': end}]
+                chunks[-1]['source_range_quality'] = 'normalized_element_text'
     flush()
     captions = {element["element_id"]: embedding_text(element["text"]) for element in elements
                 if element["kind"] == "caption" and element["text"]}

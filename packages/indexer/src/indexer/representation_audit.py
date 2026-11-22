@@ -26,7 +26,7 @@ def audit_representation(elements, chunks):
     for element in elements:
         if element.get('search_exclusion'):
             continue
-        if element.get("kind") in {"paragraph", "text", "list", "list_item"} and element.get("text"):
+        if element.get("kind") in {"paragraph", "text", "list", "list_item", "figure", "chart", "image"} and element.get("text"):
             original = set(re.findall(r"[^\W_]+", embedding_text(element["text"]).casefold()))
             represented_text = " ".join(embedding_text(chunk.get("body_text") or chunk["text"]).casefold()
                                        for chunk in chunks if element["element_id"] in chunk.get("element_ids", []))
