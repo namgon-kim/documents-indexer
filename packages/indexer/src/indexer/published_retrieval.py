@@ -2,7 +2,7 @@
 
 import json
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
@@ -198,51 +198,58 @@ class PublishedRetrieval:
         """Add bounded evidence from the same exact table, never an inferred continuation."""
         output = [dict(item) for item in results]
         seen = {item['chunk_id'] for item in output}
-        anchor = next((item for item in output if item.get('kind') == 'table'
-                       and len(item.get('element_ids', [])) == 1 and item.get('job_id')), None)
-        origin_id = anchor['chunk_id'] if anchor else None
-        if not anchor and output:
+        def group(item):
+            if item.get('kind') == 'table' and item.get('document_id') and item.get('job_id') and len(item.get('element_ids', [])) == 1:
+                return (item['document_id'], item['job_id'], item['element_ids'][0])
+            return None
+
+        anchors = {}
+        for item in output:
+            if key := group(item):
+                anchors.setdefault(key, (item, item['chunk_id']))
+        if not anchors and output:
             hit = output[0]
             if hit.get('document_id') and hit.get('job_id') and hit.get('heading_element_ids') and hit.get('page') is not None:
-                matches = [item for item in indexed.values() if item.get('kind') == 'table'
+                matches = [item for item in indexed.values() if group(item)
                            and item.get('document_id') == hit.get('document_id')
                            and item.get('job_id') == hit.get('job_id') and item.get('page') == hit.get('page')
                            and item.get('heading_path') == hit.get('heading_path')
-                           and item.get('heading_element_ids') == hit.get('heading_element_ids')
-                           and len(item.get('element_ids', [])) == 1]
-                if len({tuple(item['element_ids']) for item in matches}) == 1:
+                           and item.get('heading_element_ids') == hit.get('heading_element_ids')]
+                if len({group(item) for item in matches}) == 1:
                     matches.sort(key=lambda item: (item.get('part_number', 0), item['chunk_id']))
-                    anchor = matches[0] if matches else None
-                    origin_id = hit['chunk_id']
-        if not anchor:
-            return output
-        candidates = [item for item in indexed.values()
-                      if item.get('kind') == 'table' and item.get('document_id') == anchor.get('document_id')
-                      and item.get('job_id') == anchor.get('job_id')
-                      and item.get('element_ids') == anchor.get('element_ids')
-                      and item.get('chunk_id') not in seen]
-        candidates.sort(key=lambda item: (abs(item.get('part_number', 0) - anchor.get('part_number', 0)),
-                                          item.get('part_number', 0), item['chunk_id']))
-        budget = 9000
-        added = 0
-        for item in candidates:
-            if allowed_pages is not None and item.get('page') not in allowed_pages:
-                continue
-            if limit is not None and len(output) >= limit:
-                break
-            length = len(item.get('text', ''))
-            if not length or length > budget:
-                continue
-            output.append({**item, 'expanded_from': origin_id, 'expansion_reason': 'same_source_table'})
-            budget -= length
-            added += 1
-            if added >= 3:
-                break
-        complete = added == len(candidates)
+                    anchors[group(matches[0])] = (matches[0], hit['chunk_id'])
+        grouped = defaultdict(list)
+        for item in indexed.values():
+            key = group(item)
+            if key in anchors:
+                grouped[key].append(item)
+        queues = {}
+        for key, (anchor, _) in anchors.items():
+            queues[key] = deque(sorted((item for item in grouped[key] if item['chunk_id'] not in seen),
+                                 key=lambda item: (abs(item.get('part_number', 0) - anchor.get('part_number', 0)),
+                                                   item.get('part_number', 0), item['chunk_id'])))
+        budget, added = 9000, 0
+        # Share the existing global expansion budget across independently retrieved tables.
+        while added < 3 and any(queues.values()) and (limit is None or len(output) < limit):
+            for key, candidates in queues.items():
+                while candidates:
+                    item = candidates.popleft()
+                    if allowed_pages is not None and item.get('page') not in allowed_pages:
+                        continue
+                    length = len(item.get('text', ''))
+                    if not length or length > budget:
+                        continue
+                    output.append({**item, 'expanded_from': anchors[key][1], 'expansion_reason': 'same_source_table'})
+                    seen.add(item['chunk_id'])
+                    budget -= length
+                    added += 1
+                    break
+                if added >= 3 or (limit is not None and len(output) >= limit):
+                    break
         for item in output:
-            if (item.get('kind') == 'table' and item.get('document_id') == anchor.get('document_id')
-                and item.get('job_id') == anchor.get('job_id') and item.get('element_ids') == anchor.get('element_ids')):
-                item['table_expansion_complete'] = complete
+            key = group(item)
+            if key in anchors:
+                item['table_expansion_complete'] = all(candidate['chunk_id'] in seen for candidate in grouped[key])
         return output
 
     def search(self, request):
@@ -435,6 +442,28 @@ class PublishedRetrieval:
                              "related_images": related_images,
                              **({"xlsx_row_relations": row_relations} if row_relations else {}),
                              "source_refs": refs, "evidence_urls": urls, "context_urls": context_urls})
+            # Count indexed and returned chunks per exact source element. This describes
+            # only the published representation, not the completeness of the original file.
+            element_chunks = defaultdict(set)
+            relevant = {(hit.get('document_id'), hit.get('job_id'), eid) for hit in hits
+                        for eid in hit.get('element_ids', []) if hit.get('document_id') and hit.get('job_id')}
+            for item in indexed.values():
+                for eid in set(item.get('element_ids', [])):
+                    key = (item.get('document_id'), item.get('job_id'), eid)
+                    if key in relevant:
+                        element_chunks[key].add(item['chunk_id'])
+            returned_chunks = {item['chunk_id'] for item in hits}
+            for hit in hits:
+                scopes = []
+                for eid in dict.fromkeys(hit.get('element_ids', [])):
+                    key = (hit.get('document_id'), hit.get('job_id'), eid)
+                    ids = element_chunks.get(key, set())
+                    if ids:
+                        scopes.append({'element_id': eid, 'indexed_chunks': len(ids),
+                                       'returned_chunks': len(ids & returned_chunks),
+                                       'all_indexed_chunks_returned': ids <= returned_chunks})
+                if scopes:
+                    hit['element_scopes'] = scopes
             if counts is not None:
                 result["search_counts"] = {**counts, "ranked_count": len(result["results"]), "returned_count": len(hits)}
             if scope is not None:

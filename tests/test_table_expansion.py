@@ -91,3 +91,63 @@ def test_reranked_search_expands_table_with_configured_ranking(tmp_path):
         SearchRequest(query='표', method='bm25', rerank=True))['results']
     assert [hit['chunk_id'] for hit in hits] == ['0', '1', '2']
     assert all(hit['table_expansion_complete'] for hit in hits)
+
+
+def test_expansion_shares_budget_between_independent_ranked_tables():
+    first = [table(f'a{i}', element='a', part=i) for i in range(4)]
+    second = [table(f'b{i}', element='b', part=i) for i in range(4)]
+    chunks = first + second
+    result = PublishedRetrieval._expand_table([first[0], second[0]], {c['chunk_id']: c for c in chunks})
+    assert [c['chunk_id'] for c in result] == ['a0', 'b0', 'a1', 'b1', 'a2']
+    assert not result[0]['table_expansion_complete']
+    assert not result[1]['table_expansion_complete']
+
+
+def test_saved_q13_table_expands_into_model_input(tmp_path):
+    import json
+    from pathlib import Path
+
+    from indexer.bm25_index import BM25Index
+    from indexer.chat import _chat_evidence
+
+    chunks = json.loads((Path(__file__).parent / 'fixtures' / 'poc_q13_chunks.json').read_text())
+    index = BM25Index(tmp_path / 'q13.sqlite')
+    index.replace_document(chunks[0]['document_id'], chunks)
+    [ranked] = index.search('1-1-1 1차년도 추진 일정', 1)
+    lookup = {c['chunk_id']: c for c in chunks}
+    results = PublishedRetrieval._expand_table([lookup[ranked.chunk_id]], lookup)
+    hits = [{**c, 'filename': 'source.pdf', 'source_refs': [], 'search_text': c['text']} for c in results]
+    sources, context, counts = _chat_evidence(hits, 25, 32768)
+    assert len(sources) == 3 and counts['evidence_omitted_count'] == 0
+    text = '\n'.join(c['text'] for c in context)
+    for title in ('AI·DX 전공 교과목개발', '미래형 역량기반교육과정 개발',
+                  'AI·DX교양교육과정개발', '고숙련 전문기술인재양성',
+                  '학생안내애플리케이션', '학사제도 변경 대응'):
+        assert title in text
+    assert "'25.12-'26.02" in text and "'25.09-'26.02" in text
+
+
+def test_search_reports_list_fragment_coverage_without_removing_candidates(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from indexer.contracts import SearchRequest
+
+    chunks = [{**table('a', element='list'), 'kind': 'text', 'page': 1},
+              {**table('b', element='list', part=1), 'kind': 'text', 'page': 2},
+              {**table('c', element='other'), 'kind': 'text', 'page': 2}]
+    version = tmp_path / 'v'
+    version.mkdir()
+    (version / 'chunks.json').write_text(json.dumps(chunks))
+    doc = tmp_path / 'd1'
+    doc.mkdir()
+    (doc / 'document.json').write_text(json.dumps({'filename': 'source.pdf', 'format': 'pdf'}))
+    publisher = SimpleNamespace(root=tmp_path, search=lambda *args: {'index_version': 'v',
+                                                                    'results': [chunks[0], chunks[2]]})
+    storage = SimpleNamespace(document_dir=lambda _: doc, load_job=lambda *_: [
+        {'element_id': 'list', 'page': 1}, {'element_id': 'other', 'page': 2}])
+    result = PublishedRetrieval(publisher, storage).search(SearchRequest(query='목록', method='bm25'))
+    assert [hit['chunk_id'] for hit in result['results']] == ['a', 'c']
+    assert result['results'][0]['element_scopes'] == [
+        {'element_id': 'list', 'indexed_chunks': 2, 'returned_chunks': 1, 'all_indexed_chunks_returned': False}]
+    assert result['results'][1]['element_scopes'][0]['all_indexed_chunks_returned']

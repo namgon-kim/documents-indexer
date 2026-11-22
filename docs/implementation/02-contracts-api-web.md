@@ -32,6 +32,10 @@
 
 검색 결과 수 제한은 검색·재순위 결과에 적용하며, 이후 동일 원본 표의 추가 근거가 최대 3개 더 포함될 수 있다. 추가된 결과의 `expansion_reason`은 `same_source_table`, `expanded_from`은 기준 청크 ID다. `table_expansion_complete=false`는 색인에 있는 같은 표의 분할 청크가 일부 제외됐음을 뜻한다. 파싱 자체의 완전성은 보장하지 않는다.
 
+일반 검색의 각 근거에는 같은 문서·작업·원본 요소에 연결된 색인 청크 수와 반환 수를 `element_scopes`로 표시한다. 대화 근거에는 예산 적용 후 전체 텍스트가 모델에 들어간 청크 수와 잘림 여부를 `model_element_scopes`로 추가한다. 이는 게시 색인 내 조각에 대한 정보이며, 원문 추출이나 질문 대상 전체 범위가 완전하다는 뜻이 아니다. 예전 산출물에 요소 식별자가 없으면 범위는 미확인이다. 여러 표가 검색되면 기존 표 확장 예산을 표별로 나눠 적용한다.
+
+일반 대화 응답의 `coverage`는 검색 방식, 범위 판정 상태(`scope_complete=null`은 미확인), 검색·모델 근거 수, 색인 조각이 덜 전달된 원본 요소 수를 제공한다. 전체 조회 표현의 `full_scope_requested`는 안내를 위한 휴리스틱이며 검색 결과를 필터링하거나 확정 조회로 자동 전환하지 않는다. 확정 범위 계산은 `xlsx_full_table` 또는 XLSX 조회 API에서 사용자가 확인한 표를 지정해 수행한다. 모델 답변의 완전성이나 실제 과거 검색 로그의 복원까지 보장하지 않는다.
+
 관련 이미지 메타데이터는 검색 결과의 `related_images`에서 확인한다. 이미지 분석 청크는 최대 2개·4,000자까지 별도 근거로 추가될 수 있으며 `expansion_reason=related_image_analysis`와 관계의 출처·확인 상태가 제공된다. 작업의 `GET /v1/ingest/{document_id}/jobs/{job_id}/images`와 요소별 `.../elements/{element_id}/image`는 동일 인증을 요구한다. 이미지 원본은 작업 삭제 시 함께 삭제된다.
 
 `POST /v1/ingest/{document_id}/jobs/{job_id}/images/actions`는 이미지 요소 ID를 `analyze`, `original`, `both`, `exclude`, `reuse`, `describe`에 매핑한 `actions`, `describe`에 필요한 요소별 `descriptions` 및 선택적 `embedding_profile_id`를 받는다. 최대 100개를 선택할 수 있다. `reuse`는 저장된 이미지 분석 결과가 있을 때만 허용하며 외부 분석을 재호출하지 않는다. 미게시 검토 작업이면 같은 작업에 병합하고, 이미 게시된 작업이면 미게시 새 작업으로 분기한다. `describe`는 1~2,000자의 사용자 설명과 원본을 직접 연결한다. 본문 연결이 없는 원본은 설명을 입력해야 한다. 모든 확인 필요 이미지의 처리를 선택한 뒤 명시적으로 게시한다. 검색에서 제외된 분석 결과·관계·원본은 산출물로 유지한다.
