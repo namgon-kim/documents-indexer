@@ -281,3 +281,56 @@ def test_audit_records_truncated_heading_context():
     audit = audit_representation(elements, chunks)
     assert audit["shortened_heading_chunks"]
     assert any("본문" in item["text"] for item in chunks)
+
+
+def test_lexical_fusion_evaluation_compares_original_candidate_selection(tmp_path):
+    """Trace old append-and-truncate against fusion on a fixed corpus."""
+    index = BM25Index(tmp_path / 'fusion.sqlite')
+    chunks = [{'chunk_id': f'noise-{i:02}', 'text': f'AI 서비스 운영 자료 {i}'} for i in range(12)]
+    chunks += [{'chunk_id': 'learning', 'text': '학습지원시스템을 구축합니다'},
+               {'chunk_id': 'quota', 'text': 'Provider Allowlist를 설정합니다'},
+               {'chunk_id': 'korean', 'text': '교육혁신을 지원합니다'}]
+    index.replace_document('d', chunks)
+    cases = [('AI 학습지원시스템', 'learning'), ('AI Allowlist', 'quota'), ('AI 교육혁신', 'korean')]
+    old_recall = new_recall = 0
+    with sqlite3.connect(index.path) as db:
+        for query, expected in cases:
+            import re
+            terms = re.findall(r'[^\W_]+', query, flags=re.UNICODE)
+            match = ' OR '.join('"' + term + '"' for term in terms)
+            old = [row[0] for row in db.execute('SELECT chunk_id FROM chunks WHERE chunks MATCH ? ORDER BY bm25(chunks), chunk_id LIMIT 5', (match,))]
+            substring = ' OR '.join('"' + term + '"' for term in terms if len(term) >= 3)
+            extra = [row[0] for row in db.execute('SELECT chunk_id FROM substrings WHERE substrings MATCH ? ORDER BY bm25(substrings), chunk_id LIMIT 5', (substring,))]
+            old = (old + [key for key in extra if key not in old])[:5]
+            new = [hit.chunk_id for hit in index.search(query, 5)]
+            old_recall += expected in old
+            new_recall += expected in new
+            assert expected in extra and expected in new
+            assert len(new) <= 5 and len(set(new)) == len(new)
+    assert old_recall == 0 and new_recall == len(cases)
+
+
+def test_lexical_fusion_is_stable_deduplicated_and_document_scoped(tmp_path):
+    index = BM25Index(tmp_path / 'stable.sqlite')
+    index.replace_document('a', [{'chunk_id': key, 'text': 'AI 학습지원시스템 서비스는 2026년'} for key in ('z', 'b', 'a')])
+    index.replace_document('b', [{'chunk_id': 'other', 'text': 'AI 학습지원시스템 서비스는 2026년'}])
+    for query in ('AI 학습지원시스템', '서비스 AI', '2026 AI', normalize('NFD', '서비스 AI')):
+        hits = index.search(query, 3, 'a')
+        assert [hit.chunk_id for hit in hits] == ['a', 'b', 'z']
+        assert len({hit.chunk_id for hit in hits}) == 3
+        assert hits == index.search(query, 3, 'a')
+    assert index.search('학습지원시스템', 3, 'missing') == []
+
+
+def test_fusion_prefers_more_query_coverage_and_handles_mixed_terms(tmp_path):
+    index = BM25Index(tmp_path / 'coverage.sqlite')
+    index.replace_document('d', [
+        {'chunk_id': 'all', 'text': 'RAG 기반 서비스 운영과 2026년 계획'},
+        {'chunk_id': 'partial', 'text': 'RAG 기반 플랫폼 개선'},
+        {'chunk_id': 'other', 'text': '서비스 운영 문서'},
+    ])
+    for query in ('RAG 서비스 2026', normalize('NFD', 'RAG 서비스 2026'), 'rag 서비스 2026'):
+        hits = index.search(query, 3)
+        assert hits[0].chunk_id == 'all'
+        assert len(hits) == len({hit.chunk_id for hit in hits})
+    assert index.search('RAG 서비스 2026', 0) == []
