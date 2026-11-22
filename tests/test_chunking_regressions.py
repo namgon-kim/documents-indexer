@@ -1,4 +1,6 @@
 
+import itertools
+
 import httpx
 import pytest
 from indexer.chunking import make_chunks, normalize_elements
@@ -363,3 +365,135 @@ def test_single_column_unscoped_header_does_not_lower_quality():
     assert chunk['quality'] == 'extracted'
     value = next(part for part in chunk['table_segments'] if part['value'] == '김철수')
     assert value['label_relations'][0]['status'] == 'explicit'
+
+
+def test_saved_q4_figure_removes_duplicate_rendering_and_preserves_coverage():
+    import json
+    from pathlib import Path
+
+    from indexer.representation_audit import audit_representation
+
+    raw = json.loads((Path(__file__).parent / 'fixtures' / 'poc_q4_figure.json').read_text(encoding='utf8'))
+    old_html, old_text = raw['content']['html'], raw['content']['text']
+    elements = normalize_elements([raw])
+    assert raw['content']['html'] == old_html and raw['content']['text'] == old_text
+    normalized = elements[0]['text']
+    assert normalized.count('Figure Type: flowchart') == 1
+    assert '/image/placeholder' not in normalized
+    assert all(value in normalized for value in ('학위', '수료증', '인증서', '자율전공학과'))
+    chunks = make_chunks('d', 'j', elements, 400, 90)
+    assert len(chunks) > 1 and not audit_representation(elements, chunks)['missing_text_terms']
+    for chunk in chunks:
+        [source] = chunk['source_segments']
+        assert source['text'] == normalized[source['start']:source['end']]
+        assert chunk['source_range_quality'] == 'normalized_element_text'
+        assert '/image/placeholder' not in chunk['text']
+    assert any(a['source_segments'][0]['end'] > b['source_segments'][0]['start']
+               for a, b in itertools.pairwise(chunks))
+
+
+def test_figure_keeps_unique_information_in_both_renderings():
+    raw = {'category': 'figure', 'content': {'html': '<figure><figcaption><p>공통 설명 문구입니다</p><p>HTML 전용 수치 10</p></figcaption><img alt="대체 설명"></figure>',
+           'text': '![image](/image/placeholder)\n- 공통 설명 문구입니다\n- TEXT 전용 수치 20'}}
+    text = normalize_elements([raw])[0]['text']
+    assert text.count('공통 설명 문구입니다') == 1
+    assert all(value in text for value in ('HTML 전용 수치 10', 'TEXT 전용 수치 20', '대체 설명'))
+    assert '/image/placeholder' not in text
+
+
+def test_overlap_starts_at_word_boundaries_and_ranges_are_exact():
+    from indexer.embedding_input import split_text_ranges
+
+    text = ' '.join(['교육과정', '인증서', '프로그램', '학위'] * 100)
+    ranges = list(split_text_ranges(text, chars=70, max_bytes=210, overlap=17))
+    assert len(ranges) > 2
+    for part, start, end in ranges:
+        assert part == text[start:end]
+        assert start == 0 or text[start - 1].isspace()
+        assert end == len(text) or text[end].isspace()
+    assert all(a[2] >= b[1] for a, b in itertools.pairwise(ranges))
+
+
+def test_figure_resplit_retains_normalized_source_offsets():
+    html = '<figure><figcaption>' + '항목 인증서 교육 프로그램 ' * 70 + '</figcaption></figure>'
+    elements = normalize_elements([{'category': 'figure', 'content': {'html': html}}])
+    chunks = make_chunks('d', 'j', elements, 400, 0)
+    parts = [part for chunk in chunks for part in split_chunk(chunk, 256)]
+    for part in parts:
+        source = part['source_segments'][0]
+        assert part['source_range_quality'] == 'normalized_element_text'
+        assert source['text'] == elements[0]['text'][source['start']:source['end']]
+
+
+def test_figure_dedup_keeps_changed_claim_and_literal_markdown_content():
+    raw = {'category': 'figure', 'content': {
+        'html': '<figure><figcaption><p>공통 핵심 수치 10</p><p>공통 설명</p></figcaption></figure>',
+        'text': '- 공통 핵심 수치 20\n- **공통 설명**\n- 함수 __init__ 및 [설정](https://example.test/config)'}}
+    text = normalize_elements([raw])[0]['text']
+    assert '공통 핵심 수치 10' in text and '공통 핵심 수치 20' in text
+    assert text.count('공통 설명') == 1
+    assert '__init__' in text and 'https://example.test/config' in text
+
+
+def test_oversized_single_word_splits_only_when_necessary():
+    from indexer.embedding_input import split_text_ranges
+
+    text = '인증서' * 100
+    ranges = list(split_text_ranges(text, chars=100, max_bytes=60, overlap=10))
+    assert len(ranges) > 1
+    assert all(part == text[start:end] and len(part.encode()) <= 60 for part, start, end in ranges)
+    assert ''.join(part for part, _, _ in ranges) == text
+
+
+def test_figure_deduplicates_complete_sentences_and_retains_extra_sentence():
+    raw = {'category': 'figure', 'content': {
+        'html': '<figure><figcaption>공통 설명입니다.</figcaption></figure>',
+        'text': '공통 설명입니다. 독립적인 추가 설명입니다.'}}
+    text = normalize_elements([raw])[0]['text']
+    assert text.count('공통 설명입니다.') == 1
+    assert '독립적인 추가 설명입니다.' in text
+
+
+def test_figure_caption_and_offsets_survive_embedding_resplit():
+    caption = row('caption', '그림 1 운영 흐름', 1)
+    figure = {'category': 'figure', 'page': 1, 'content': {
+        'html': '<figure><figcaption>' + '항목 인증서 교육 프로그램 ' * 50 + '</figcaption></figure>'}}
+    elements = normalize_elements([caption, figure])
+    chunks = [chunk for chunk in make_chunks('d', 'j', elements, 400, 0) if chunk['kind'] == 'figure']
+    assert chunks and '그림 1 운영 흐름' in chunks[0]['text']
+    split = split_chunk(chunks[0], 256)
+    for part in split:
+        source = part['source_segments'][0]
+        assert '그림 1 운영 흐름' in part['text']
+        assert source['text'] == elements[1]['text'][source['start']:source['end']]
+        assert part['context_element_ids'] == [elements[0]['element_id']]
+
+
+def test_q4_search_recall_before_and_after_figure_dedup(tmp_path):
+    import json
+    from pathlib import Path
+
+    from indexer.bm25_index import BM25Index
+
+    raw = json.loads((Path(__file__).parent / 'fixtures' / 'poc_q4_figure.json').read_text(encoding='utf8'))
+    new_elements = normalize_elements([raw])
+    old_elements = normalize_elements([raw])
+    old_elements[0]['text'] = (' '.join(parse_table_html(raw['content']['html']).stripped_strings)
+                               + '\n' + raw['content']['text'].strip())
+    for name, elements in [('old', old_elements), ('new', new_elements)]:
+        chunks = make_chunks('d', name, elements, 400, 0)
+        index = BM25Index(tmp_path / f'{name}.sqlite')
+        index.replace_document('d', chunks)
+        for query in ('인증서', '수료증', '프로그램', '학위'):
+            found = index.search(query, 5)
+            assert any(query in chunk['text'] for chunk in chunks if chunk['chunk_id'] in {hit.chunk_id for hit in found})
+        if name == 'new':
+            assert all('/image/placeholder' not in chunk['text'] for chunk in chunks)
+            assert sum(chunk['text'].count('Figure Type') for chunk in chunks) == 1
+
+
+def test_figure_alt_is_not_lost_as_partial_substring():
+    raw = {'category': 'figure', 'content': {
+        'html': '<figure><figcaption>100건</figcaption><img alt="10"></figure>'}}
+    text = normalize_elements([raw])[0]['text']
+    assert text.splitlines() == ['100건', '10']

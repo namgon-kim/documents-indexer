@@ -56,8 +56,12 @@ def split_chunk(chunk, max_bytes):
                          for item in group]
             parts.append(("\n".join(filter(None, [prefix, *(item["text"] for item in converted)])), converted))
     else:
-        heading = context_prefix(chunk.get("heading_text") or "", max_bytes // 3)
         body = embedding_text(chunk.get("body_text") or text)
+        # Figure captions can be part of the actual prefix even when they are
+        # absent from heading_text. Preserve them when embedding resplits it.
+        prefix = (text.removesuffix(body).rstrip() if chunk.get('source_range_quality') == 'normalized_element_text'
+                  and text.endswith(body) else chunk.get('heading_text') or '')
+        heading = context_prefix(prefix, max_bytes // 3)
         available = max_bytes - byte_size(heading) - (1 if heading else 0)
         parts = [("\n".join(filter(None, [heading, value])), None) for value in
                  split_text(body, chars=max(1, len(body)), max_bytes=available)]
@@ -93,7 +97,13 @@ def split_chunk(chunk, max_bytes):
             start = original_body.find(body_fragment, search_cursor)
             if start >= 0:
                 search_cursor = start + len(body_fragment)
-            if start >= 0 and sources:
+            if (start >= 0 and len(sources) == 1 and chunk.get('source_range_quality') == 'normalized_element_text'
+                    and embedding_text(sources[0]['text']) == original_body):
+                source_start = sources[0]['start'] + start
+                item['source_segments'] = [{**sources[0], 'text': body_fragment, 'start': source_start,
+                                            'end': source_start + len(body_fragment)}]
+                item['source_range_quality'] = 'normalized_element_text'
+            elif start >= 0 and sources:
                 offsets, cursor = [], 0
                 for source in sources:
                     source_text = embedding_text(source["text"])
