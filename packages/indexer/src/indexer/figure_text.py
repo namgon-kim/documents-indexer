@@ -8,18 +8,31 @@ from indexer.parsing.normalization import readable
 
 # This is the parser's synthetic marker, not a reference to an extracted asset.
 PLACEHOLDER = re.compile(r'!\[[^\]]*\]\(/image/placeholder(?:\?[^)]*)?\)', re.IGNORECASE)
-LIST_MARKER = re.compile(r'(?m)^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)')
+LIST_MARKER = re.compile(r'(?m)^[ \t]*[-*+][ \t]+')
 
 
 def _provider_text(value):
     text = PLACEHOLDER.sub('', unescape(value or ''))
-    text = LIST_MARKER.sub('', text)
     return embedding_text(text)
 
 
 def _comparison_text(value):
+    # Bullet glyphs are presentation; numeric markers may convey order or year.
+    value = LIST_MARKER.sub('', value)
     value = re.sub(r'(?<!\w)\*\*(?=\S)(.+?)(?<=\S)\*\*(?!\w)', r'\1', value)
-    return ' '.join(embedding_text(value).casefold().split())
+    return ' '.join(embedding_text(value).split())
+
+
+def _sentences(line):
+    start = 0
+    for boundary in re.finditer(r'(?<=[.!?。！？])(?=\s)', line):
+        # A number followed by a dot may be an ordered item or a year, not
+        # the end of a sentence. Keep it attached to the following text.
+        if re.search(r'(?<!\w)\d+\.$', line[start:boundary.start()]):
+            continue
+        yield line[start:boundary.start()]
+        start = boundary.start()
+    yield line[start:]
 
 
 def figure_search_text(soup, provider):
@@ -30,7 +43,7 @@ def figure_search_text(soup, provider):
     normalized_html = ' ' + _comparison_text(html) + ' '
     extra_lines = []
     for line in provider.splitlines():
-        for sentence in re.split(r'(?<=[.!?。！？])(?=\s)', line):
+        for sentence in _sentences(line):
             sentence = sentence.strip()
             if sentence and ' ' + _comparison_text(sentence) + ' ' not in normalized_html:
                 extra_lines.append(sentence)

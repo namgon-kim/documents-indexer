@@ -497,3 +497,53 @@ def test_figure_alt_is_not_lost_as_partial_substring():
         'html': '<figure><figcaption>100건</figcaption><img alt="10"></figure>'}}
     text = normalize_elements([raw])[0]['text']
     assert text.splitlines() == ['100건', '10']
+
+
+def test_figure_keeps_provider_numbered_items_and_years():
+    raw = {'category': 'figure', 'content': {'html': '<figure></figure>',
+           'text': '2026. 추진 계획\n1. 학위\n2. 수료증\n01) 첫째 항목\n- 별도 내용'}}
+    source = raw['content']['text']
+    elements = normalize_elements([raw])
+    text = elements[0]['text']
+    assert all(item in text for item in ('2026. 추진 계획', '1. 학위', '2. 수료증', '01) 첫째 항목', '- 별도 내용'))
+    assert raw['content']['text'] == source
+    chunks = make_chunks('d', 'j', elements, 400, 0)
+    assert all(item in ' '.join(c['text'] for c in chunks) for item in ('2026', '1. 학위', '2. 수료증', '01) 첫째 항목'))
+    for chunk in chunks:
+        source_part = chunk['source_segments'][0]
+        assert source_part['text'] == text[source_part['start']:source_part['end']]
+
+
+def test_figure_dedup_does_not_drop_numbers_when_html_lacks_them():
+    raw = {'category': 'figure', 'content': {
+        'html': '<figure><figcaption><p>추진 계획</p><p>학위</p><p>수료증</p></figcaption></figure>',
+        'text': '2026. 추진 계획\n1. 학위\n2. 수료증'}}
+    text = normalize_elements([raw])[0]['text']
+    assert all(item in text for item in ('2026. 추진 계획', '1. 학위', '2. 수료증'))
+
+
+def test_figure_dedup_handles_numbered_and_unnumbered_sources_safely():
+    raw = {'category': 'figure', 'content': {
+        'html': '<figure><figcaption><p>1. 설치 단계</p><p>2. 검증 단계</p><p>공통 설명</p><p>US</p></figcaption></figure>',
+        'text': '1. 설치 단계\n2. 검증 단계\n- 공통 설명\n- us\n3. 독립 단계'}}
+    text = normalize_elements([raw])[0]['text']
+    assert text.count('1. 설치 단계') == text.count('2. 검증 단계') == 1
+    assert text.count('공통 설명') == 1
+    assert 'US' in text and '- us' in text and '3. 독립 단계' in text
+
+
+def test_numbered_figure_items_remain_searchable_with_source_ranges(tmp_path):
+    from indexer.bm25_index import BM25Index
+
+    raw = {'category': 'figure', 'content': {'html': '<figure><figcaption>추진 계획 학위 수료증</figcaption></figure>',
+           'text': '2026. 추진 계획\n1. 학위\n2. 수료증\n01) 첫째 항목'}}
+    element = normalize_elements([raw])[0]
+    chunks = make_chunks('d', 'j', [element], 400, 0)
+    index = BM25Index(tmp_path / 'numbered.sqlite')
+    index.replace_document('d', chunks)
+    for query in ('2026', '01', '1. 학위', '2. 수료증'):
+        hits = index.search(query, 5)
+        assert hits
+        assert all(chunk['source_segments'][0]['text'] == element['text'][
+            chunk['source_segments'][0]['start']:chunk['source_segments'][0]['end']]
+            for chunk in chunks if chunk['chunk_id'] in {hit.chunk_id for hit in hits})

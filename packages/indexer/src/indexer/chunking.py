@@ -390,7 +390,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 append_chunk("\n".join(filter(None, [prefix, part])), [element], part_number, "figure", element["heading_path"],
                              {"context_element_ids": [relation["caption_id"]], "relations": [{"type": "caption",
                               "origin": "inferred", "status": "unverified", "element_id": relation["caption_id"]}],
-                              "quality": "unverified", "representation_version": "figure-structure-v1"}, body_prefix=prefix)
+                              "quality": "unverified", "representation_version": "figure-structure-v2"}, body_prefix=prefix)
                 chunks[-1]['source_segments'] = [{'element_id': element['element_id'], 'order': element['order'],
                                                   'text': part, 'start': start, 'end': end}]
                 chunks[-1]['source_range_quality'] = 'normalized_element_text'
@@ -419,7 +419,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             append_chunk("\n".join(filter(None, (heading, part))), [element], part_number,
                          kind if kind in {"figure", "chart", "table"} else "text", element["heading_path"], extra)
             if kind in {'figure', 'chart', 'image'}:
-                chunks[-1]['representation_version'] = 'figure-structure-v1'
+                chunks[-1]['representation_version'] = 'figure-structure-v2'
                 chunks[-1]['source_segments'] = [{'element_id': element['element_id'], 'order': element['order'],
                                                   'text': part, 'start': start, 'end': end}]
                 chunks[-1]['source_range_quality'] = 'normalized_element_text'
