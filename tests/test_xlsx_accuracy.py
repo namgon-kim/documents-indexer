@@ -182,17 +182,19 @@ def test_group_context_follows_each_cell_into_split_chunks(tmp_path):
     path = tmp_path / 'groups.xlsx'
     book = Workbook()
     sheet = book.active
-    sheet.append(['지역', '상반기 판매 실적', '하반기 판매 실적', '연간 판매 실적'])
-    sheet.append(['서울특별시', 10, 20, 30])
-    sheet.append([None, 40, 50, 90])
+    sheet.append(['지역', '상반기 판매 실적', '하반기 판매 실적', '연간 판매 실적', '분기 평균 실적', '전년 대비 증감'])
+    sheet.append(['서울특별시', 10, 20, 30, 7, 8])
+    sheet.append([None, 40, 50, 90, 22, 23])
     sheet.merge_cells('A2:A3')
     book.save(path)
     state = native(path)
     chunk = next(c for c in state['chunks'] if any(s['address'] == 'D3' for s in c.get('table_segments', [])))
     labels = {s['address']: s['label'] for s in chunk['table_segments']}
-    assert labels == {'B3': '지역 서울특별시 / 상반기 판매 실적', 'C3': '하반기 판매 실적', 'D3': '연간 판매 실적'}
+    assert labels == {'B3': '지역 서울특별시 / 상반기 판매 실적', 'C3': '하반기 판매 실적', 'D3': '연간 판매 실적',
+                      'E3': '분기 평균 실적', 'F3': '전년 대비 증감'}
+    # 144 bytes hold the context once with four cells; the fifth cell starts a new piece.
     pieces = split_chunk(chunk, 144)
-    assert len(pieces) > 1
+    assert [[s['address'] for s in piece['table_segments']] for piece in pieces] == [['B3', 'C3', 'D3', 'E3'], ['F3']]
     for piece in pieces:
         first = piece['table_segments'][0]
         assert first['label'].startswith('지역 서울특별시 / ') and '지역 서울특별시' in piece['text']
