@@ -12,8 +12,8 @@ from indexer.element_scope import same_scope, source_scope
 from indexer.embedding_input import (
     MAX_INPUT_BYTES,
     byte_size,
-    context_prefix,
     embedding_text,
+    heading_prefix,
     split_text,
     split_text_ranges,
 )
@@ -37,7 +37,7 @@ from indexer.structure_relations import figure_relationships, table_relationship
 from indexer.table_evidence import set_html_table_evidence
 from indexer.xlsx_structure import confirmed
 
-TABLE_REPRESENTATION = "table-structure-v16"
+TABLE_REPRESENTATION = "table-structure-v17"
 
 def normalize_elements(raw_elements: list[dict], *, source_format: str | None = None) -> list[dict]:
     elements = []
@@ -201,12 +201,12 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
     def append_chunk(text, refs, part_number, kind, heading_path, table_extra=None, body_prefix=None):
         text = embedding_text(text)
         first = refs[0]
-        heading_text = context_prefix(" > ".join(heading_path), min(600, target_chars // 2, max_bytes // 3))
+        heading_text = heading_prefix(heading_path, min(600, target_chars // 2, max_bytes // 3))
         actual_prefix = heading_text if body_prefix is None else body_prefix
         body_text = text.removeprefix(actual_prefix + "\n") if actual_prefix else text
         chunk_id = str(uuid5(NAMESPACE_URL, f"ingestion:{job_id}:{first['element_id']}:{part_number}"))
         chunk = {"chunk_id": chunk_id, "document_id": document_id, "job_id": job_id,
-                 "representation_version": "structure-v12", "text": text,
+                 "representation_version": "structure-v13", "text": text,
                  "element_ids": [item["element_id"] for item in refs], "page": first["page"], "source_scope": source_scope(first),
                  "group_scope": first.get('container_id') if profile == 'slides' else None,
                  "heading_element_ids": first.get("heading_element_ids", []),
@@ -232,7 +232,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
         if not pending:
             return
         first = pending[0]
-        heading = context_prefix(" > ".join(first["heading_path"]), min(600, target_chars // 2, max_bytes // 3))
+        heading = heading_prefix(first["heading_path"], min(600, target_chars // 2, max_bytes // 3))
         text = embedding_text("\n".join(filter(None, [heading, *(item["text"] for item in pending)])))
         append_chunk(text, list(pending), 0, "text", first["heading_path"])
         pending.clear()
@@ -249,7 +249,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
         if not text and not element.get("xlsx_region"):
             flush()
             continue
-        heading = context_prefix(" > ".join(element["heading_path"]), min(600, target_chars // 2, max_bytes // 3))
+        heading = heading_prefix(element["heading_path"], min(600, target_chars // 2, max_bytes // 3))
         budget = max(1, target_chars - len(heading) - 1)
         table = parse_table_html(element["html"]).find("table")
         kind = element["kind"]
@@ -281,7 +281,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             title = region['title_text']
             if linked_title:
                 title = linked_title['xlsx_region']['title_text']
-            prefix = context_prefix(' > '.join(dict.fromkeys(filter(None, [heading, title]))),
+            prefix = heading_prefix(list(dict.fromkeys([*element['heading_path'], title])),
                                     min(800, target_chars // 2, max_bytes // 3))
             parts, row_labels, ambiguous_pairs = [], {}, False
             if region['kind'] == 'key_value' and confirmed(region):
@@ -338,7 +338,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                 kind = region['kind'] if region['kind'] in {'title', 'code', 'key_value'} else 'table'
                 append_chunk('\n'.join(filter(None, [prefix, *(item['text'] for item in segments)])),
                              [element], number, kind, element['heading_path'], {
-                                 'representation_version': 'xlsx-structure-v6', 'xlsx_region_start': region['start'],
+                                 'representation_version': 'xlsx-structure-v7', 'xlsx_region_start': region['start'],
                                  'xlsx_context_status': context_status,
                                  'xlsx_region_kind': region['kind'], 'xlsx_sheet': region['sheet'],
                                  'xlsx_context_cells': list(dict.fromkeys(key for key in [region['title'] if title else None, *header_keys,
@@ -378,7 +378,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
                                                                        "representation_version": TABLE_REPRESENTATION})
                         chunks[-1]["source_segments"][0]["text"] = part
                     continue
-                table_heading = context_prefix(" > ".join(filter(None, [heading, inherited_caption, caption])), min(800, target_chars // 2, max_bytes // 3))
+                table_heading = heading_prefix([*element["heading_path"], inherited_caption, caption], min(800, target_chars // 2, max_bytes // 3))
                 context_ids = list(dict.fromkeys(value for value in (relation.get("caption_id"), relation.get("previous_table_id"), relation.get("previous_caption_id")) if value))
                 represented = {(part["row"], part["column"]) for part in parts}
                 for cell in cells:
@@ -440,14 +440,14 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
         if kind in {"figure", "chart", "image"} and element["element_id"] in figures:
             flush()
             relation = figures[element["element_id"]]
-            prefix = context_prefix(" > ".join(filter(None, [heading, relation["caption"]])), min(800, target_chars // 2, max_bytes // 3))
+            prefix = heading_prefix([*element["heading_path"], relation["caption"]], min(800, target_chars // 2, max_bytes // 3))
             for part_number, (part, start, end) in enumerate(split_text_ranges(
                     text, chars=max(1, target_chars - len(prefix) - 1),
                     max_bytes=max_bytes - byte_size(prefix) - 1, overlap=overlap_chars)):
                 append_chunk("\n".join(filter(None, [prefix, part])), [element], part_number, "figure", element["heading_path"],
                              {"context_element_ids": [relation["caption_id"]], "relations": [{"type": "caption",
                               "origin": "inferred", "status": "unverified", "element_id": relation["caption_id"]}],
-                              "quality": "unverified", "representation_version": "figure-structure-v3"}, body_prefix=prefix)
+                              "quality": "unverified", "representation_version": "figure-structure-v4"}, body_prefix=prefix)
                 chunks[-1]['source_segments'] = [{'element_id': element['element_id'], 'order': element['order'],
                                                   'text': part, 'start': start, 'end': end}]
                 chunks[-1]['source_range_quality'] = 'normalized_element_text'
@@ -476,7 +476,7 @@ def make_chunks(document_id: str, job_id: str, elements: list[dict], target_char
             append_chunk("\n".join(filter(None, (heading, part))), [element], part_number,
                          kind if kind in {"figure", "chart", "table"} else "text", element["heading_path"], extra)
             if kind in {'figure', 'chart', 'image'}:
-                chunks[-1]['representation_version'] = 'figure-structure-v3'
+                chunks[-1]['representation_version'] = 'figure-structure-v4'
                 chunks[-1]['source_segments'] = [{'element_id': element['element_id'], 'order': element['order'],
                                                   'text': part, 'start': start, 'end': end}]
                 chunks[-1]['source_range_quality'] = 'normalized_element_text'

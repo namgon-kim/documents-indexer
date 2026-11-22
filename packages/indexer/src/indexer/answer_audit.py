@@ -2,15 +2,16 @@
 
 import re
 
-CITATION = re.compile(r'\[(\d+)\]')
+from indexer.citations import CITATION, parse_citation
 
 
 def audit_answer(answer, evidence):
     warnings = []
     for raw in re.split(r'\n+|(?<=[.!?。])\s+(?!\[)|(?<=\])\s+(?=[가-힣A-Za-z])', answer):
         claim = raw.strip()
-        numbers = [int(number) for number in CITATION.findall(claim)]
-        if any(number < 1 or number > len(evidence) for number in numbers):
+        tokens = [parse_citation(match.group(1)) for match in CITATION.finditer(claim)]
+        numbers = [number for token in tokens if token is not None for number in token]
+        if any(token is None for token in tokens) or any(number > len(evidence) for number in numbers):
             warnings.append({'code': 'invalid_citation', 'claim': claim[:300],
                              'citations': sorted({number for number in numbers if 1 <= number <= len(evidence)})})
             if len(warnings) > 20:

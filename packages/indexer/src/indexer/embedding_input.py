@@ -30,6 +30,34 @@ def context_prefix(text: str, budget: int) -> str:
     )
 
 
+def heading_prefix(path, budget):
+    """Preserve each heading level when a hierarchy exceeds its byte budget."""
+    parts = [embedding_text(part) for part in path if part and embedding_text(part)]
+    whole = ' > '.join(parts)
+    if byte_size(whole) <= budget:
+        return whole
+    if not parts or budget < 1:
+        return ''
+    separator_cost = 3 * (len(parts) - 1)
+    if separator_cost >= budget:
+        return context_prefix(whole, budget)
+    remaining = budget - separator_cost
+    limits = [byte_size(part) for part in parts]
+    allocations = [0] * len(parts)
+    pending = set(range(len(parts)))
+    while pending and remaining:
+        share = max(1, remaining // len(pending))
+        for index in sorted(pending):
+            amount = min(share, limits[index] - allocations[index], remaining)
+            allocations[index] += amount
+            remaining -= amount
+            if allocations[index] >= limits[index]:
+                pending.remove(index)
+            if not remaining:
+                break
+    return ' > '.join(filter(None, (context_prefix(part, allowance) for part, allowance in zip(parts, allocations, strict=True))))
+
+
 def split_text_ranges(text: str, *, chars: int, max_bytes: int, overlap: int = 0):
     """Yield text and offsets in the NFC-normalized input, with word-safe overlap."""
     source = embedding_text(text)

@@ -55,13 +55,13 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=4000)
-    citation_numbers: list[int] = Field(default_factory=list, max_length=20)
+    citation_numbers: list[int] = Field(default_factory=list, max_length=MAX_RESULT_LIMIT + 5)
 
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     message: str = Field(min_length=1, max_length=2000)
-    history: list[ChatMessage] = Field(default_factory=list, max_length=10)
+    history: list[ChatMessage] = Field(default_factory=list, max_length=50)
     document_id: UUID | None = None
     index_version: UUID | None = None
     top_k: int | None = Field(default=None, ge=1, le=MAX_RESULT_LIMIT, strict=True)

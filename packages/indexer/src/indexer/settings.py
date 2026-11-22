@@ -49,6 +49,7 @@ class ServerSettings(BaseModel):
     llm_base_url: str
     llm_model: str = Field(min_length=1, max_length=128)
     llm_models: list[str] = Field(max_length=100)
+    llm_context_tokens: int = Field(ge=8192, le=2000000)
     xlsx_structure_enabled: bool
     xlsx_structure_model: str = Field(max_length=128)
     xlsx_structure_max_input_bytes: int = Field(ge=1024, le=256000)
