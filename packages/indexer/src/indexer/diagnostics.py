@@ -39,6 +39,8 @@ def set_answer(answer, sources):
     """Keep text request-local, while publishing only sentence IDs and citation IDs."""
     import re
 
+    from indexer.citations import CITATION, parse_citation
+
     private = _private.get()
     if private is None:
         return
@@ -48,12 +50,14 @@ def set_answer(answer, sources):
     private['answer_sentences'] = sentences[:500]
     metadata = []
     for index, sentence in enumerate(sentences[:500], 1):
-        numbers = list(dict.fromkeys(int(value) for value in re.findall(r'\[(\d+)\]', sentence)))
+        parsed = [parse_citation(match.group(1)) for match in CITATION.finditer(sentence)]
+        numbers = list(dict.fromkeys(number for item in parsed if item is not None for number in item))
         valid = [number for number in numbers if 1 <= number <= len(sources)]
         metadata.append({'sentence_id': index, 'citation_ids': valid,
                          'chunk_ids': [sources[number - 1]['chunk_id'] for number in valid
                                        if sources[number - 1].get('chunk_id')],
-                         'invalid_citation_ids': [number for number in numbers if number not in valid]})
+                         'invalid_citation_ids': [number for number in numbers if number not in valid],
+                         **({'invalid_citation_format': True} if any(item is None for item in parsed) else {})})
     record('answer_sentences', {'items': metadata, 'truncated': len(sentences) > 500})
 
 

@@ -5,7 +5,7 @@ import type { Session } from "./api";
 import { VisualAssets } from "./VisualAssets";
 import { TableRelations } from "./TableRelations";
 
-export type ChatMessage = {role: "user" | "assistant"; content: string; sources?: Hit[]; index_version?: string; answer_verification?: {status: string; warnings: {code: string; claim: string; citations: number[]}[]; warnings_truncated: boolean}; coverage?: {scope_verification: string; scope_complete: boolean | null; partial_element_count: number}; page_scope?: {requested_pages: number[]; pages_without_chunks: number[]; all_page_chunks_selected: boolean}; search_counts?: {evidence_limited: boolean; evidence_omitted_count: number; context_omitted_count: number; evidence_truncated_count: number}};
+export type ChatMessage = {role: "user" | "assistant"; content: string; sources?: Hit[]; index_version?: string; answer_verification?: {status: string; warnings: {code: string; claim: string; citations: number[]}[]; warnings_truncated: boolean}; coverage?: {scope_verification: string; scope_complete: boolean | null; partial_element_count: number}; page_scope?: {requested_pages: number[]; pages_without_chunks: number[]; all_page_chunks_selected: boolean}; search_counts?: {evidence_limited: boolean; evidence_omitted_count: number; context_omitted_count: number; evidence_truncated_count: number; history_omitted_count?: number}};
 type Props = {
   session: Session;
   messages: ChatMessage[]; searching: boolean; query: string; canSend: boolean;
@@ -24,11 +24,29 @@ const documentIcon = <svg viewBox="0 0 24 24"><rect x="4" y="2.5" width="16" hei
 
 // 답변 모델은 근거 번호를 [1] 형식으로 붙인다. 근거가 있는 번호만 버튼으로 바꾼다.
 function withCitations(text: string, count: number, onCite: (number: number) => void) {
-  return text.split(/(\[\d+\])/).map((part, index) => {
-    const number = /^\[(\d+)\]$/.exec(part)?.[1];
-    if (!number || Number(number) < 1 || Number(number) > count) return part;
-    return <button type="button" className="cite" key={index} aria-label={`근거 ${number} 보기`} onClick={() => onCite(Number(number))}>{number}</button>;
-  });
+  const output: ReactNode[] = [];
+  const pattern = /\[([\d,\-\s]+)\]/g;
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index;
+    output.push(text.slice(cursor, index));
+    const values: number[] = [];
+    let valid = true;
+    for (const part of match[1].split(",")) {
+      const range = /^\s*(\d{1,6})(?:\s*-\s*(\d{1,6}))?\s*$/.exec(part);
+      if (!range) { valid = false; break; }
+      const first = Number(range[1]), last = range[2] ? Number(range[2]) : first;
+      if (first < 1 || last < first || values.length + last - first + 1 > 100) { valid = false; break; }
+      for (let n = first; n <= last; n++) values.push(n);
+    }
+    if (!valid) output.push(match[0]);
+    else [...new Set(values)].forEach((n, i) => output.push(n <= count
+      ? <button type="button" className="cite" key={`${index}-${i}`} aria-label={`근거 ${n} 보기`} onClick={() => onCite(n)}>{n}</button>
+      : "[근거 확인 불가]"));
+    cursor = index + match[0].length;
+  }
+  output.push(text.slice(cursor));
+  return output;
 }
 
 export function DocumentChat(props: Props) {
@@ -101,6 +119,7 @@ export function DocumentChat(props: Props) {
           {(message.coverage?.partial_element_count ?? 0) > 0 && <p className="hint" role="status">일부 원본 요소의 색인 조각이 답변 근거에 모두 포함되지 않았습니다. 전체 범위와 원문을 확인해 주세요.</p>}
           {message.coverage && <details className="hint"><summary>조회 범위 확인</summary><p>원문 추출과 질문 대상 전체 범위의 완전성은 확인되지 않았습니다.</p></details>}
           {message.page_scope && <p className="hint" role="status">PDF 물리쪽 {message.page_scope.requested_pages.join(", ")} · 페이지 내 BM25 조회 · 인쇄 쪽 번호와 다를 수 있으며 원문 추출 완전성은 미확인입니다.{!message.page_scope.all_page_chunks_selected ? " 일부 청크만 답변 근거로 선택됐습니다." : ""}{message.page_scope.pages_without_chunks.length ? ` 검색 가능한 청크 없음: ${message.page_scope.pages_without_chunks.join(", ")}쪽 (원본·추출 상태 확인 필요).` : ""}</p>}
+          {!!message.search_counts?.history_omitted_count && <p className="hint" role="status">이전 대화 {message.search_counts.history_omitted_count}개는 문맥 크기 제한으로 답변에 포함되지 않았습니다.</p>}
           {message.search_counts?.evidence_limited && <p className="hint" role="status">답변 근거 예산으로 검색 근거 {message.search_counts.evidence_omitted_count}개와 문맥 {message.search_counts.context_omitted_count}개가 제외됐고, 근거 {message.search_counts.evidence_truncated_count}개는 일부만 사용됐습니다.</p>}
           {!!message.sources?.length && <div className={"chat-sources" + (open.includes(index) ? " is-open" : "")}>
             <div className="chat-source-strip">
@@ -144,6 +163,7 @@ export function DocumentChat(props: Props) {
         <button className="chat-send" aria-label={searching ? "답변 중" : "보내기"} disabled={!canSend}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg></button>
       </div>
+      {messages.length > 50 && <p className="hint">다음 답변에는 최근 대화 50개까지 전달됩니다. 더 오래된 대화는 화면에 남습니다.</p>}
       <div className="chat-compose-foot"><span>검색된 문서 내용과 대화가 답변 모델로 전송됩니다 · 대화 기록은 현재 브라우저 탭에 보관됩니다</span>
         <span><kbd>Enter</kbd> 보내기 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 줄바꿈</span></div>
     </form>

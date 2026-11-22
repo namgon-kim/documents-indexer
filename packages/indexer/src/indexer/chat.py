@@ -7,8 +7,9 @@ from langchain_core.runnables import RunnableLambda
 
 from indexer import diagnostics
 from indexer.answer_audit import audit_answer
+from indexer.citations import citation_numbers, render_citations, sanitize_history_citations
 from indexer.contracts import IndexerError, SearchRequest
-from indexer.embedding_input import byte_size, embedding_text
+from indexer.embedding_input import byte_size, context_prefix, embedding_text
 from indexer.pdf_pages import physical_pdf_pages
 from indexer.search_engine import MAX_RESULT_LIMIT
 from indexer.xlsx_query import NUMERIC, QueryPlan
@@ -185,6 +186,16 @@ def _coverage(hits, sources, method='ranked_search'):
             'reason': 'ranked_search_does_not_verify_target_scope'}
 
 
+# Previous messages are used for retrieval only when the current question refers
+# back to an earlier subject. Answer generation receives a separately budgeted history.
+_GENERIC_FOLLOWUP = re.compile(r'^\s*(?:목표|배경|내용|일정|이유|방법|결과|차이|장점|단점|한계)(?:은|는|이|가|을|를)?\s*[?？]?\s*$')
+_CONTEXT_REFERENCE = re.compile(
+    r'(?<![가-힣A-Za-z])(?:그\s*(?:것|거|중|때|쪽|분|곳|시스템|항목|표|문서|대상|내용|중에서)|'
+    r'이\s*(?:것|거|중|때|쪽|시스템|항목|표|문서|대상)|저\s*(?:것|거|쪽)|'
+    r'앞(?:의|서|에)|이전(?:\s*(?:것|내용|답변|질문|항목|시스템|대상|표|문서)|에|의|과|와|$)|방금|위(?:의|에서)|같은\s*(?:것|항목|대상)|'
+    r'(?:첫|두|세|네)\s*번째|\b(?:it|they|them|those|these|previous|former|latter)\b)', re.IGNORECASE)
+
+
 class RagChat:
     def __init__(self, config, retrieval, client):
         self.config = config
@@ -311,14 +322,21 @@ class RagChat:
         limit = getattr(profile, "max_input_bytes", self.config.embedding_max_input_bytes)
         if not lexical_only and byte_size(question) > limit:
             raise IndexerError("QUERY_TOO_LONG", "현재 질문이 임베딩 입력 제한을 넘었습니다. 질문을 줄여 주세요.", 422)
-        previous = [embedding_text(item.content) for item in request.history if item.role == "user"][-2:]
+        previous = ([embedding_text(item.content) for item in request.history if item.role == "user"][-2:]
+                    if _CONTEXT_REFERENCE.search(question) or _GENERIC_FOLLOWUP.fullmatch(question) else [])
         query = question
         for item in reversed(previous):
             chars = 2000 - len(query) - 1
             budget = limit - byte_size(query) - 1 if not lexical_only else 8000
             if chars <= 0 or budget <= 0:
                 break
-            prefix = item[-chars:].encode("utf-8")[-budget:].decode("utf-8", "ignore").strip()
+            if len(item) > chars:
+                if chars < 5:
+                    item = item[:chars]
+                else:
+                    keep = (chars - 3) // 2
+                    item = item[:keep] + ' … ' + item[-keep:]
+            prefix = context_prefix(item, budget).strip()
             if prefix:
                 query = prefix + "\n" + query
         search_request = SearchRequest(query=query, document_id=request.document_id,
@@ -370,16 +388,23 @@ class RagChat:
                       else "질문하신 정보를 찾을 수 없습니다.")
             return {"answer": answer, "sources": [], "index_version": result["index_version"],
                     "search_counts": counts_report, "coverage": coverage, **({'page_scope': page_scope} if page_scope else {})}
-        messages = []
+        history_messages = []
         for item in request.history:
-            content = item.content
-            if item.role == "assistant":
-                if not item.citation_numbers and re.search(r"\[\d+\]", content):
-                    continue
-                known = set(item.citation_numbers)
-                content = re.sub(r"\[(\d+)\]", lambda match, known=known: "" if int(match.group(1)) in known else match.group(0), content)
+            # Historical citations refer to a different result set. Keep the
+            # message but remove those IDs before sending it to the model.
+            content = sanitize_history_citations(item.content, set(item.citation_numbers)) if item.role == 'assistant' else item.content
             if content.strip():
-                messages.append({"role": item.role, "content": content})
+                history_messages.append({'role': item.role, 'content': content})
+        history_budget = 262144
+        selected_history = []
+        for message in reversed(history_messages):
+            candidate = [message, *selected_history]
+            if byte_size(json.dumps(candidate, ensure_ascii=False)) > history_budget:
+                break
+            selected_history = candidate
+        counts_report['history_omitted_count'] = len(history_messages) - len(selected_history)
+        counts_report['history_budget_bytes'] = history_budget
+        messages = selected_history
         messages.append({"role": "user", "content": json.dumps({"질문": request.message, "근거_제한": counts,
                          "PDF_물리쪽_조회": page_scope, "조회_범위": coverage, "검색된 문서": context}, ensure_ascii=False)})
         instructions = ("검색 근거를 바탕으로 사용자의 질문에 한국어로 친절하고 자연스러운 대화체로 안내하세요. "
@@ -434,10 +459,10 @@ class RagChat:
         except (httpx.HTTPError, ValueError, TypeError, KeyError) as error:
             raise IndexerError("LLM_UNAVAILABLE", "답변 생성에 실패했습니다. 모델 연결 설정을 확인해 주세요.", 503) from error
         diagnostics.set_answer(content, sources)
-        diagnostics.record('answer_citations', sorted({int(value) for value in re.findall(r'\[(\d+)\]', content)
-                                                     if 1 <= int(value) <= len(sources)}))
+        diagnostics.record('answer_citations', sorted({value for value in citation_numbers(content)
+                                                     if 1 <= value <= len(sources)}))
         verification = audit_answer(content, context)
-        answer = re.sub(r"\[(\d+)\]", lambda match: match.group(0) if 1 <= int(match.group(1)) <= len(sources) else "[근거 확인 불가]", content)
+        answer = render_citations(content, len(sources))
         if verification["warnings"]:
             answer += "\n\n※ 일부 주장과 인용 근거의 관계를 원문에서 확인해 주세요."
         return {"answer": answer, "sources": sources, "index_version": result["index_version"],
