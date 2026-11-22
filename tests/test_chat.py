@@ -337,22 +337,6 @@ def test_small_text_expansion_uses_spare_evidence_budget():
     assert counts['evidence_omitted_count'] == 0
 
 
-def test_generated_claim_audit_uses_model_input_and_returns_review_cue(tmp_path):
-    hit = {'filename': 'doc', 'source_refs': [], 'search_text': '인원이 5명에서 7명으로 증가했습니다.'}
-    retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
-    calls = []
-    def provider(request):
-        calls.append(request)
-        return httpx.Response(200, json={'choices': [{'message': {'content': '인원이 7명에서 5명으로 감소했습니다. [1]'}}]})
-    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
-        result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
-            ChatRequest(message='인원 변화가 어떻게 되나요?'))
-    assert len(calls) == 1 and len(result['sources']) == 1
-    assert result['answer_verification']['warnings'][0]['code'] == 'possible_reversed_direction'
-    assert result['answer_verification']['status'] == 'review_suggested'
-    assert '7명에서 5명' in result['answer']
-
-
 def test_chat_flags_invalid_citation_before_redacting_it(tmp_path):
     hit = {'filename': 'doc', 'source_refs': [], 'search_text': '인원 7명'}
     retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
@@ -365,18 +349,26 @@ def test_chat_flags_invalid_citation_before_redacting_it(tmp_path):
     assert 'invalid_citation' in {warning['code'] for warning in result['answer_verification']['warnings']}
 
 
-def test_chat_checks_explicit_complete_table_column_requested_by_user(tmp_path):
-    items = [f'업무 {letter}' for letter in 'ABCDEF']
-    segments = [{'row': i + 2, 'column': 2, 'value': value, 'label': '업무명',
-                 'label_relations': [{'kind': 'column', 'status': 'explicit', 'text': '업무명'}]}
-                for i, value in enumerate(items)]
-    hit = {'chunk_id': 'c', 'document_id': 'd', 'job_id': 'j', 'element_ids': ['e'], 'kind': 'table',
-           'element_scopes': [{'element_id': 'e', 'indexed_chunks': 1, 'returned_chunks': 1}],
-           'filename': 'doc', 'source_refs': [], 'search_text': '\n'.join(items), 'table_segments': segments}
+
+
+def test_answer_model_receives_evidence_relationship_and_scope_contract(tmp_path):
+    hit = {'filename': 'doc', 'source_refs': [], 'search_text': '근거 텍스트'}
     retrieval = SimpleNamespace(search=lambda _: {'index_version': 'v', 'results': [hit]})
-    def provider(_):
-        return httpx.Response(200, json={'choices': [{'message': {'content': ', '.join(items[:3]) + '입니다. [1]'}}]})
+    calls = []
+    def provider(request):
+        calls.append(request)
+        payload = json.loads(request.content)
+        instructions = payload['messages'][0]['content']
+        for condition in ('대상별 속성, 수치, 단위, 시점과 조건', '시작값과 종료값', '질문의 전제가 근거와 다르면',
+                          '전체 목록을 요구받으면', '확인된 셀의 공란', '각 핵심 주장', '근거가 서로 충돌'):
+            assert condition in instructions
+        context = json.loads(payload['messages'][-1]['content'])
+        assert context['질문'] == '대상을 비교해 주세요'
+        assert context['검색된 문서'][0]['text'] == hit['search_text']
+        assert context['조회_범위']['scope_verification'] == 'unknown'
+        return httpx.Response(200, json={'choices': [{'message': {'content': '요약 결과입니다. [1]'}}]})
     with httpx.Client(transport=httpx.MockTransport(provider)) as client:
         result = RagChat(Config(tmp_path, external_processing=True, llm_api_key='fake'), retrieval, client).invoke(
-            ChatRequest(message='업무명 목록을 정리해 주세요'))
-    assert 'table_items_not_literal_in_answer' in {warning['code'] for warning in result['answer_verification']['warnings']}
+            ChatRequest(message='대상을 비교해 주세요'))
+    assert len(calls) == 1 and result['answer'] == '요약 결과입니다. [1]'
+    assert result['answer_verification']['status'] == 'not_verified'

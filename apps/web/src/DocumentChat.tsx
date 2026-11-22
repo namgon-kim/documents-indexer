@@ -16,18 +16,7 @@ type Props = {
 };
 
 const verificationMessages: Record<string, string> = {
-  possible_reversed_direction: "변화 방향이 인용 근거와 반대일 수 있습니다",
-  possible_direction_description_conflict: "증가·감소 서술이 인용 근거와 다를 수 있습니다",
-  possible_subject_quantity_mismatch: "대상에 연결된 수치가 인용 근거와 다를 수 있습니다",
-  table_items_not_literal_in_answer: "질문한 표 열의 일부 값이 답변에 그대로 나타나지 않습니다",
-  possible_subject_mismatch: "인용 근거의 대상이 다를 수 있습니다",
-  quantity_unit_mismatch: "숫자의 단위가 인용 근거와 다를 수 있습니다",
-  quantity_not_literal_in_citation: "인용 근거에서 숫자를 그대로 찾지 못했습니다",
-  uncited_quantitative_claim: "숫자 주장에 확인 가능한 인용이 없습니다",
-  uncited_named_claim: "대상에 대한 주장에 확인 가능한 인용이 없습니다",
   invalid_citation: "존재하지 않는 근거 번호가 있습니다",
-  document_absence_scope_unverified: "문서 전체의 부재를 확인하지 못했습니다",
-  list_items_not_literal_in_answer: "인용된 목록의 일부 항목이 답변에 그대로 나타나지 않습니다",
 };
 
 const suggestions = ["이 문서의 핵심 내용을 요약해 줘", "주요 일정과 기한을 정리해 줘", "표에 있는 수치를 비교해 줘"];
@@ -105,7 +94,7 @@ export function DocumentChat(props: Props) {
         : <div className="chat-row assistant" key={index}><span className="chat-bot" aria-hidden="true">{documentIcon}</span><div className="chat-stack">
           <p className="chat-bubble">{withCitations(message.content, message.sources?.length ?? 0, number => cite(index, number))}</p>
           {!!message.answer_verification?.warnings.length && <details className="hint" open><summary>답변 근거 확인 필요</summary>
-            <p>아래 항목은 자동 검사에서 발견한 확인 사항입니다. 문맥이나 계산에 따라 올바를 수 있으므로 원문을 확인해 주세요.</p>
+            <p>답변에 사용할 수 없는 근거 번호가 있습니다. 유효한 근거와 원문을 확인해 주세요.</p>
             {message.answer_verification.warnings.map((warning, i) => <p key={i}>{verificationMessages[warning.code] ?? "해당 주장과 인용을 확인해 주세요"}: {warning.claim}{warning.citations.map(n => <button type="button" className="cite" key={n} onClick={() => cite(index, n)}>{n}</button>)}</p>)}
             {message.answer_verification.warnings_truncated && <p>추가 확인 사항이 생략됐습니다.</p>}
           </details>}

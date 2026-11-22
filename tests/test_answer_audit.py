@@ -1,133 +1,23 @@
 from indexer.answer_audit import audit_answer
 
 
-def test_cited_reversed_numeric_direction_is_flagged_but_matching_is_not():
-    evidence = [{'text': '참여자는 5명에서 7명으로 증가했습니다.'}]
-    found = audit_answer('참여자는 7명에서 5명으로 감소했습니다. [1]', evidence)
-    assert [w['code'] for w in found['warnings']] == ['possible_reversed_direction']
-    assert found['warnings'][0]['citations'] == [1]
-    assert audit_answer('참여자는 5명에서 7명으로 증가했습니다. [1]', evidence)['warnings'] == []
+def test_citation_identifiers_are_checked_without_claiming_semantic_verification():
+    evidence = [{'text': 'A 1, B 2'}]
+    result = audit_answer('A는 2입니다. [1]', evidence)
+    assert result['status'] == 'not_verified'
+    assert result['warnings'] == []
+    assert result['method'] == 'citation_identifiers_only'
 
 
-def test_direction_check_uses_only_cited_evidence_and_is_uncertain():
-    evidence = [{'text': 'A: 2→4'}, {'text': 'B: 4→2'}]
-    assert audit_answer('A는 4→2입니다. [1]', evidence)['warnings'][0]['code'] == 'possible_reversed_direction'
-    assert not audit_answer('B는 4→2입니다. [2]', evidence)['warnings']
-    assert not audit_answer('합하면 6입니다. [1] [2]', evidence)['warnings']
-    assert audit_answer('A는 4→2입니다.', evidence)['warnings'][0]['code'] == 'uncited_quantitative_claim'
-
-
-def test_missing_quantity_and_document_absence_are_review_not_refusal():
-    evidence = [{'text': '첫 분기 12명, 둘째 분기 18명'}]
-    result = audit_answer('합계는 30명입니다. [1]\n문서 전체에는 다른 항목이 없습니다.', evidence)
-    assert [item['code'] for item in result['warnings']] == [
-        'quantity_not_literal_in_citation', 'document_absence_scope_unverified']
+def test_invalid_citation_is_reported_with_available_references():
+    result = audit_answer('주장 [1] [5]', [{'text': '근거'}])
     assert result['status'] == 'review_suggested'
-    assert not audit_answer('확인한 셀은 비어 있습니다. [1]', evidence)['warnings']
-    assert not audit_answer('전체 기간의 값은 확인된 근거에서 알 수 없습니다.', evidence)['warnings']
+    assert result['warnings'] == [{'code': 'invalid_citation', 'claim': '주장 [1] [5]', 'citations': [1]}]
 
 
-def test_citations_and_number_formats_are_handled_without_false_confirmation():
-    evidence = [{'text': '예산 1,500원 및 비율 2.5%'}]
-    assert audit_answer('예산은 1500원입니다. [1]\n비율은 2.5%입니다. [1]', evidence)['warnings'] == []
-    assert audit_answer('값은 10명입니다. [3]', evidence)['warnings'][0]['code'] == 'invalid_citation'
-
-
-def test_multiple_sentences_preserve_their_own_citations():
-    evidence = [{'text': 'A 1→2'}, {'text': 'B 9→8'}]
-    result = audit_answer('A는 2→1입니다. [1] B는 9→8입니다. [2]', evidence)
-    assert len(result['warnings']) == 1
-    assert result['warnings'][0]['citations'] == [1]
-
-
-def _codes(answer, text):
-    return {item['code'] for item in audit_answer(answer, [{'text': text}])['warnings']}
-
-
-def test_currency_units_and_conversion_are_compared():
-    assert 'quantity_unit_mismatch' in _codes('예산은 10억원입니다. [1]', '예산은 10만원입니다.')
-    assert not _codes('예산은 1억원입니다. [1]', '예산은 10000만원입니다.')
-    assert not _codes('예산은 10000원입니다. [1]', '예산은 1만원입니다.')
-    assert 'quantity_not_literal_in_citation' in _codes('인원은 3명입니다. [1]', '인원은 2명입니다.')
-
-
-def test_same_pair_opposite_description_and_ambiguous_negation():
-    assert 'possible_direction_description_conflict' in _codes('인원 5명→7명 감소했습니다. [1]', '인원 5명→7명 증가했습니다.')
-    assert not _codes('인원 5명→7명 증가했습니다. [1]', '인원 5명→7명 증가했습니다.')
-    assert 'possible_direction_description_conflict' not in _codes('인원 5명→7명 감소했습니다. [1]', '인원 5명→7명 증가하지 않았습니다.')
-
-
-def test_explicit_labeled_subject_mismatch_is_only_a_review_cue():
-    assert 'possible_subject_mismatch' in _codes('시스템 B 사용자는 7명입니다. [1]', '시스템 A 사용자는 7명입니다.')
-    assert not _codes('시스템 A 사용자는 7명입니다. [1]', '시스템 A 사용자는 7명입니다.')
-    assert 'possible_subject_mismatch' not in _codes('시스템 B 사용자는 7명입니다. [1]', '시스템 A와 시스템 B 사용자는 7명입니다.')
-
-
-def test_uncited_and_invalid_citations_are_distinct():
-    assert 'uncited_quantitative_claim' in _codes('사용자는 7명입니다.', '사용자는 7명입니다.')
-    result = audit_answer('사용자는 7명입니다. [1] [3]', [{'text': '사용자는 7명입니다.'}])
-    assert 'invalid_citation' in {item['code'] for item in result['warnings']}
-    assert 'uncited_quantitative_claim' not in {item['code'] for item in result['warnings']}
-
-
-def test_absence_wording_and_explicit_list_coverage():
-    assert 'document_absence_scope_unverified' in _codes('문서에는 해당 내용이 기재되어 있지 않습니다. [1]', '일부 근거')
-    assert 'document_absence_scope_unverified' not in _codes('확인한 셀은 비어 있습니다. [1]', '해당 셀은 빈 값')
-    items = '- 알파 업무\n- 베타 업무\n- 감마 업무'
-    assert 'list_items_not_literal_in_answer' in _codes('전체 항목은 알파 업무, 베타 업무입니다. [1]', items)
-    assert 'list_items_not_literal_in_answer' not in _codes('전체 항목은 알파 업무, 베타 업무, 감마 업무입니다. [1]', items)
-    assert 'list_items_not_literal_in_answer' not in _codes('주요 항목은 알파 업무입니다. [1]', items)
-
-
-def test_uncited_named_factual_claim_is_a_review_signal():
-    evidence = [{'text': '시스템 A가 해당 기능을 제공합니다.'}]
-    result = audit_answer('시스템 B가 해당 기능을 제공합니다.', evidence)
-    assert result['warnings'][0]['code'] == 'uncited_named_claim'
-    assert not audit_answer('더 자세히 확인해 주세요.', evidence)['warnings']
-
-
-def test_full_list_claim_can_flag_missing_items_without_calling_paraphrases_wrong():
-    items = [f'항목 {letter}' for letter in 'ABCDEF']
-    evidence = '\n'.join(f'- {item}' for item in items)
-    partial = '전체 항목은 ' + ', '.join(items[:3]) + '입니다. [1]'
-    complete = '전체 항목은 ' + ', '.join(items) + '입니다. [1]'
-    assert 'list_items_not_literal_in_answer' in _codes(partial, evidence)
-    assert not _codes(complete, evidence)
-
-
-def test_quantity_is_compared_with_its_explicit_subject():
-    cited = '시스템 A 사용자 7명, 시스템 B 사용자 9명'
-    assert 'possible_subject_quantity_mismatch' in _codes('시스템 A 사용자는 9명입니다. [1]', cited)
-    assert 'possible_subject_quantity_mismatch' not in _codes('시스템 A 사용자는 7명입니다. [1]', cited)
-    assert 'possible_subject_quantity_mismatch' not in _codes('시스템 A는 9명입니다. [1]', '시스템 A 7명 또는 9명, 시스템 B 9명')
-    assert 'possible_subject_quantity_mismatch' not in _codes('시스템 A는 9명입니다. [1]', '시스템 A와 시스템 B는 9명입니다.')
-
-
-def test_pairs_normalize_money_units_dates_and_refuse_incompatible_units():
-    assert 'possible_reversed_direction' in _codes('2억원 → 1억원 감소 [1]', '1억원 → 2억원 증가')
-    assert 'possible_reversed_direction' in _codes('2026년 → 2025년 감소 [1]', '2025년 → 2026년 증가')
-    assert 'possible_reversed_direction' in _codes('2억원 → 10000만원 감소 [1]', '1억원 → 2억원 증가')
-    assert 'possible_direction_description_conflict' in _codes('1억원 → 2억원 감소 [1]', '1억원 → 2억원 증가')
-    assert 'possible_reversed_direction' not in _codes('2명 → 1명 감소 [1]', '1억원 → 2억원 증가')
-
-
-def test_structured_list_uses_question_and_only_complete_explicit_table():
-    items = [f'업무 {letter}' for letter in 'ABCDEF']
-    segments = [{'column': 2, 'row': i + 2, 'value': value,
-                 'label_relations': [{'kind': 'column', 'status': 'explicit', 'text': '업무명'}]}
-                for i, value in enumerate(items)]
-    scope = [{'all_indexed_chunks_in_model': True}]
-    source = {'document_id': 'd', 'job_id': 'j', 'kind': 'table', 'element_ids': ['e'],
-              'table_segments': segments, 'model_element_scopes': scope}
-    evidence = [{'text': '\n'.join(items)}]
-    partial = '요청하신 항목은 ' + ', '.join(items[:3]) + '입니다. [1]'
-    kwargs = {'question': '업무명 목록을 정리해 주세요', 'sources': [source]}
-    assert 'table_items_not_literal_in_answer' in {w['code'] for w in audit_answer(partial, evidence, **kwargs)['warnings']}
-    full = ', '.join(items) + '입니다. [1]'
-    assert 'table_items_not_literal_in_answer' not in {w['code'] for w in audit_answer(full, evidence, **kwargs)['warnings']}
-    source['model_element_scopes'] = [{'all_indexed_chunks_in_model': False}]
-    assert 'table_items_not_literal_in_answer' not in {w['code'] for w in audit_answer(partial, evidence, **kwargs)['warnings']}
-    source['model_element_scopes'] = scope
-    for segment in segments:
-        segment['label_relations'][0]['status'] = 'unverified'
-    assert 'table_items_not_literal_in_answer' not in {w['code'] for w in audit_answer(partial, evidence, **kwargs)['warnings']}
+def test_only_more_than_limit_marks_warnings_truncated():
+    evidence = [{'text': '근거'}]
+    exact = audit_answer('\n'.join(f'문장 {i} [2]' for i in range(20)), evidence)
+    extra = audit_answer('\n'.join(f'문장 {i} [2]' for i in range(21)), evidence)
+    assert len(exact['warnings']) == 20 and not exact['warnings_truncated']
+    assert len(extra['warnings']) == 20 and extra['warnings_truncated']
