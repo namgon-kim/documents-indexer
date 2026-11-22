@@ -410,6 +410,7 @@ class RagChat:
                             "이전 대화는 질문의 맥락이며 사실의 근거로 사용하지 마세요.")
         if diagnostics.active():
             diagnostics.record('model_contract', {'system_prompt_sha256': hashlib.sha256(instructions.encode('utf-8')).hexdigest()})
+        diagnostics.set_model_input(context)
         payload = {"model": request.model or self.config.llm_model,
                    "messages": [{"role": "system", "content": instructions}, *messages]}
         if request.reasoning_effort is not None:
@@ -432,6 +433,7 @@ class RagChat:
                 raise ValueError("empty response")
         except (httpx.HTTPError, ValueError, TypeError, KeyError) as error:
             raise IndexerError("LLM_UNAVAILABLE", "답변 생성에 실패했습니다. 모델 연결 설정을 확인해 주세요.", 503) from error
+        diagnostics.set_answer(content, sources)
         diagnostics.record('answer_citations', sorted({int(value) for value in re.findall(r'\[(\d+)\]', content)
                                                      if 1 <= int(value) <= len(sources)}))
         verification = audit_answer(content, context)

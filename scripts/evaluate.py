@@ -106,6 +106,18 @@ def evaluate(client, cases, top_k, method="hybrid", index_version=None, profile_
                "latency_ms": round(elapsed, 2)}
         if trace_mode:
             row['diagnostic_trace'] = trace
+            if trace_mode == 'chat':
+                row['recall_scope'] = 'confirmed_citable_source_lower_bound'
+                probes = trace['probes']
+                unknown = any(probe.get('model_input_status') != 'captured' or (
+                    probe.get('truncated_cell_match_unverified_chunk_ids') and not probe.get('model_input_matches'))
+                    for probe in probes)
+                if unknown:
+                    row['model_input_recall'] = None
+                    row['model_input_recall_status'] = 'unknown'
+                else:
+                    row['model_input_recall'] = sum(bool(probe.get('model_input_matches')) for probe in probes) / len(probes)
+                    row['model_input_recall_status'] = 'literal_source_fields_only'
         report.append(row)
     if not report:
         raise ValueError("Provide at least one evaluation case")

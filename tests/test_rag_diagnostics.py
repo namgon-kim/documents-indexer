@@ -197,7 +197,10 @@ def test_probe_does_not_treat_omitted_or_truncated_model_text_as_visible(tmp_pat
                         'model_evidence': [{'chunk_id': 'a', 'citation_id': 1, 'status': 'truncated'},
                                            {'chunk_id': 'b', 'citation_id': None, 'status': 'omitted'}]}}
     probe = DiagnosticProbe(document_id=doc, page=1, contains_line=['hiddenValue'])
-    [observed] = probe_results([probe], result, trace, publisher, chat=True)
+    from indexer.diagnostics import set_model_input
+    with capture_trace():
+        set_model_input([{'id': 1, 'text': 'prefix', 'context': '', 'evidence_pages': [1], 'context_pages': []}])
+        [observed] = probe_results([probe], result, trace, publisher, chat=True)
     assert observed['stage_chunk_ids']['ranked_selected'] == ['a', 'b']
     assert observed['stage_chunk_ids']['model_evidence'] == []
     assert observed['returned_chunk_ids'] == [] and not observed['answer_literal_match']
@@ -233,7 +236,137 @@ def test_truncated_table_segment_not_mistaken_for_model_input(tmp_path):
         'evidence_truncated': True, 'table_segments': [segment]}]}
     trace = {'stages': {'model_evidence': [{'chunk_id': 'a', 'citation_id': 1, 'status': 'truncated'}]}}
     probe = DiagnosticProbe(document_id=doc, page=1, row=7, column=3, contains_line=['confidential'])
-    [observed] = probe_results([probe], result, trace, publisher, chat=True)
+    from indexer.diagnostics import set_model_input
+    with capture_trace():
+        set_model_input([{'id': 1, 'text': 'prefix', 'context': '', 'evidence_pages': [1], 'context_pages': []}])
+        [observed] = probe_results([probe], result, trace, publisher, chat=True)
     assert observed['published_matching_chunk_ids'] == ['a']
     assert observed['returned_chunk_ids'] == [] and observed['stage_chunk_ids']['model_evidence'] == []
     assert observed['truncated_cell_match_unverified_chunk_ids'] == ['a']
+
+
+def test_model_fields_and_answer_sentences_are_traced_without_text_disclosure(tmp_path):
+    from indexer.contracts import ChatRequest
+    from indexer.diagnostics import probe_results
+
+    from apps.api.main import DiagnosticProbe
+
+    doc, job, version = str(uuid4()), str(uuid4()), str(uuid4())
+    folder = tmp_path / version
+    folder.mkdir()
+    chunks = [{'chunk_id': name, 'document_id': doc, 'job_id': job, 'page': 1,
+               'text': text, 'element_ids': [f'e{i + 1}']}
+              for i, (name, text) in enumerate([('a', 'bodyToken'), ('b', 'otherBody')])]
+    (folder / 'chunks.json').write_text(json.dumps(chunks))
+    sources = [{**chunks[0], 'filename': 'doc', 'source_refs': [{'page': 1, 'role': 'evidence'},
+                                                                 {'page': 2, 'role': 'context'}],
+                'search_text': 'bodyToken', 'context_text': 'contextToken',
+                'table_segments': [{'row': 1, 'column': 1, 'label': 'x',
+                                    'label_relations': [{'text': 'metadataToken'}]}]},
+               {**chunks[1], 'filename': 'doc', 'source_refs': [{'page': 1, 'role': 'evidence'}],
+                'search_text': 'otherBody'}]
+    publisher = SimpleNamespace(root=tmp_path, deleted_documents=lambda: set())
+    config = Config(tmp_path, external_processing=True, llm_api_key='secret')
+    def provider(request):
+        return httpx.Response(200, json={'choices': [{'message': {'content': 'answerAlpha [2]. answerBeta [1].'}}]})
+    probes = [DiagnosticProbe(document_id=doc, page=page, contains_line=[term]) for page, term in
+              [(1, 'bodyToken'), (2, 'contextToken'), (1, 'metadataToken'), (1, 'answerAlpha')]]
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client, capture_trace() as trace:
+        chat = RagChat(config, None, client)
+        response = chat.answer((ChatRequest(message='question'), {'index_version': version, 'results': sources}))
+        results = probe_results(probes, response, trace, publisher, chat=True)
+        assert results[0]['model_input_matches'] == [{'citation_id': 1, 'chunk_id': 'a', 'fields': ['text']}]
+        assert results[1]['model_input_matches'] == [{'citation_id': 1, 'chunk_id': 'a', 'fields': ['context']}]
+        assert results[2]['model_input_matches'] == [{'citation_id': 1, 'chunk_id': 'a', 'fields': ['metadata']}]
+        assert results[3]['answer_sentence_ids'] == [1]
+        assert trace['stages']['answer_sentences']['items'] == [
+            {'sentence_id': 1, 'citation_ids': [2], 'chunk_ids': ['b'], 'invalid_citation_ids': []},
+            {'sentence_id': 2, 'citation_ids': [1], 'chunk_ids': ['a'], 'invalid_citation_ids': []}]
+        public = json.dumps({'trace': trace, 'probes': results})
+        assert all(value not in public for value in ('bodyToken', 'contextToken', 'metadataToken', 'answerAlpha', 'answerBeta'))
+    # The request-local raw payload is no longer available after the capture scope ends.
+    after = probe_results(probes, response, trace, publisher, chat=True)
+    assert after[0]['model_input_status'] == 'not_captured' and not after[0]['model_input_matches']
+
+
+def test_table_expansion_reports_missing_and_ambiguous_anchors_and_other_source(tmp_path):
+    from indexer.diagnostics import probe_results
+    from indexer.published_retrieval import PublishedRetrieval
+
+    from apps.api.main import DiagnosticProbe
+
+    doc, job, version = str(uuid4()), str(uuid4()), str(uuid4())
+    def table(chunk_id, element):
+        return {'chunk_id': chunk_id, 'document_id': doc, 'job_id': job, 'kind': 'table', 'page': 1,
+                'element_ids': [element], 'part_number': 0, 'text': 'needle',
+                'heading_path': ['heading'], 'heading_element_ids': ['e10']}
+    first, other = table('a', 'e1'), table('b', 'e2')
+    indexed = {item['chunk_id']: item for item in (first, other)}
+    heading = {'chunk_id': 'h', 'document_id': doc, 'job_id': job, 'kind': 'text', 'page': 1,
+               'heading_path': ['heading'], 'heading_element_ids': ['e10']}
+    with capture_trace() as trace:
+        PublishedRetrieval._expand_table([heading], indexed)
+    assert trace['stages']['table_expansion_decisions']['anchor_status'] == 'ambiguous_table_context'
+    with capture_trace() as trace:
+        PublishedRetrieval._expand_table([{**heading, 'heading_element_ids': []}], indexed)
+    assert trace['stages']['table_expansion_decisions']['anchor_status'] == 'no_table_anchor'
+    folder = tmp_path / version
+    folder.mkdir()
+    (folder / 'chunks.json').write_text(json.dumps([first, other]))
+    publisher = SimpleNamespace(root=tmp_path, deleted_documents=lambda: set())
+    with capture_trace() as trace:
+        PublishedRetrieval._expand_table([first], indexed)
+        result = {'index_version': version, 'results': []}
+        [probe] = probe_results([DiagnosticProbe(document_id=doc, page=1, contains_line=['needle'])],
+                                result, trace, publisher, chat=False)
+    reasons = {item['chunk_id']: item['reason'] for item in probe['table_expansion_reasons']}
+    assert reasons == {'a': 'already_selected', 'b': 'different_source_element'}
+
+
+def test_artifact_summary_distinguishes_other_job_missing_data_and_legacy(tmp_path):
+    doc, requested, other, version = (str(uuid4()) for _ in range(4))
+    storage = ArtifactStore(tmp_path)
+    storage.save_job(doc, requested, 'chunks', [{'chunk_id': 'wanted'}])
+    folder = tmp_path / version
+    folder.mkdir()
+    path = folder / 'chunks.json'
+    publisher = SimpleNamespace(root=tmp_path, deleted_documents=lambda: set(),
+                                get_version=lambda _: {'version': version, 'document_ids': [doc]})
+    path.write_text(json.dumps([{'chunk_id': 'old', 'document_id': doc, 'job_id': other}]))
+    result = artifact_summary(storage, publisher, doc, requested, version)
+    assert result['published_status'] == 'job_not_in_snapshot' and 'chunk_comparison' not in result
+    path.write_text(json.dumps([{'chunk_id': 'legacy', 'document_id': doc}]))
+    assert artifact_summary(storage, publisher, doc, requested, version)['published_status'] == 'job_membership_unknown'
+    path.write_text('[]')
+    assert artifact_summary(storage, publisher, doc, requested, version)['published_status'] == 'document_chunks_missing'
+    path.write_text(json.dumps([{'chunk_id': 'published', 'document_id': doc, 'job_id': requested}]))
+    result = artifact_summary(storage, publisher, doc, requested, version)
+    assert result['published_status'] == 'available' and result['chunk_comparison']['job_only_ids'] == ['wanted']
+
+
+def test_context_excluded_by_budget_is_not_reported_as_model_input(tmp_path):
+    from indexer.contracts import ChatRequest
+    from indexer.diagnostics import probe_results
+
+    from apps.api.main import DiagnosticProbe
+
+    doc, job, version = str(uuid4()), str(uuid4()), str(uuid4())
+    folder = tmp_path / version
+    folder.mkdir()
+    chunk = {'chunk_id': 'a', 'document_id': doc, 'job_id': job, 'page': 1,
+             'text': 'x' * 2600, 'element_ids': ['e1']}
+    (folder / 'chunks.json').write_text(json.dumps([chunk]))
+    source = {**chunk, 'filename': 'doc', 'source_refs': [{'page': 1, 'role': 'evidence'}],
+              'search_text': chunk['text'], 'context_text': 'hiddenContext' * 1000}
+    publisher = SimpleNamespace(root=tmp_path, deleted_documents=lambda: set())
+    config = Config(tmp_path, external_processing=True, llm_api_key='secret', chat_evidence_bytes=4096)
+    def provider(_request):
+        return httpx.Response(200, json={'choices': [{'message': {'content': '답변 [1]'}}]})
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client, capture_trace() as trace:
+        result = RagChat(config, None, client).answer((ChatRequest(message='question'),
+                                                       {'index_version': version, 'results': [source]}))
+        [probe] = probe_results([DiagnosticProbe(document_id=doc, page=1, contains_line=['hiddenContext'])],
+                                result, trace, publisher, chat=True)
+        assert result['search_counts']['context_omitted_count'] == 1
+        assert probe['model_input_status'] == 'captured' and probe['model_input_matches'] == []
+        assert 'hiddenContext' not in json.dumps({'trace': trace, 'probe': probe})

@@ -4,15 +4,18 @@ from contextvars import ContextVar
 from uuid import uuid4
 
 _current = ContextVar('rag_diagnostic_trace', default=None)
+_private = ContextVar('rag_diagnostic_private', default=None)
 
 
 @contextmanager
 def capture_trace():
     trace = {'trace_id': str(uuid4()), 'stages': {}}
     token = _current.set(trace)
+    private_token = _private.set({})
     try:
         yield trace
     finally:
+        _private.reset(private_token)
         _current.reset(token)
 
 
@@ -24,6 +27,34 @@ def record(stage, value):
     trace = _current.get()
     if trace is not None:
         trace['stages'][stage] = value
+
+
+def set_model_input(context):
+    private = _private.get()
+    if private is not None:
+        private['model_input'] = context
+
+
+def set_answer(answer, sources):
+    """Keep text request-local, while publishing only sentence IDs and citation IDs."""
+    import re
+
+    private = _private.get()
+    if private is None:
+        return
+    sentences = [part.strip() for part in re.split(
+        r'\n+|(?<=[.!?。])\s+(?!\[)|(?<=\])\s+(?=[가-힣A-Za-z])', answer) if part.strip()]
+    private['answer_text'] = answer
+    private['answer_sentences'] = sentences[:500]
+    metadata = []
+    for index, sentence in enumerate(sentences[:500], 1):
+        numbers = list(dict.fromkeys(int(value) for value in re.findall(r'\[(\d+)\]', sentence)))
+        valid = [number for number in numbers if 1 <= number <= len(sources)]
+        metadata.append({'sentence_id': index, 'citation_ids': valid,
+                         'chunk_ids': [sources[number - 1]['chunk_id'] for number in valid
+                                       if sources[number - 1].get('chunk_id')],
+                         'invalid_citation_ids': [number for number in numbers if number not in valid]})
+    record('answer_sentences', {'items': metadata, 'truncated': len(sentences) > 500})
 
 
 def ranking(stage, hits):
@@ -123,7 +154,16 @@ def artifact_summary(storage, publisher, document_id, job_id, version):
         published = json.loads(path.read_text(encoding='utf-8'))
         if not isinstance(published, list):
             raise TypeError
-        selected = [item for item in published if item.get('document_id') == document_id and item.get('job_id') == job_id]
+        document_chunks = [item for item in published if item.get('document_id') == document_id]
+        selected = [item for item in document_chunks if item.get('job_id') == job_id]
+        if not selected:
+            if not document_chunks:
+                summary['published_status'] = 'document_chunks_missing'
+            elif any(not item.get('job_id') for item in document_chunks):
+                summary['published_status'] = 'job_membership_unknown'
+            else:
+                summary['published_status'] = 'job_not_in_snapshot'
+            return summary
         summary['published_status'] = 'available'
         summary['published_chunks'] = {'count': len(selected), 'representation_versions': sorted({
             item.get('representation_version', 'unknown') for item in selected})}
@@ -163,7 +203,10 @@ def probe_results(probes, result, trace, publisher, *, chat):
         indexed = {}
         snapshot_status = 'published_snapshot_unavailable'
     hits = result.get('sources' if chat else 'results', [])
-    answer = embedding_text(result.get('answer', '')) if chat else None
+    private = _private.get() or {}
+    model_input = private.get('model_input') if chat else None
+    sentence_texts = private.get('answer_sentences', []) if chat else []
+    answer = embedding_text(private.get('answer_text', result.get('answer', ''))) if chat else None
 
     def match_terms(terms, line):
         line = embedding_text(line)
@@ -174,7 +217,8 @@ def probe_results(probes, result, trace, publisher, *, chat):
         if str(probe.document_id) != hit.get('document_id'):
             return False
         if returned:
-            if not any(ref.get('page') == probe.page for ref in hit.get('source_refs', [])):
+            if not any(ref.get('page') == probe.page and ref.get('role', 'evidence') == 'evidence'
+                       for ref in hit.get('source_refs', [])):
                 return False
         elif hit.get('page') != probe.page:
             return False
@@ -186,10 +230,75 @@ def probe_results(probes, result, trace, publisher, *, chat):
                    and (not returned or not hit.get('evidence_truncated'))
                    and match_terms(terms, segment.get('text', '')) for segment in hit.get('table_segments', []))
 
+    def leaves(value):
+        if isinstance(value, dict):
+            for member in value.values():
+                yield from leaves(member)
+        elif isinstance(value, list):
+            for member in value:
+                yield from leaves(member)
+        elif isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            yield str(value)
+
+    def model_matches(probe, terms):
+        if model_input is None:
+            return []
+        matches = []
+        for source, item in zip(hits, model_input, strict=True):
+            if str(probe.document_id) != source.get('document_id') or not source.get('chunk_id'):
+                continue
+            fields = []
+            if probe.row is not None or probe.column is not None:
+                if match(probe, source, returned=True):
+                    fields.append('text')
+            else:
+                evidence_pages = item.get('evidence_pages', [])
+                all_pages = {*evidence_pages, *item.get('context_pages', [])}
+                if probe.page in evidence_pages and (not terms or any(
+                        match_terms(terms, line) for line in str(item.get('text', '')).splitlines())):
+                    fields.append('text')
+                if terms and probe.page in all_pages and any(
+                        match_terms(terms, line) for line in str(item.get('context', '')).splitlines()):
+                    fields.append('context')
+                metadata = {key: value for key, value in item.items() if key not in {'text', 'context'}}
+                if terms and probe.page in all_pages and any(match_terms(terms, value) for value in leaves(metadata)):
+                    fields.append('metadata')
+            if fields:
+                matches.append({'citation_id': item['id'], 'chunk_id': source['chunk_id'], 'fields': fields})
+        return matches
+
+    def expansion_reasons(matched_ids):
+        expansion = trace['stages'].get('table_expansion_decisions')
+        if not expansion:
+            return []
+        reasons = {item['chunk_id']: item['reason'] for item in expansion.get('candidates', [])}
+        anchors = [indexed[key] for key in expansion.get('anchor_chunk_ids', []) if key in indexed]
+        output = []
+        for chunk_id in matched_ids[:1000]:
+            chunk = indexed[chunk_id]
+            if chunk_id in reasons:
+                reason = reasons[chunk_id]
+            elif expansion.get('truncated'):
+                reason = 'candidate_not_enumerated'
+            elif not anchors:
+                reason = ('anchor_not_in_snapshot' if expansion.get('anchor_chunk_ids')
+                          else expansion.get('anchor_status', 'no_table_anchor'))
+            elif chunk.get('kind') != 'table':
+                reason = 'not_table'
+            elif any(anchor.get('document_id') == chunk.get('document_id')
+                     and anchor.get('job_id') == chunk.get('job_id')
+                     and anchor.get('element_ids') != chunk.get('element_ids') for anchor in anchors):
+                reason = 'different_source_element'
+            else:
+                reason = 'not_same_table_or_context'
+            output.append({'chunk_id': chunk_id, 'reason': reason})
+        return output
+
     output = []
     for number, probe in enumerate(probes, 1):
         terms = [embedding_text(term) for term in probe.contains_line]
         matching = [hit['chunk_id'] for hit in hits if hit.get('chunk_id') and match(probe, hit, returned=True)]
+        model_fields = model_matches(probe, terms) if chat else []
         uncertain = [hit['chunk_id'] for hit in hits if hit.get('chunk_id') in indexed
                      and hit.get('evidence_truncated') and (probe.row is not None or probe.column is not None)
                      and match(probe, indexed[hit['chunk_id']], returned=False)]
@@ -201,9 +310,8 @@ def probe_results(probes, result, trace, publisher, *, chat):
                    and (stage != 'model_evidence' or entry.get('citation_id') is not None)]
             if ids:
                 if stage == 'model_evidence':
-                    visible = {hit['chunk_id']: hit for hit in hits if hit.get('chunk_id')}
-                    stages[stage] = [chunk_id for chunk_id in ids
-                                     if chunk_id in visible and match(probe, visible[chunk_id], returned=True)]
+                    if model_input is not None:
+                        stages[stage] = [entry['chunk_id'] for entry in model_fields]
                 else:
                     stages[stage] = [chunk_id for chunk_id in ids if chunk_id in indexed and match(probe, indexed[chunk_id], returned=False)]
         published_matches = [key for key, item in indexed.items() if match(probe, item, returned=False)]
@@ -211,7 +319,13 @@ def probe_results(probes, result, trace, publisher, *, chat):
                        'truncated_cell_match_unverified_chunk_ids': uncertain, 'stage_chunk_ids': stages,
                        'published_matching_chunk_ids': published_matches[:1000],
                        'published_matches_truncated': len(published_matches) > 1000,
+                       'table_expansion_reasons': expansion_reasons(published_matches),
+                       'model_input_status': ('captured' if model_input is not None else 'not_captured') if chat else 'not_requested',
+                       'model_input_matches': model_fields, 'model_input_scope': 'source_evidence_fields_only',
+                       'answer_sentence_ids': [index for index, sentence in enumerate(sentence_texts, 1)
+                                               if terms and match_terms(terms, sentence)],
                        'answer_literal_match': match_terms(terms, answer) if answer is not None and terms else None,
                        'candidate_match_scope': 'published_chunk_metadata', 'answer_match_scope': 'whole_answer_literal_terms',
+                       'answer_match_origin': ('model_response' if 'answer_text' in private else 'returned_response') if chat else None,
                        'snapshot_status': snapshot_status})
     return output

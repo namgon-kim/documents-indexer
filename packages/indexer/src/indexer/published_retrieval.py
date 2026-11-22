@@ -212,9 +212,11 @@ class PublishedRetrieval:
             return None
 
         anchors = {}
+        anchor_status = 'no_table_anchor' if output else 'no_search_results'
         for item in output:
             if key := group(item):
                 anchors.setdefault(key, (item, item['chunk_id']))
+                anchor_status = 'selected_table'
         if not anchors and output:
             hit = output[0]
             if hit.get('document_id') and hit.get('job_id') and hit.get('heading_element_ids') and hit.get('page') is not None:
@@ -223,7 +225,11 @@ class PublishedRetrieval:
                            and item.get('job_id') == hit.get('job_id') and item.get('page') == hit.get('page')
                            and item.get('heading_path') == hit.get('heading_path')
                            and item.get('heading_element_ids') == hit.get('heading_element_ids')]
-                if len({group(item) for item in matches}) == 1:
+                group_count = len({group(item) for item in matches})
+                if group_count > 1:
+                    anchor_status = 'ambiguous_table_context'
+                if group_count == 1:
+                    anchor_status = 'unique_heading_context'
                     matches.sort(key=lambda item: (item.get('part_number', 0), item['chunk_id']))
                     anchors[group(matches[0])] = (matches[0], hit['chunk_id'])
         grouped = defaultdict(list)
@@ -267,6 +273,8 @@ class PublishedRetrieval:
             initial = {item['chunk_id'] for item in results}
             candidates = [item for group_items in grouped.values() for item in group_items]
             diagnostics.record('table_expansion_decisions', {
+                'anchor_status': anchor_status,
+                'anchor_chunk_ids': [anchor['chunk_id'] for anchor, _ in anchors.values()],
                 'candidate_count': len(candidates), 'truncated': len(candidates) > 1000,
                 'candidates': [{'chunk_id': item['chunk_id'], 'reason': (
                     'already_selected' if item['chunk_id'] in initial else
