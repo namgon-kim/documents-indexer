@@ -2,7 +2,6 @@
 from uuid import uuid4
 
 import pytest
-
 from indexer.contracts import SearchRequest
 from indexer.published_retrieval import PublishedRetrieval
 from indexer.search_engine import SearchHit, SearchService
