@@ -30,11 +30,12 @@ export function VisualAsset({item, session, showAnalysisStatus = true}: {item: V
 }
 
 // Loads only when scrolled into view so documents with many images stay light.
+// Originals the browser cannot draw (EMF, WMF, ...) stay downloadable instead of previewable.
 export function ImageThumbnail({item, session, label, expanded, onToggle}: {item: VisualItem; session: Session; label: string;
   expanded: boolean; onToggle: () => void}) {
   const frame = useRef<HTMLButtonElement>(null);
   const [source, setSource] = useState('');
-  const [state, setState] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle');
+  const [state, setState] = useState<'idle' | 'loading' | 'ready' | 'file' | 'failed'>('idle');
   useEffect(() => () => {if (source) URL.revokeObjectURL(source);}, [source]);
   useEffect(() => {
     const node = frame.current;
@@ -42,7 +43,7 @@ export function ImageThumbnail({item, session, label, expanded, onToggle}: {item
     const load = () => {
       setState('loading');
       imageBlob(item.url, session)
-        .then(blob => {if (!blob.type.startsWith('image/')) throw new Error(); setSource(URL.createObjectURL(blob)); setState('ready');})
+        .then(blob => {setSource(URL.createObjectURL(blob)); setState(blob.type.startsWith('image/') ? 'ready' : 'file');})
         .catch(() => setState('failed'));
     };
     if (typeof IntersectionObserver === 'undefined') {load(); return;}
@@ -52,11 +53,22 @@ export function ImageThumbnail({item, session, label, expanded, onToggle}: {item
     observer.observe(node);
     return () => observer.disconnect();
   }, [item.url, session, state]);
+  const format = item.format?.toUpperCase() || '';
+  function saveOriginal() {
+    const link = document.createElement('a');
+    link.href = source;
+    link.download = `${label}${item.format ? '.' + item.format.toLowerCase() : ''}`;
+    link.click();
+  }
+  if (state === 'file') return <button ref={frame} type="button" className="image-thumb is-file" onClick={saveOriginal}
+    title="브라우저에서 표시할 수 없는 형식입니다. 원본 파일을 내려받습니다." aria-label={`${label} 원본 파일 다운로드`}>
+    <span className="image-thumb-empty">{format || '파일'}<br/>원본 다운로드</span>
+  </button>;
   return <>
     <button ref={frame} type="button" className={'image-thumb' + (expanded ? ' is-open' : '')} onClick={onToggle}
       disabled={state === 'failed'} aria-expanded={expanded} aria-label={`${label} ${expanded ? '크게 보기 닫기' : '크게 보기'}`}>
-      {state === 'ready' ? <img src={source} alt="" onError={() => setState('failed')}/>
-        : <span className="image-thumb-empty">{state === 'failed' ? '미리보기 없음' : item.format?.toUpperCase() || '이미지'}</span>}
+      {state === 'ready' ? <img src={source} alt="" onError={() => setState('file')}/>
+        : <span className="image-thumb-empty">{state === 'failed' ? '미리보기 없음' : format || '이미지'}</span>}
     </button>
     {expanded && state === 'ready' && <figure className="image-preview">
       <img src={source} alt={`${label} ${item.is_preview ? '미리보기' : '원본'}`}/>
