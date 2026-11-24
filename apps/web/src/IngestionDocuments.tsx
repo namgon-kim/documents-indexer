@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { ApiError, api, remove, uploadIngestion } from "./api";
+import { ApiError, api, download, remove, uploadIngestion } from "./api";
 import type { EmbeddingProfile, Options, Session, Settings } from "./api";
 import { XlsxJoin } from "./XlsxJoin";
 import { XlsxStructure } from "./XlsxStructure";
@@ -72,6 +72,12 @@ function DocumentCard({item, busy, modelEnabled, embeddingProfile, supportsDpi, 
   const [showAllImages, setShowAllImages] = useState(false);
   const [openImage, setOpenImage] = useState<string | null>(null);
   const [imageSubmitting, setImageSubmitting] = useState(false);
+  const [downloadState, setDownloadState] = useState<"" | "busy" | "failed">("");
+  async function downloadSource() {
+    setDownloadState("busy");
+    try { await download(`/v1/ingest/${item.document_id}/source`, session, item.filename); setDownloadState(""); }
+    catch { setDownloadState("failed"); }
+  }
   const [selected, setSelected] = useState(item.latest_job.job_id);
   const job = item.jobs.find(value => value.job_id === selected) || item.latest_job;
   const [target, setTarget] = useState(job.settings.target_chars ?? 1200);
@@ -236,9 +242,11 @@ function DocumentCard({item, busy, modelEnabled, embeddingProfile, supportsDpi, 
       {item.indexed && <p className="hint">새 색인 게시가 완료될 때까지 기존 버전은 검색할 수 있습니다.</p>}
     </details>}
     <div className="actions">
+      <button type="button" disabled={item.deletion_pending || downloadState === "busy"} className="secondary" onClick={() => void downloadSource()}>{downloadState === "busy" ? "내려받는 중…" : "원본 다운로드"}</button>
       <button type="button" disabled={busy || running || item.deletion_pending} className="secondary" onClick={() => onDelete(item, job, "job")}>작업 기록 삭제</button>
       <button type="button" disabled={busy || running} className="secondary" onClick={() => onDelete(item, job, "document")}>{item.deletion_pending ? "문서 삭제 다시 시도" : "문서 삭제"}</button>
     </div>
+    {downloadState === "failed" && <p className="alert">원본 문서를 내려받지 못했습니다. 잠시 후 다시 시도해 주세요.</p>}
     </details>
   </article>;
 }

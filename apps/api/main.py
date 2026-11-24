@@ -144,6 +144,16 @@ def settings_from(payload, kind, defaults=None):
     return settings.model_dump()
 
 
+SOURCE_TYPES = {
+    'pdf': 'application/pdf',
+    'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'hwp': 'application/x-hwp',
+    'hwpx': 'application/hwp+zip',
+}
+
+
 def create_app(config: Config | None = None, *, ingestion_service=None):
     base_config = config or Config.from_env()
     config = apply_overrides(base_config)
@@ -999,6 +1009,23 @@ def create_app(config: Config | None = None, *, ingestion_service=None):
             raise IndexerError('JOB_NOT_FOUND', '기준 작업을 찾을 수 없습니다.', 404) from error
         except ValueError as error:
             raise IndexerError('IMAGE_ACTION_UNAVAILABLE', str(error), 409) from error
+
+    @app.get('/v1/ingest/{document_id}/source', dependencies=[Depends(auth.require)])
+    def ingestion_source(request: Request, document_id: UUID):
+        publisher = getattr(request.app.state, 'index_publisher', None)
+        if publisher and str(document_id) in publisher.deleted_documents():
+            raise IndexerError('DOCUMENT_NOT_FOUND', '원본 문서를 찾을 수 없습니다.', 404)
+        try:
+            storage = request.app.state.ingestion.storage
+            document = storage.load_document(str(document_id))
+            path = storage.document_dir(str(document_id)) / ('source.' + document['format'])
+            if not path.is_file():
+                raise FileNotFoundError
+        except (FileNotFoundError, KeyError, ValueError, AttributeError) as error:
+            raise IndexerError('DOCUMENT_NOT_FOUND', '원본 문서를 찾을 수 없습니다.', 404) from error
+        filename = str(document.get('filename') or path.name).replace('\\', '/').split('/')[-1] or path.name
+        return FileResponse(path, media_type=SOURCE_TYPES.get(document['format'], 'application/octet-stream'),
+                            filename=filename, headers={'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store'})
 
     @app.get('/v1/ingest/{document_id}/jobs/{job_id}/elements/{element_id}/image', dependencies=[Depends(auth.require)])
     def ingestion_image(request: Request, document_id: UUID, job_id: UUID, element_id: str, preview: bool = False):
